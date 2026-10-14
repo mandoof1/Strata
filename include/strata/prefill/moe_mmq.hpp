@@ -46,6 +46,12 @@ void scale_gu_rows(float* gu, int64_t ld, int64_t n_ff, const int32_t* bounds, i
 /// The down product's rows [0, nrows) (`ld` floats each, relative `bounds`) times their expert's s_down - on the FP32
 /// output, not folded into up, where the hidden would sit near 1e-5 (FP16-subnormal block scales in q8 formats).
 void scale_down_rows(float* d, int64_t ld, const int32_t* bounds, int n, const float* tails, int64_t nrows, void* stream);
+/// The rows quantize(x, src, ...) writes for tokens x k_used rows in expert order, written token by token: token t's
+/// row of x is quantized once and stored at rows slot[t * k_used + k] (`slot` the inverse of `src`) - the same bytes,
+/// a k_used-th of the quantizations (llama.cpp's quantize_scatter_mmq_q8_1_cuda).  STRATA_QUANT_GATHER=1: quantize()
+/// over `src`, as before.
+void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int ggml_type, int64_t cols,
+                      int64_t ld, int64_t tokens, int k_used, void* stream);
 
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into

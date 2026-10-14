@@ -71,6 +71,7 @@ size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }
 void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*, float*) {}
 bool fp4_activations(int) { return false; }
+void quantize_scatter(const float*, const int32_t*, const int32_t*, void*, int, int64_t, int64_t, int64_t, int, void*) {}
 Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product&, void*) {}
@@ -3863,8 +3864,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         pt.mark(kPfGather, cs);
                         if (use_mmq) {
-                            // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
-                            mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale);
+                            // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`:
+                            // each token quantized once and written to its K rows (slot_dev, the inverse of src_dev).
+                            // NVFP4 w4a4 activations carry a per-row scale (Xscale): that mode keeps the gather.
+                            if (mmq::fp4_activations(mmq_gt))
+                                mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale);
+                            else
+                                mmq::quantize_scatter(m.mixed, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                             // reads the group's own quantized H)
                             const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
