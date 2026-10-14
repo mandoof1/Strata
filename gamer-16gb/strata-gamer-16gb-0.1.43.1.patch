@@ -1,0 +1,770 @@
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 5d16d99..6167e09 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -225,6 +225,9 @@ public:
+     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
+     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
+     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
++    /// local (io-prio): true when the last `prefetch` of `layer` had to read this expert from the drive (its pages were
++    /// not cached).  The CPU pool then computes it after the cached ones, so its read overlaps their compute.
++    virtual bool cold(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+     /// CS-T: the experts of `layer` a predictor expects next - a source that reads a file may start reading their
+     /// pages now, in the background.  Only warms: what `blob` returns is unchanged.  Default: nothing.
+     virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
+@@ -462,6 +465,7 @@ struct ExpertDispatch {
+     /// STRATA_ROUTE_TAIL_SKIP=R: entries skipped (a missed expert every token of the window routes only at rank >= R)
+     /// and the distinct experts behind them (neither copied nor computed)
+     int64_t tail_skipped = 0;
++    int64_t cold_last_moved = 0;   ///< local (io-prio): CPU jobs moved behind the cached ones (cold-last order)
+     int64_t tail_experts = 0;
+     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
+     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
+@@ -656,6 +660,11 @@ public:
+     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
+     bool recheck_unbuffered(std::string& why);
+     bool unbuffered() const { return !direct_.empty(); }
++    /// local (refill-cached): the blob's pages are in the page cache (four sampled pages), so reading it costs no drive read
++    bool blob_cached(int64_t layer, int64_t expert) const {
++        uint64_t total = 0;
++        return cached_bytes(layer, expert, total, false) >= total && total > 0;
++    }
+     /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
+     /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
+     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
+@@ -699,6 +708,7 @@ public:
+     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
+     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
++    bool cold(int64_t layer, int64_t expert) const override;
+     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
+     /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
+     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
+@@ -736,6 +746,7 @@ public:
+         uint64_t pf_demand = 0;                              ///< blobs the layer asked for that the workers were handed
+         uint64_t pf_jobs = 0, pf_read_blobs = 0, pf_resident_skips = 0, pf_dropped = 0;   ///< prefetch workers
+         uint64_t pf_used = 0, pf_unused = 0;                 ///< prefetched blobs a layer then used / never used
++        uint64_t pf_stale = 0;                               ///< local (io-prio): predictions dropped, their layer already reached
+         uint64_t crit_us = 0;                                ///< wall time the decode waited on file reads (prefetch + staged_blob)
+         uint64_t crit_n = 0;
+     };
+@@ -831,6 +842,19 @@ private:
+     std::mutex io_mu_;
+     std::condition_variable io_cv_;
+     std::deque<std::pair<int32_t, int32_t>> io_q_;   ///< (layer, expert) to read ahead
++    // local (io-prio, STRATA_IO_PRIO=0 turns it off): the blobs the layer being computed needs (prefetch) are their own
++    // FIFO queue and always go first; a read-ahead (warm) read starts only while no demand read is queued or in
++    // flight, at most io_ahead_max_ of them at once (STRATA_IO_AHEAD_INFLIGHT, default 2), and a prediction for a
++    // layer the decode has already reached is dropped.  On a SATA SSD the speculative reads otherwise took the
++    // bandwidth the current layer was waiting for.
++    std::deque<std::pair<int32_t, int32_t>> io_dq_;  ///< (layer, expert) the current layer needs
++    bool io_prio_ = true;
++    int io_ahead_max_ = 2;
++    int io_dem_busy_ = 0, io_ahead_busy_ = 0;        ///< reads in flight (under io_mu_)
++    std::atomic<int32_t> io_cur_layer_{-1};           ///< the layer the last prefetch was for
++    std::vector<uint32_t> io_cold_stamp_;             ///< per (layer, expert): io_cold_epoch_ when last read on demand
++    uint32_t io_cold_epoch_ = 0;
++    std::atomic<uint64_t> io_pf_stale_{0};
+     bool io_quit_ = false;
+     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
+     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
+@@ -844,7 +868,7 @@ private:
+     /// `exact` false: four sampled pages (a blob is cached when they are; a handful of syscalls, not hundreds of pages' walk).
+     uint64_t cached_bytes(int64_t layer, int64_t expert, uint64_t& total, bool exact = true) const;
+     void io_worker();
+-    void io_enqueue(int64_t layer, int64_t expert);
++    void io_enqueue(int64_t layer, int64_t expert, bool demand = false);
+     void io_stop();
+     const uint8_t* io_blob(int64_t layer, int64_t expert);
+     const uint8_t* base_ = nullptr;
+@@ -885,6 +909,12 @@ private:
+     void* mapping_ = nullptr;
+ #else
+     int fd_ = -1;
++    // local (split-file, STRATA_EXPERTS_HEAD=<file>): experts.bin's first split_n_ bytes are mapped from a copy on a
++    // faster drive and the rest from experts.bin itself, one contiguous view; head_fd_ backs the view's head,
++    // io_head_fd_ is the I/O threads' descriptor for it (POSIX_FADV_RANDOM)
++    uint64_t split_n_ = 0;
++    int head_fd_ = -1, io_head_fd_ = -1;
++    std::string head_path_;
+ #endif
+     bool unmapped_ = false;   ///< pp-opt: drop_mapping closed the view (base_ stays as the "opened" mark only)
+     bool startup_ub_ = false;                 ///< begin_startup_unbuffered: until end_startup_unbuffered
+diff --git a/serve/server.py b/serve/server.py
+index ff1b935..e15d4d2 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -475,6 +475,47 @@ def experts_loading_words(args: list, size: str) -> str:
+     return f"loading the experts into RAM ({size}) and locking part of them for the GPU."
+ 
+ 
++def _drive_of(path: str) -> str:
++    """The block device a file lives on (nvme0n1p3, sda2, ...), from /sys; '' when it cannot be told."""
++    try:
++        st = os.stat(path)
++        dev = f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
++        if os.path.exists(f"/sys/dev/block/{dev}"):
++            return os.path.basename(os.path.realpath(f"/sys/dev/block/{dev}"))
++        real, best, src = os.path.realpath(path), "", ""   # btrfs gives a subvolume an anonymous device: the source of
++        with open("/proc/self/mountinfo") as f:          # the deepest mount that holds the file
++            for row in f:
++                a, _, b = row.partition(" - ")
++                mnt = a.split()[4]
++                if (real == mnt or real.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(best) and len(b.split()) > 1:
++                    best, src = mnt, b.split()[1]
++        return os.path.basename(src) if src.startswith("/dev/") else ""
++    except (OSError, AttributeError, IndexError):
++        pass
++    return ""
++
++
++def expert_head_words(line: str) -> str:
++    """local (split-file): the engine's STRATA_EXPERTS_HEAD line as one start line that says whether the experts are
++    read from the fast copy (the NVMe) or from the pack itself, and why not."""
++    m = re.search(r"split file: the first ([\d.]+) GiB of experts\.bin \((\d+)%\) from (.+), the rest from (.+)$", line)
++    if m:
++        gib, pct, head, rest = m.groups()
++        drive = _drive_of(head)
++        what = "NVMe copy: ON" if drive.startswith("nvme") else f"fast copy: ON ({drive or 'drive unknown'}, not NVMe)"
++        where = f"{head}" + (f" ({drive})" if drive else "")
++        if pct == "100":
++            return f"[strata] {what} - all {gib} GiB of experts are read from {where}"
++        return f"[strata] {what} - the first {gib} GiB of experts ({pct}%) from {where}, the rest from {rest}"
++    m = re.search(r"STRATA_EXPERTS_HEAD=(.+) ignored \((.*)\): all of experts\.bin from (.+)$", line)
++    if m:
++        head, why, rest = m.groups()
++        drive = _drive_of(rest)
++        return (f"[strata] NVMe copy: OFF - {head} not used ({why}); all experts are read from {rest}"
++                + (f" ({drive})" if drive else "") + " - slower")
++    return "[strata] " + line.strip()
++
++
+ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
+     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
+     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
+@@ -510,6 +551,11 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
+             cut = chunk.rfind(b"\n") + 1
+             pos += cut
+             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
++                if line.startswith("FileExpertSource: ") and ("split file:" in line or " ignored (" in line):
++                    say("head", expert_head_words(line))
++                elif "session is up" in line and "head" not in said:
++                    say("head", "[strata] NVMe copy: OFF - no STRATA_EXPERTS_HEAD in the config; the experts are "
++                                "read from the pack's own drive.")
+                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
+                     say("arena", f"[strata] {loading}\n"
+                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index ad28f56..07e9175 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -593,8 +593,22 @@ int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
+     }
+     const uint8_t* b = mapped_blob(layer, expert);
+     if (b == nullptr) return 0;
+-    out[0] = {b, layer_blob_bytes_[(size_t) layer], io_fds_.empty() ? -1 : io_fds_[0], (uint64_t) (b - base_), 0};
+-    return 1;
++    const int main_fd = io_fds_.empty() ? -1 : io_fds_[0];
++    const uint64_t off = (uint64_t) (b - base_), n = layer_blob_bytes_[(size_t) layer];
++    if (split_n_ == 0 || off >= split_n_) {
++        out[0] = {b, n, main_fd, off, 0};
++        return 1;
++    }
++    // local (split-file): the head copy backs [0, split_n_) at the same offsets
++    const int head = io_head_fd_ >= 0 ? io_head_fd_ : -1;
++    if (off + n <= split_n_) {
++        out[0] = {b, n, head, off, 0};
++        return 1;
++    }
++    const uint64_t n0 = split_n_ - off;
++    out[0] = {b, n0, head, off, 0};
++    out[1] = {b + n0, n - n0, main_fd, split_n_, n0};
++    return 2;
+ }
+ 
+ uint64_t FileExpertSource::cached_bytes(int64_t layer, int64_t expert, uint64_t& total, bool exact) const {
+@@ -628,6 +642,7 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
+     c.pf_dropped = io_pf_dropped_.load(std::memory_order_relaxed);
+     c.pf_used = io_pf_used_.load(std::memory_order_relaxed);
+     c.pf_unused = io_pf_unused_.load(std::memory_order_relaxed);
++    c.pf_stale = io_pf_stale_.load(std::memory_order_relaxed);
+     c.crit_us = io_crit_us_.load(std::memory_order_relaxed);
+     c.crit_n = io_crit_n_.load(std::memory_order_relaxed);
+     return c;
+@@ -649,6 +664,10 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
+         fds.push_back(fd);
+     }
+     io_fds_ = std::move(fds);
++    if (split_n_ > 0 && !head_path_.empty()) {   // local (split-file): the head copy's own descriptor for the preads
++        io_head_fd_ = ::open(head_path_.c_str(), O_RDONLY | O_CLOEXEC);
++        if (io_head_fd_ >= 0) (void) posix_fadvise(io_head_fd_, 0, 0, POSIX_FADV_RANDOM);
++    }
+     {
+         std::lock_guard<std::mutex> lk(stage_mu_);
+         for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
+@@ -656,6 +675,11 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
+     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
+     io_threads_ = threads > 0 ? threads : 8;
+     if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::atoi(v) != 0;
++    if (const char* v = std::getenv("STRATA_IO_PRIO")) io_prio_ = std::atoi(v) != 0;
++    if (const char* v = std::getenv("STRATA_IO_AHEAD_INFLIGHT")) io_ahead_max_ = std::max(0, std::atoi(v));
++    io_cold_stamp_.assign((size_t) (n_layers_ * n_expert_), 0u);
++    io_cold_epoch_ = 0;
++    io_cur_layer_.store(-1, std::memory_order_relaxed);
+     {   // experts.bin: fill the page cache from the workers and let the kernels read the mapping (STRATA_IO_PF_STAGE=1: stage)
+         const char* v = std::getenv("STRATA_IO_PF_STAGE");
+         io_fill_ = role_ptr_.empty() && !(v != nullptr && std::atoi(v) != 0);
+@@ -674,6 +698,7 @@ void FileExpertSource::io_stop() {
+         std::lock_guard<std::mutex> lk(io_mu_);
+         io_quit_ = true;
+         io_q_.clear();
++        io_dq_.clear();
+     }
+     io_cv_.notify_all();
+     for (std::thread& t : io_workers_)
+@@ -681,15 +706,23 @@ void FileExpertSource::io_stop() {
+     io_workers_.clear();
+ #if defined(__linux__)
+     for (int f : io_fds_) ::close(f);
++    if (io_head_fd_ >= 0) ::close(io_head_fd_);
++    io_head_fd_ = -1;
+ #endif
+     io_fds_.clear();
+     io_pf_ = false;
+     io_quit_ = false;
++    io_dem_busy_ = io_ahead_busy_ = 0;
+ }
+ 
+-void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
++void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, bool demand) {
+     {
+         std::lock_guard<std::mutex> lk(io_mu_);
++        if (demand && io_prio_) {   // io-prio: the current layer's blobs, first come first served, never dropped
++            io_dq_.emplace_back((int32_t) layer, (int32_t) expert);
++            io_cv_.notify_one();
++            return;
++        }
+         if (io_q_.size() >= 512) {   // the predictions run ahead of the reads: the oldest are the stalest
+             io_q_.pop_front();
+             io_pf_dropped_.fetch_add(1, std::memory_order_relaxed);
+@@ -704,14 +737,51 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
+ void FileExpertSource::io_worker() {
+     for (;;) {
+         int32_t layer, expert;
++        bool demand = false;
+         {
+             std::unique_lock<std::mutex> lk(io_mu_);
+-            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty(); });
+-            if (io_quit_) return;
+-            layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
+-            expert = io_q_.back().second;
+-            io_q_.pop_back();
++            // io-prio: a read-ahead starts only while nothing the current layer needs is queued or being read
++            auto ahead_ok = [&] {
++                return !io_q_.empty() && (!io_prio_ || (io_dq_.empty() && io_dem_busy_ == 0 && io_ahead_busy_ < io_ahead_max_));
++            };
++            bool got = false;
++            while (!got) {
++                io_cv_.wait(lk, [&] { return io_quit_ || !io_dq_.empty() || ahead_ok(); });
++                if (io_quit_) return;
++                if (!io_dq_.empty()) {
++                    layer = io_dq_.front().first;
++                    expert = io_dq_.front().second;
++                    io_dq_.pop_front();
++                    demand = got = true;
++                    ++io_dem_busy_;
++                    break;
++                }
++                layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
++                expert = io_q_.back().second;
++                io_q_.pop_back();
++                // io-prio: a prediction for a layer the decode has already reached is of no use any more
++                const int32_t cur = io_cur_layer_.load(std::memory_order_relaxed);
++                if (io_prio_ && cur >= 0 && layer <= cur) {
++                    io_pf_stale_.fetch_add(1, std::memory_order_relaxed);
++                    continue;
++                }
++                got = true;
++                ++io_ahead_busy_;
++            }
+         }
++        // whatever path this iteration takes, the in-flight count goes back down and the waiting workers re-check
++        struct InFlight {
++            FileExpertSource* s;
++            bool demand;
++            ~InFlight() {
++                {
++                    std::lock_guard<std::mutex> lk(s->io_mu_);
++                    if (demand) --s->io_dem_busy_;
++                    else --s->io_ahead_busy_;
++                }
++                s->io_cv_.notify_all();
++            }
++        } in_flight{this, demand};
+         io_pf_jobs_.fetch_add(1, std::memory_order_relaxed);
+         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+         if (complement_ready_ && resident_blob(index) != nullptr) continue;
+@@ -722,10 +792,36 @@ void FileExpertSource::io_worker() {
+             Span sp[3];
+             const int ns = spans(layer, expert, sp);
+             bool any = false;
++            // local (io-populate, STRATA_IO_POPULATE=0: the pread below): one large asynchronous read of the blob
++            // (readahead ignores the descriptor's FADV_RANDOM), then MADV_POPULATE_READ waits for it and maps the pages
++            // into this process's page tables - no 2 MB copy through the L3 the pool is working in, and the kernels'
++            // first touch of the blob is not a page fault.  The thread still holds its io-prio slot until the bytes
++            // are in, so the demand-first accounting is unchanged.
++            static const bool populate = [] { const char* v = std::getenv("STRATA_IO_POPULATE"); return v == nullptr || std::atoi(v) != 0; }();
+             for (int i = 0; i < ns; ++i) {
+                 if (sp[i].fd < 0 || resident_sampled_n(sp[i].p, sp[i].n)) continue;
+-                if (scratch.size() < sp[i].n) scratch.resize((size_t) sp[i].n);
+                 const auto t0 = std::chrono::steady_clock::now();
++                if (populate) {
++                    constexpr int kMadvPopulateRead = 22;   // MADV_POPULATE_READ (Linux 5.14)
++                    const uintptr_t a = (uintptr_t) sp[i].p & ~(uintptr_t) 4095;
++                    const size_t len = (size_t) ((((uintptr_t) sp[i].p + sp[i].n + 4095) & ~(uintptr_t) 4095) - a);
++                    // in 128 KiB steps (platform::advise_willneed's): the kernel clips one readahead() to the
++                    // device's read_ahead_kb (256 KiB on the NVMe), so a 1.5-2 MB blob got its first 256 KiB
++                    // ahead and MADV_POPULATE_READ faulted the rest in synchronously (measured: 3.0 -> 1.8 ms
++                    // per cold 1.5 MB blob at QD1, 0.7-0.9 -> 1.2 GB/s with 4 readers)
++                    for (uint64_t at = 0; at < (uint64_t) sp[i].n; at += 128ull << 10)
++                        (void) ::readahead(sp[i].fd, (off64_t) (sp[i].off + at),
++                                           (size_t) std::min<uint64_t>(128ull << 10, (uint64_t) sp[i].n - at));
++                    if (::madvise((void*) a, len, kMadvPopulateRead) == 0) {
++                        io_pread_bytes_.fetch_add(sp[i].n, std::memory_order_relaxed);
++                        io_pread_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
++                                               std::memory_order_relaxed);
++                        io_pread_n_.fetch_add(1, std::memory_order_relaxed);
++                        any = true;
++                        continue;
++                    }
++                }
++                if (scratch.size() < sp[i].n) scratch.resize((size_t) sp[i].n);
+                 if (pread_full(sp[i].fd, scratch.data(), sp[i].n, sp[i].off)) {
+                     io_pread_bytes_.fetch_add(sp[i].n, std::memory_order_relaxed);
+                     io_pread_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+@@ -958,7 +1054,55 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
+         err = buf;
+         return false;
+     }
+-    void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, 0);
++    void* view = MAP_FAILED;
++    // local (split-file): STRATA_EXPERTS_HEAD names a copy of experts.bin's first N bytes (N a multiple of 4096) on a
++    // faster drive.  One address range is reserved, the head copy is mapped over its first N bytes and experts.bin
++    // (from offset N) over the rest, so every blob pointer, mincore and madvise works as before; the I/O threads read
++    // a blob's bytes from whichever file backs them (spans).  16 pages spread over the head are compared with
++    // experts.bin first: a stale or foreign copy is refused and everything is read from experts.bin.
++    if (const char* hp = std::getenv("STRATA_EXPERTS_HEAD"); hp != nullptr && hp[0] != '\0') {
++        const int hfd = ::open(hp, O_RDONLY);
++        struct stat hs{};
++        std::string why;
++        if (hfd < 0) why = "cannot open it";
++        else if (fstat(hfd, &hs) != 0 || hs.st_size <= 0) why = "cannot stat it";
++        else if ((uint64_t) hs.st_size > want || ((uint64_t) hs.st_size < want && hs.st_size % 4096 != 0))
++            why = "its size is not a multiple of 4096 up to experts.bin's";
++        else {
++            const uint64_t n = (uint64_t) hs.st_size;
++            std::vector<uint8_t> a(4096), b(4096);
++            for (int k = 0; k < 16 && why.empty(); ++k) {
++                const uint64_t off = (n / 4096 - 1) * (uint64_t) k / 15 * 4096;
++                if (pread(hfd, a.data(), 4096, (off_t) off) != 4096 || pread(fd, b.data(), 4096, (off_t) off) != 4096 ||
++                    std::memcmp(a.data(), b.data(), 4096) != 0)
++                    why = "it differs from experts.bin at byte " + std::to_string(off);
++            }
++            if (why.empty()) {
++                void* res = mmap(nullptr, (size_t) want, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++                if (res == MAP_FAILED) why = "no address range";
++                else if (mmap(res, (size_t) n, PROT_READ, MAP_SHARED | MAP_FIXED, hfd, 0) == MAP_FAILED ||
++                         (n < want &&   // a head as big as experts.bin is the whole file: nothing from experts.bin
++                          mmap((uint8_t*) res + n, (size_t) (want - n), PROT_READ, MAP_SHARED | MAP_FIXED, fd, (off_t) n) == MAP_FAILED)) {
++                    munmap(res, (size_t) want);
++                    why = "the split mapping failed";
++                } else {
++                    view = res;
++                    split_n_ = n;
++                    head_fd_ = hfd;
++                    head_path_ = hp;
++                    std::fprintf(stderr, "FileExpertSource: split file: the first %.2f GiB of experts.bin (%.0f%%) from %s, "
++                                         "the rest from %s\n", (double) n / 1073741824.0, 100.0 * (double) n / (double) want,
++                                 hp, path.c_str());
++                }
++            }
++        }
++        if (view == MAP_FAILED) {
++            std::fprintf(stderr, "FileExpertSource: STRATA_EXPERTS_HEAD=%s ignored (%s): all of experts.bin from %s\n", hp,
++                         why.c_str(), path.c_str());
++            if (hfd >= 0) ::close(hfd);
++        }
++    }
++    if (view == MAP_FAILED) view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, 0);
+     if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
+     fd_ = fd;
+     base_ = (const uint8_t*) view;
+@@ -1072,6 +1216,9 @@ void FileExpertSource::close() {
+     if (base_ != nullptr) munmap((void*) base_, (size_t) mapped_bytes_);
+     if (fd_ >= 0) ::close(fd_);
+     fd_ = -1;
++    if (head_fd_ >= 0) ::close(head_fd_);   // local (split-file)
++    head_fd_ = -1;
++    split_n_ = 0;
+ #endif
+     base_ = nullptr;
+     blobs_ = 0;
+@@ -1423,9 +1570,16 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
+     return ok ? dst : nullptr;
+ }
+ 
++bool FileExpertSource::cold(int64_t layer, int64_t expert) const {
++    if (io_cold_stamp_.empty() || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return false;
++    return io_cold_epoch_ != 0 && io_cold_stamp_[(size_t) (layer * n_expert_ + expert)] == io_cold_epoch_;
++}
++
+ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n) {
+     if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return;
+     if (io_fill_ && io_pf_ && direct_.empty()) {   // hand the layer's uncached blobs to the workers and go on: the kernels
++        io_cur_layer_.store((int32_t) layer, std::memory_order_relaxed);
++        if (++io_cold_epoch_ == 0) io_cold_epoch_ = 1;   // 0 marks "never"
+         for (int64_t i = 0; i < n; ++i) {          // that reach one before it lands wait on its pages, the rest compute
+             const int64_t e = experts[i];
+             if (e < 0 || e >= n_expert_) continue;
+@@ -1435,7 +1589,8 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
+             uint64_t total = 0;
+             if (cached_bytes(layer, e, total, false) >= total) continue;
+             io_pf_demand_.fetch_add(1, std::memory_order_relaxed);
+-            io_enqueue(layer, e);
++            if (!io_cold_stamp_.empty()) io_cold_stamp_[index] = io_cold_epoch_;
++            io_enqueue(layer, e, /*demand=*/true);
+         }
+         return;
+     }
+@@ -2145,7 +2300,8 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
+             ranges.push_back({(PVOID) p, (SIZE_T) role_bytes_[i]});
+ #else
+             const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
+-            (void) madvise((void*) a, (size_t) ((uintptr_t) p + role_bytes_[i] - a), MADV_WILLNEED);
++            // in 128 KiB steps: one MADV_WILLNEED is clipped to the device's read_ahead_kb
++            strata::platform::advise_willneed((const void*) a, (uint64_t) ((uintptr_t) p + role_bytes_[i] - a));
+ #endif
+         }
+     }
+@@ -3850,6 +4006,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+     }
+     int njobs = 0;
++    static thread_local std::vector<int64_t> job_e;   // local (io-prio): each job's expert, for the cold-last order
++    if (job_e.size() < (size_t) d.n_expert) job_e.resize((size_t) d.n_expert);
+     for (int64_t t = 0; t < n_tok; ++t)
+         for (int64_t j = 0; j < k; ++j) {
+             const int64_t i = t * k + j;
+@@ -3891,6 +4049,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+                     return;
+                 }
+                 jo = (int16_t) njobs++;
++                job_e[(size_t) jo] = e;
+                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
+                 nj.blob = b;
+                 nj.nt = 0;
+@@ -3902,6 +4061,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+             ++jb.nt;
+             ++d.multi_entries;
+         }
++    // local (io-prio): the experts prefetch had to send to the drive go last, so the pool computes the cached ones while
++    // their reads land instead of a worker (and, with the row split, every worker) waiting on a cold blob first.  Each
++    // job writes only its own rows, so the order changes no bit.  STRATA_COLD_LAST=0 keeps the routing order.
++    static const bool cold_last = [] { const char* v = std::getenv("STRATA_COLD_LAST"); return v == nullptr || std::atoi(v) != 0; }();
++    if (cold_last && njobs > 1) {
++        int n_cold = 0;
++        for (int j = 0; j < njobs; ++j) n_cold += d.src->cold(d.layers, job_e[(size_t) j]) ? 1 : 0;
++        if (n_cold > 0 && n_cold < njobs) {
++            static thread_local std::vector<ExpertJobMulti> tmp;
++            tmp.assign(d.jobs_multi.begin(), d.jobs_multi.begin() + njobs);
++            int w = 0;
++            for (int pass = 0; pass < 2; ++pass)
++                for (int j = 0; j < njobs; ++j)
++                    if (d.src->cold(d.layers, job_e[(size_t) j]) == (pass == 1)) d.jobs_multi[(size_t) w++] = tmp[(size_t) j];
++            d.cold_last_moved += n_cold;
++        }
++    }
+     const auto c3 = std::chrono::steady_clock::now();
+     pt("run", njobs);
+     if (njobs > 0) {
+@@ -4679,7 +4855,7 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
+     const auto& lay = strata::kernels::cpu::expert_layout();
+     const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
+     const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
+-    madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
++    strata::platform::advise_willneed((const uint8_t*) map_ + off, end - off);   // 128 KiB steps (read_ahead_kb clip)
+ #endif
+ }
+ 
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 3995ae9..a893de2 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -67,6 +67,16 @@ constexpr float EPS = 1e-6f;
+ using Clock = std::chrono::steady_clock;
+ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+ const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
++// The verify window's per-layer wait limit (default 20 s).  STRATA_VERIFY_TIMEOUT_S raises it on a PC whose expert
++// reads can stall longer than that without being stuck (a SATA SSD under a page-fault storm, low RAM).
++inline std::chrono::seconds g_verify_timeout() {
++    static const std::chrono::seconds s = [] {
++        const char* v = std::getenv("STRATA_VERIFY_TIMEOUT_S");
++        const int n = v != nullptr ? std::atoi(v) : 0;
++        return std::chrono::seconds(n > 0 ? n : 20);
++    }();
++    return s;
++}
+ inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
+ // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
+ struct RouteResidentCfg;
+@@ -206,6 +216,11 @@ bool sh_stream_on() {
+ // HIP keeps the commit graph after every window (STRATA_ONE_TOKEN_COMMIT=0 does too).
+ // The head's hyper-connection read for the window's tokens in one launch set (CUDA; HIP keeps gr_read per token;
+ // STRATA_HEAD_MIX_MULTI=0 does too): bitwise the same sums.
++// local: the verify window's routing in one projection + one top-k launch on HIP (see moe_route_window)
++bool route_window_on() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTE_WINDOW"); return v == nullptr || std::atoi(v) != 0; }();
++    return on;
++}
+ bool head_mix_multi_enabled() {
+ #if defined(STRATA_USE_HIP)
+     static const bool on = [] {
+@@ -1446,8 +1461,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                           NE, n, cs);
+                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
+-#if defined(STRATA_HIP_GFX906)
+-        } else if (dec_batch) {
++#if defined(STRATA_HIP_GFX906) || defined(STRATA_USE_HIP)
++        } else if (dec_batch && route_window_on()) {
++            // local: on every HIP card, not only gfx906 (gfx1200: 2(T-1) fewer dependent launches per layer, ~2.4 us
++            // each in a graph; route_window_parity checks the batched kernels bit for bit on the card).
++            // STRATA_ROUTE_WINDOW=0 keeps the per-token launches.
+             // gfx906: the Coder's 256-expert router (the native router is 512 x 10 only) for the whole window in one
+             // multi-column BF16 projection and one top-k, bitwise the per-token calls (route_window_parity); ~3 ms
+             // of a ~55 ms verify window on 2x MI50.  STRATA_ROUTE_PER_TOKEN=1: the per-token calls.
+@@ -2215,7 +2233,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+                     return false;
+                 }
+             }
+-            if (now - a > std::chrono::seconds(20)) {
++            if (now - a > g_verify_timeout()) {
+                 // #267: the caller ends the engine; no spin kernel may outlive it
+                 trace_ev("TIMEOUT", k, l, (int64_t) cudaStreamQuery(cs_));
+                 if (g_trace) {
+@@ -2899,7 +2917,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
+                     return false;
+                 }
+             }
+-            if (now - a > std::chrono::seconds(20)) {
++            if (now - a > g_verify_timeout()) {
+                 err = "verify batch: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
+                 return false;
+             }
+@@ -3054,7 +3072,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
+                     b_running_ = false;
+                     return -1;
+                 }
+-                if (now - b_last_ > std::chrono::seconds(20)) {
++                if (now - b_last_ > g_verify_timeout()) {
+                     err = "verify batch: timed out at layer " + std::to_string(lb_ + b_k_) + released_note(release_gpu_waits(5000));
+                     b_running_ = false;
+                     return -1;
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 8416444..99f0b80 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -4,6 +4,7 @@
+ #if defined(__cpp_lib_atomic_wait)
+ #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
+ #endif
++#include "strata/platform/memory.hpp"
+ #include "mmq_resident_sort.hpp"
+ #include "wmma_gemm.h"
+ #include "strata/core/mtp.hpp"
+@@ -508,6 +509,10 @@ struct Stager {
+                 uint8_t* rd[kMaxBatch];
+                 size_t nr = 0;
+                 core::ExpertSource* from = nullptr;
++                // the mapped file tier: request the run's blobs before copying, so the OS reads them in large
++                // chunks; a page-cache-starved PC otherwise faults them in 4 KB at a time (no mmap read-around)
++                for (int i = j; i < j + k; ++i)
++                    if (jobs[(size_t) i].from == nullptr) platform::advise_willneed(jobs[(size_t) i].src, jobs[(size_t) i].bytes);
+                 for (int i = j; i < j + k; ++i) {
+                     const Job& jb = jobs[(size_t) i];
+                     if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 1e5299e..ef0a6c6 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -8344,6 +8344,36 @@ int main(int argc, char** argv) {
+         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
+         std::vector<std::pair<int32_t, int32_t>> pending;
+         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
++        // local (refill-cached, opt-in STRATA_REFILL_CACHED_ONLY=1; measured slower on the long-context replay, 7.4 vs
++        // 12.6 tok/s, because a big prompt leaves thousands of slots empty for its reply): with the adaptive tier on one GPU and the
++        // mapped file tier, a prompt's lent slots are refilled after it only with experts whose pages are cached; the
++        // others would be drive reads on the critical path of every turn (2.8-9 s per agent turn on a SATA SSD), for
++        // the coldest experts of the VRAM set.  Their slots stay empty, and the adaptive tier admits the decode's most
++        // used missed experts into them (no victim), up to STRATA_FREE_ADMIT (default 16) per round, from cached pages.
++        std::vector<int32_t> free_slots;
++        const bool refill_cached_only = [&] {
++            const char* v = std::getenv("STRATA_REFILL_CACHED_ONLY");
++            // only when the adaptive tier really runs (a round every few windows): it is what fills the empty slots
++            return (v != nullptr && std::atoi(v) != 0) && o.adapt_every > 0 && o.adapt_every <= 16 && o.adapt_swaps > 0 && srcp == &src &&
++                   stages.empty() && !src.complement_ready() && !src.unbuffered();
++        }();
++        const int free_admit = [] { const char* v = std::getenv("STRATA_FREE_ADMIT"); return v ? std::max(1, std::atoi(v)) : 16; }();
++        int64_t free_admitted = 0, refill_skipped = 0;
++        // local (rank tie-break, STRATA_ADAPT_RANK_TIEBREAK=0 turns it off): among resident experts with the same decayed
++        // usage (most of the profile-filled cache starts at 0) the adaptive tier evicts the one the expert profile ranks
++        // coldest first, so the experts that are hot across conversations survive a topic's swaps.  The bonus is below
++        // any real usage step (usage counts routed tokens, decayed by --adapt-decay), so it only orders ties.
++        const std::vector<float> rank_bonus = [&] {
++            std::vector<float> b;
++            const char* v = std::getenv("STRATA_ADAPT_RANK_TIEBREAK");
++            if ((v != nullptr && std::atoi(v) == 0) || profile.empty()) return b;
++            b.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
++            for (size_t r = 0; r < profile.size(); ++r) {
++                const size_t i = (size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second;
++                if (i < b.size()) b[i] = 1e-3f * (1.0f - (float) r / (float) profile.size());
++            }
++            return b;
++        }();
+         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
+         cudaEvent_t adapt_ev = nullptr;
+         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+@@ -8439,6 +8469,41 @@ int main(int argc, char** argv) {
+         auto adapt = [&]() -> bool {
+             if (!pending.empty()) return true;   // the previous swaps are still in flight
+             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
++            if (refill_cached_only && !free_slots.empty()) {   // local (refill-cached): fill the empty slots first
++                std::vector<std::pair<float, int32_t>> cands;      // (usage, layer * n_expert + expert)
++                for (int64_t l = 0; l < g.n_layers; ++l)
++                    for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
++                        const size_t i = (size_t) l * g.n_expert + (size_t) e;
++                        const float u = drive.d.usage[i];
++                        if (host_res[i] < 0 && u >= 2.0f && !helper_holds(l, e)) cands.emplace_back(u, (int32_t) i);
++                    }
++                const size_t want = std::min<size_t>({cands.size(), free_slots.size(), (size_t) free_admit * 4});
++                std::partial_sort(cands.begin(), cands.begin() + (ptrdiff_t) want, cands.end(),
++                                  [](auto& a, auto& b) { return a.first > b.first; });
++                int admitted = 0;
++                for (size_t c = 0; c < want && admitted < free_admit && !free_slots.empty(); ++c) {
++                    const int32_t i = cands[c].second, l = i / (int32_t) g.n_expert, e = i % (int32_t) g.n_expert;
++                    if (!src.blob_cached(l, e)) continue;   // a drive read here would stall the decode
++                    const uint8_t* b = srcp->blob_stable(l, e);
++                    const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
++                    const int32_t slot = free_slots.back();
++                    if (b == nullptr || nb > (size_t) (xcache.slot_offset(slot + 1) - xcache.slot_offset(slot))) continue;
++                    if (adapt_copy_h2d(xcache.device_slot(slot), b, nb, adapt_stream) != cudaSuccess) {
++                        std::fprintf(stderr, "strata serve: free-slot admission copy failed: %s\n", cudaGetErrorString(cudaGetLastError()));
++                        return false;
++                    }
++                    free_slots.pop_back();
++                    pending.emplace_back(i, slot);   // resident once the copy has landed (apply_pending)
++                    ++admitted;
++                }
++                if (admitted > 0) {
++                    free_admitted += admitted;
++                    cudaEventRecord(adapt_ev, adapt_stream);
++                    for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
++                    for (float& v : drive.d.usage) v *= o.adapt_decay;
++                    return true;
++                }
++            }
+             struct Swap { float gain; int32_t layer, in, out; };
+             std::vector<Swap> swaps;
+             std::vector<std::pair<float, int32_t>> cand, vict;
+@@ -8449,7 +8514,7 @@ int main(int argc, char** argv) {
+                 const int32_t* r = host_res.data() + l * g.n_expert;
+                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+-                    else vict.emplace_back(u[e], e);
++                    else vict.emplace_back(u[e] + (rank_bonus.empty() ? 0.0f : rank_bonus[(size_t) (l * g.n_expert + e)]), e);
+                 }
+                 if (cand.empty() || vict.empty()) continue;
+                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+@@ -8937,13 +9002,25 @@ int main(int argc, char** argv) {
+         // A swap still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
+         auto save_profile = [&](const char* why) {
+             if (heat.empty()) return;
++            // local: STRATA_PROFILE_ROUTING_ONLY=1 ranks by the routing alone, not the experts resident now first.
++            // With static residency (a large --adapt-every) no round ever folds the counts into `heat`, so the
++            // undecayed counts since the start (drive.d.usage) are added here.
++            static const bool routing_only = [] {
++                const char* v = std::getenv("STRATA_PROFILE_ROUTING_ONLY");
++                return v != nullptr && v[0] == '1';
++            }();
++            std::vector<double> h = heat;
++            if (routing_only)
++                for (size_t i = 0; i < h.size() && i < drive.d.usage.size(); ++i) h[i] += (double) drive.d.usage[i];
+             std::vector<uint8_t> resident(host_res.size(), 0);
+-            for (size_t i = 0; i < host_res.size(); ++i) resident[i] = host_res[i] >= 0;
+-            for (const auto& p : pending) resident[(size_t) p.first] = 1;
+-            if (astate == AState::SwapIn)   // --adapt-async: the same for a round past its step 2
+-                for (const ASwap& w : aswaps) resident[(size_t) w.layer * g.n_expert + w.in] = 1;
++            if (!routing_only) {
++                for (size_t i = 0; i < host_res.size(); ++i) resident[i] = host_res[i] >= 0;
++                for (const auto& p : pending) resident[(size_t) p.first] = 1;
++                if (astate == AState::SwapIn)   // --adapt-async: the same for a round past its step 2
++                    for (const ASwap& w : aswaps) resident[(size_t) w.layer * g.n_expert + w.in] = 1;
++            }
+             std::string e;
+-            const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat,
++            const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, h,
+                                                                    profile_loaded);
+             if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
+                 std::fprintf(stderr, "strata serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(),
+@@ -10838,7 +10915,29 @@ int main(int argc, char** argv) {
+             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
+                 tr("refill start", (long long) p.lent.size());
+                 const strata::core::OnDevice on(p.dev);
++                // the mapped file tier: keep the next 64 blobs requested ahead of the copies (large OS reads
++                // instead of 4 KB faults once the page cache has thrashed, as after a long prompt on a low-RAM PC)
++                constexpr size_t kAhead = 64;
++                auto advise_lent = [&](size_t n) {
++                    if (n >= p.lent.size()) return;
++                    const int64_t li = p.lent[n].first;
++                    strata::platform::advise_willneed(srcp->blob_stable(li / g.n_expert, li % g.n_expert),
++                        (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(li / g.n_expert));
++                };
++                // local (refill-cached): only what the page cache holds is refilled, so nothing is read ahead either
++                const bool cached_only = refill_cached_only && p.dev < 0;
++                if (!cached_only)
++                    for (size_t n = 0; n < kAhead; ++n) advise_lent(n);
++                size_t done_n = 0;
+                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
++                    if (cached_only) {
++                        if (!src.blob_cached(i / g.n_expert, i % g.n_expert)) {
++                            free_slots.push_back(slot);   // left empty: the adaptive tier fills it from the decode
++                            ++refill_skipped;
++                            continue;
++                        }
++                    } else
++                        advise_lent(kAhead + done_n++);
+                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
+@@ -10885,6 +10984,10 @@ int main(int argc, char** argv) {
+                 }
+                 if (n_parts > 0) res_upload();
+                 if (trace && n_parts > 0) {
++                    if (refill_cached_only)
++                        std::fprintf(stderr, "strata trace: refill-cached: %lld lent slots left empty so far, %lld free slots now, "
++                                             "%lld experts admitted into free slots so far\n", (long long) refill_skipped,
++                                     (long long) free_slots.size(), (long long) free_admitted);
+                     std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
+                                  (long long) n_lent, (long long) n_parts,
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+@@ -12479,6 +12582,10 @@ int main(int argc, char** argv) {
+                                      (unsigned long long) (ic.pf_dropped - ic_prev.pf_dropped),
+                                      (double) (ic.crit_us - ic_prev.crit_us) / 1e3,
+                                      (unsigned long long) (ic.crit_n - ic_prev.crit_n));
++                    if (src.io_prefetch())   // local (io-prio)
++                        std::fprintf(stderr, "; io-prio: %llu demand reads, %llu stale predictions dropped, %lld CPU jobs ordered cold-last",
++                                     (unsigned long long) (ic.pf_demand - ic_prev.pf_demand),
++                                     (unsigned long long) (ic.pf_stale - ic_prev.pf_stale), (long long) drive.d.cold_last_moved);
+                     std::fprintf(stderr, "\n");
+                     io_prev = io_now;
+                     ic_prev = ic;
