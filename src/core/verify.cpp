@@ -67,6 +67,16 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// The verify window's per-layer wait limit (default 20 s).  STRATA_VERIFY_TIMEOUT_S raises it on a PC whose expert
+// reads can stall longer than that without being stuck (a SATA SSD under a page-fault storm, low RAM).
+inline std::chrono::seconds g_verify_timeout() {
+    static const std::chrono::seconds s = [] {
+        const char* v = std::getenv("STRATA_VERIFY_TIMEOUT_S");
+        const int n = v != nullptr ? std::atoi(v) : 0;
+        return std::chrono::seconds(n > 0 ? n : 20);
+    }();
+    return s;
+}
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
 // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
 struct RouteResidentCfg;
@@ -206,6 +216,11 @@ bool sh_stream_on() {
 // HIP keeps the commit graph after every window (STRATA_ONE_TOKEN_COMMIT=0 does too).
 // The head's hyper-connection read for the window's tokens in one launch set (CUDA; HIP keeps gr_read per token;
 // STRATA_HEAD_MIX_MULTI=0 does too): bitwise the same sums.
+// local: the verify window's routing in one projection + one top-k launch on HIP (see moe_route_window)
+bool route_window_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTE_WINDOW"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
 bool head_mix_multi_enabled() {
 #if defined(STRATA_USE_HIP)
     static const bool on = [] {
@@ -1446,8 +1461,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                           NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
-#if defined(STRATA_HIP_GFX906)
-        } else if (dec_batch) {
+#if defined(STRATA_HIP_GFX906) || defined(STRATA_USE_HIP)
+        } else if (dec_batch && route_window_on()) {
+            // local: on every HIP card, not only gfx906 (gfx1200: 2(T-1) fewer dependent launches per layer, ~2.4 us
+            // each in a graph; route_window_parity checks the batched kernels bit for bit on the card).
+            // STRATA_ROUTE_WINDOW=0 keeps the per-token launches.
             // gfx906: the Coder's 256-expert router (the native router is 512 x 10 only) for the whole window in one
             // multi-column BF16 projection and one top-k, bitwise the per-token calls (route_window_parity); ~3 ms
             // of a ~55 ms verify window on 2x MI50.  STRATA_ROUTE_PER_TOKEN=1: the per-token calls.
@@ -2215,7 +2233,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
+            if (now - a > g_verify_timeout()) {
                 // #267: the caller ends the engine; no spin kernel may outlive it
                 trace_ev("TIMEOUT", k, l, (int64_t) cudaStreamQuery(cs_));
                 if (g_trace) {
@@ -2899,7 +2917,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
+            if (now - a > g_verify_timeout()) {
                 err = "verify batch: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
                 return false;
             }
@@ -3054,7 +3072,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
                     b_running_ = false;
                     return -1;
                 }
-                if (now - b_last_ > std::chrono::seconds(20)) {
+                if (now - b_last_ > g_verify_timeout()) {
                     err = "verify batch: timed out at layer " + std::to_string(lb_ + b_k_) + released_note(release_gpu_waits(5000));
                     b_running_ = false;
                     return -1;

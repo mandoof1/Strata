@@ -8344,6 +8344,36 @@ int main(int argc, char** argv) {
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
+        // local (refill-cached, opt-in STRATA_REFILL_CACHED_ONLY=1; measured slower on the long-context replay, 7.4 vs
+        // 12.6 tok/s, because a big prompt leaves thousands of slots empty for its reply): with the adaptive tier on one GPU and the
+        // mapped file tier, a prompt's lent slots are refilled after it only with experts whose pages are cached; the
+        // others would be drive reads on the critical path of every turn (2.8-9 s per agent turn on a SATA SSD), for
+        // the coldest experts of the VRAM set.  Their slots stay empty, and the adaptive tier admits the decode's most
+        // used missed experts into them (no victim), up to STRATA_FREE_ADMIT (default 16) per round, from cached pages.
+        std::vector<int32_t> free_slots;
+        const bool refill_cached_only = [&] {
+            const char* v = std::getenv("STRATA_REFILL_CACHED_ONLY");
+            // only when the adaptive tier really runs (a round every few windows): it is what fills the empty slots
+            return (v != nullptr && std::atoi(v) != 0) && o.adapt_every > 0 && o.adapt_every <= 16 && o.adapt_swaps > 0 && srcp == &src &&
+                   stages.empty() && !src.complement_ready() && !src.unbuffered();
+        }();
+        const int free_admit = [] { const char* v = std::getenv("STRATA_FREE_ADMIT"); return v ? std::max(1, std::atoi(v)) : 16; }();
+        int64_t free_admitted = 0, refill_skipped = 0;
+        // local (rank tie-break, STRATA_ADAPT_RANK_TIEBREAK=0 turns it off): among resident experts with the same decayed
+        // usage (most of the profile-filled cache starts at 0) the adaptive tier evicts the one the expert profile ranks
+        // coldest first, so the experts that are hot across conversations survive a topic's swaps.  The bonus is below
+        // any real usage step (usage counts routed tokens, decayed by --adapt-decay), so it only orders ties.
+        const std::vector<float> rank_bonus = [&] {
+            std::vector<float> b;
+            const char* v = std::getenv("STRATA_ADAPT_RANK_TIEBREAK");
+            if ((v != nullptr && std::atoi(v) == 0) || profile.empty()) return b;
+            b.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            for (size_t r = 0; r < profile.size(); ++r) {
+                const size_t i = (size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second;
+                if (i < b.size()) b[i] = 1e-3f * (1.0f - (float) r / (float) profile.size());
+            }
+            return b;
+        }();
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
@@ -8439,6 +8469,41 @@ int main(int argc, char** argv) {
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
+            if (refill_cached_only && !free_slots.empty()) {   // local (refill-cached): fill the empty slots first
+                std::vector<std::pair<float, int32_t>> cands;      // (usage, layer * n_expert + expert)
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                        const size_t i = (size_t) l * g.n_expert + (size_t) e;
+                        const float u = drive.d.usage[i];
+                        if (host_res[i] < 0 && u >= 2.0f && !helper_holds(l, e)) cands.emplace_back(u, (int32_t) i);
+                    }
+                const size_t want = std::min<size_t>({cands.size(), free_slots.size(), (size_t) free_admit * 4});
+                std::partial_sort(cands.begin(), cands.begin() + (ptrdiff_t) want, cands.end(),
+                                  [](auto& a, auto& b) { return a.first > b.first; });
+                int admitted = 0;
+                for (size_t c = 0; c < want && admitted < free_admit && !free_slots.empty(); ++c) {
+                    const int32_t i = cands[c].second, l = i / (int32_t) g.n_expert, e = i % (int32_t) g.n_expert;
+                    if (!src.blob_cached(l, e)) continue;   // a drive read here would stall the decode
+                    const uint8_t* b = srcp->blob_stable(l, e);
+                    const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                    const int32_t slot = free_slots.back();
+                    if (b == nullptr || nb > (size_t) (xcache.slot_offset(slot + 1) - xcache.slot_offset(slot))) continue;
+                    if (adapt_copy_h2d(xcache.device_slot(slot), b, nb, adapt_stream) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: free-slot admission copy failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                        return false;
+                    }
+                    free_slots.pop_back();
+                    pending.emplace_back(i, slot);   // resident once the copy has landed (apply_pending)
+                    ++admitted;
+                }
+                if (admitted > 0) {
+                    free_admitted += admitted;
+                    cudaEventRecord(adapt_ev, adapt_stream);
+                    for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
+                    for (float& v : drive.d.usage) v *= o.adapt_decay;
+                    return true;
+                }
+            }
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -8449,7 +8514,7 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    else vict.emplace_back(u[e] + (rank_bonus.empty() ? 0.0f : rank_bonus[(size_t) (l * g.n_expert + e)]), e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -8937,13 +9002,25 @@ int main(int argc, char** argv) {
         // A swap still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
         auto save_profile = [&](const char* why) {
             if (heat.empty()) return;
+            // local: STRATA_PROFILE_ROUTING_ONLY=1 ranks by the routing alone, not the experts resident now first.
+            // With static residency (a large --adapt-every) no round ever folds the counts into `heat`, so the
+            // undecayed counts since the start (drive.d.usage) are added here.
+            static const bool routing_only = [] {
+                const char* v = std::getenv("STRATA_PROFILE_ROUTING_ONLY");
+                return v != nullptr && v[0] == '1';
+            }();
+            std::vector<double> h = heat;
+            if (routing_only)
+                for (size_t i = 0; i < h.size() && i < drive.d.usage.size(); ++i) h[i] += (double) drive.d.usage[i];
             std::vector<uint8_t> resident(host_res.size(), 0);
-            for (size_t i = 0; i < host_res.size(); ++i) resident[i] = host_res[i] >= 0;
-            for (const auto& p : pending) resident[(size_t) p.first] = 1;
-            if (astate == AState::SwapIn)   // --adapt-async: the same for a round past its step 2
-                for (const ASwap& w : aswaps) resident[(size_t) w.layer * g.n_expert + w.in] = 1;
+            if (!routing_only) {
+                for (size_t i = 0; i < host_res.size(); ++i) resident[i] = host_res[i] >= 0;
+                for (const auto& p : pending) resident[(size_t) p.first] = 1;
+                if (astate == AState::SwapIn)   // --adapt-async: the same for a round past its step 2
+                    for (const ASwap& w : aswaps) resident[(size_t) w.layer * g.n_expert + w.in] = 1;
+            }
             std::string e;
-            const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat,
+            const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, h,
                                                                    profile_loaded);
             if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
                 std::fprintf(stderr, "strata serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(),
@@ -10838,7 +10915,29 @@ int main(int argc, char** argv) {
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
+                // the mapped file tier: keep the next 64 blobs requested ahead of the copies (large OS reads
+                // instead of 4 KB faults once the page cache has thrashed, as after a long prompt on a low-RAM PC)
+                constexpr size_t kAhead = 64;
+                auto advise_lent = [&](size_t n) {
+                    if (n >= p.lent.size()) return;
+                    const int64_t li = p.lent[n].first;
+                    strata::platform::advise_willneed(srcp->blob_stable(li / g.n_expert, li % g.n_expert),
+                        (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(li / g.n_expert));
+                };
+                // local (refill-cached): only what the page cache holds is refilled, so nothing is read ahead either
+                const bool cached_only = refill_cached_only && p.dev < 0;
+                if (!cached_only)
+                    for (size_t n = 0; n < kAhead; ++n) advise_lent(n);
+                size_t done_n = 0;
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                    if (cached_only) {
+                        if (!src.blob_cached(i / g.n_expert, i % g.n_expert)) {
+                            free_slots.push_back(slot);   // left empty: the adaptive tier fills it from the decode
+                            ++refill_skipped;
+                            continue;
+                        }
+                    } else
+                        advise_lent(kAhead + done_n++);
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
@@ -10885,6 +10984,10 @@ int main(int argc, char** argv) {
                 }
                 if (n_parts > 0) res_upload();
                 if (trace && n_parts > 0) {
+                    if (refill_cached_only)
+                        std::fprintf(stderr, "strata trace: refill-cached: %lld lent slots left empty so far, %lld free slots now, "
+                                             "%lld experts admitted into free slots so far\n", (long long) refill_skipped,
+                                     (long long) free_slots.size(), (long long) free_admitted);
                     std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
                                  (long long) n_lent, (long long) n_parts,
                                  std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
@@ -12479,6 +12582,10 @@ int main(int argc, char** argv) {
                                      (unsigned long long) (ic.pf_dropped - ic_prev.pf_dropped),
                                      (double) (ic.crit_us - ic_prev.crit_us) / 1e3,
                                      (unsigned long long) (ic.crit_n - ic_prev.crit_n));
+                    if (src.io_prefetch())   // local (io-prio)
+                        std::fprintf(stderr, "; io-prio: %llu demand reads, %llu stale predictions dropped, %lld CPU jobs ordered cold-last",
+                                     (unsigned long long) (ic.pf_demand - ic_prev.pf_demand),
+                                     (unsigned long long) (ic.pf_stale - ic_prev.pf_stale), (long long) drive.d.cold_last_moved);
                     std::fprintf(stderr, "\n");
                     io_prev = io_now;
                     ic_prev = ic;
