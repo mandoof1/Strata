@@ -900,6 +900,11 @@ private:
     std::deque<std::pair<int32_t, int32_t>> io_wq_;
     static constexpr size_t kWarmQueueMax = 64;
     std::atomic<uint64_t> io_warm_queued_{0}, io_warm_read_{0}, io_warm_cached_{0}, io_warm_dropped_{0};
+    // local (probe-trim, STRATA_PROBE_TRIM=1, same output): the page-cache probe in two mincore calls instead of four for
+    // the blobs this process has mapped (io_mapped_: populated by an I/O worker or handed to the pool), the worker's
+    // second probe of a demand blob the layer just probed cold dropped, and one lock per layer for its demand reads
+    bool probe_trim_ = false;
+    std::unique_ptr<std::atomic<uint8_t>[]> io_mapped_;
     bool io_prio_ = true;
     int io_ahead_max_ = 2;
     int io_dem_busy_ = 0, io_ahead_busy_ = 0;        ///< reads in flight (under io_mu_)

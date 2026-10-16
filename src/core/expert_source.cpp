@@ -575,6 +575,24 @@ uint64_t resident_sampled(const uint8_t* p, uint64_t n) {
     return n;
 }
 bool resident_sampled_n(const uint8_t* p, uint64_t n) { return resident_sampled(p, n) >= n; }
+/// local (probe-trim): resident_sampled's answer from the same four pages in two calls - the first page alone (a cold
+/// blob ends there, as before), then one call from the second sampled page to the last.  Only for pages this process
+/// has mapped: on this box (1.75 MiB, i5-9400F) 4 single-page calls 3.3 us, these two 2.0 us mapped but ~9 us when the
+/// pages are cached and not mapped (the range call then looks every page up in the page cache), a cold blob 0.8 us.
+uint64_t resident_sampled_2(const uint8_t* p, uint64_t n) {
+    if (n == 0) return 0;
+    const uintptr_t a = (uintptr_t) p & ~(uintptr_t) 4095, e = ((uintptr_t) p + (uintptr_t) n - 1) & ~(uintptr_t) 4095;
+    const uintptr_t pages = (e - a) / 4096;
+    unsigned char v = 0;
+    if (mincore((void*) a, 4096, &v) != 0 || (v & 1) == 0) return 0;
+    if (pages == 0) return n;
+    const uintptr_t s1 = a + (pages / 3) * 4096, s2 = a + (pages * 2 / 3) * 4096;
+    static thread_local std::vector<unsigned char> vec;
+    vec.resize((size_t) ((e - s1) / 4096 + 1));
+    if (mincore((void*) s1, (size_t) (e - s1 + 4096), vec.data()) != 0) return 0;
+    if ((vec[0] & 1) == 0 || (vec[(size_t) ((s2 - s1) / 4096)] & 1) == 0 || (vec[(size_t) ((e - s1) / 4096)] & 1) == 0) return 0;
+    return n;
+}
 /// The whole range with pread (a short read continues); false on an error or an end of file.
 bool pread_full(int fd, uint8_t* dst, uint64_t n, uint64_t off) {
     uint64_t done = 0;
@@ -630,9 +648,12 @@ uint64_t FileExpertSource::cached_bytes(int64_t layer, int64_t expert, uint64_t&
     Span sp[3];
     const int ns = spans(layer, expert, sp);
     uint64_t res = 0;
+    // local (probe-trim): the same sampled pages in two calls where this process has them mapped
+    const bool two = !exact && probe_trim_ && io_mapped_ && ns > 0 &&
+                     io_mapped_[(size_t) layer * (size_t) n_expert_ + (size_t) expert].load(std::memory_order_relaxed) != 0;
     for (int i = 0; i < ns; ++i) {
         total += sp[i].n;
-        res += exact ? resident_in(sp[i].p, sp[i].n) : resident_sampled(sp[i].p, sp[i].n);
+        res += exact ? resident_in(sp[i].p, sp[i].n) : two ? resident_sampled_2(sp[i].p, sp[i].n) : resident_sampled(sp[i].p, sp[i].n);
     }
     return res;
 #else
@@ -690,6 +711,12 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
         for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
     }
     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
+    if (const char* v = std::getenv("STRATA_PROBE_TRIM")) probe_trim_ = std::atoi(v) != 0;
+    if (probe_trim_ && !io_mapped_) {
+        io_mapped_.reset(new std::atomic<uint8_t>[(size_t) (n_layers_ * n_expert_)]());
+        std::fprintf(stderr, "strata: STRATA_PROBE_TRIM=1: page-cache probes in two calls for mapped blobs, one lock per "
+                             "layer for the demand reads (same output)\n");
+    }
     io_threads_ = threads > 0 ? threads : 8;
     if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::atoi(v) != 0;
     if (const char* v = std::getenv("STRATA_IO_PRIO")) io_prio_ = std::atoi(v) != 0;
@@ -828,8 +855,10 @@ void FileExpertSource::io_worker() {
             // first touch of the blob is not a page fault.  The thread still holds its io-prio slot until the bytes
             // are in, so the demand-first accounting is unchanged.
             static const bool populate = [] { const char* v = std::getenv("STRATA_IO_POPULATE"); return v == nullptr || std::atoi(v) != 0; }();
+            // local (probe-trim): a one-span demand blob was probed cold by the layer just now: no second probe
+            const bool probed = probe_trim_ && demand && ns == 1;
             for (int i = 0; i < ns; ++i) {
-                if (sp[i].fd < 0 || resident_sampled_n(sp[i].p, sp[i].n)) continue;
+                if (sp[i].fd < 0 || (!probed && resident_sampled_n(sp[i].p, sp[i].n))) continue;
                 const auto t0 = std::chrono::steady_clock::now();
                 if (populate) {
                     constexpr int kMadvPopulateRead = 22;   // MADV_POPULATE_READ (Linux 5.14)
@@ -843,6 +872,7 @@ void FileExpertSource::io_worker() {
                         (void) ::readahead(sp[i].fd, (off64_t) (sp[i].off + at),
                                            (size_t) std::min<uint64_t>(128ull << 10, (uint64_t) sp[i].n - at));
                     if (::madvise((void*) a, len, kMadvPopulateRead) == 0) {
+                        if (io_mapped_ && ns == 1) io_mapped_[index].store(1, std::memory_order_relaxed);   // local (probe-trim)
                         io_pread_bytes_.fetch_add(sp[i].n, std::memory_order_relaxed);
                         io_pread_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                                                std::memory_order_relaxed);
@@ -908,6 +938,8 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
         if (b != nullptr) {
             const uint64_t total = layer_blob_bytes_[(size_t) layer];
             file_read_bytes_.fetch_add(total, std::memory_order_relaxed);
+            // local (probe-trim): the pool reads every page of it through this mapping
+            if (io_mapped_) io_mapped_[(size_t) key].store(1, std::memory_order_relaxed);
         }
         return b;
     }
@@ -1643,6 +1675,9 @@ void FileExpertSource::prefetch_probed(int64_t layer, const int64_t* experts, in
     if (io_fill_ && io_pf_ && direct_.empty()) {   // hand the layer's uncached blobs to the workers and go on: the kernels
         io_cur_layer_.store((int32_t) layer, std::memory_order_relaxed);
         if (++io_cold_epoch_ == 0) io_cold_epoch_ = 1;   // 0 marks "never"
+        const bool batch = probe_trim_ && io_prio_;   // local (probe-trim): enqueue once, below
+        static thread_local std::vector<std::pair<int32_t, int32_t>> cold_q;
+        cold_q.clear();
         for (int64_t i = 0; i < n; ++i) {          // that reach one before it lands wait on its pages, the rest compute
             const int64_t e = experts[i];
             if (e < 0 || e >= n_expert_) continue;
@@ -1656,7 +1691,15 @@ void FileExpertSource::prefetch_probed(int64_t layer, const int64_t* experts, in
             } else if (cached_bytes(layer, e, total, false) >= total) continue;
             io_pf_demand_.fetch_add(1, std::memory_order_relaxed);
             if (!io_cold_stamp_.empty()) io_cold_stamp_[index] = io_cold_epoch_;
+            if (batch) { cold_q.emplace_back((int32_t) layer, (int32_t) e); continue; }
             io_enqueue(layer, e, /*demand=*/true);
+        }
+        if (batch && !cold_q.empty()) {   // local (probe-trim): the layer's demand reads under one lock, the wake-ups after it
+            {
+                std::lock_guard<std::mutex> lk(io_mu_);
+                io_dq_.insert(io_dq_.end(), cold_q.begin(), cold_q.end());
+            }
+            for (size_t w = 0; w < std::min(cold_q.size(), (size_t) io_threads_); ++w) io_cv_.notify_one();
         }
         return;
     }
@@ -2846,6 +2889,8 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
     }();
     if (!enabled || base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return 0;
+    if (io_mapped_)   // local (probe-trim): its pages leave this process's mapping
+        io_mapped_[(size_t) layer * (size_t) n_expert_ + (size_t) expert].store(0, std::memory_order_relaxed);
     static const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
     // STRATA_FILE_RELEASE_ADVICE=cold: MADV_COLD (the pages go first under pressure, but stay while there is none)
     static std::atomic<int> advice{[] { const char* v = std::getenv("STRATA_FILE_RELEASE_ADVICE");
