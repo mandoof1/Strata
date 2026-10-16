@@ -51,4 +51,11 @@ void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n
 void iq256_gu_single_exact(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act,
                            float* ff, int r0, int r1);
 
+/// #1415 / #1544: the same, bit for bit ggml-cpu's AVX2 single-token vec_dot, for IQ2_XXS (16), IQ2_XS (17), IQ3_XXS
+/// (18), IQ3_S (21) and IQ2_S (22) gate/up rows, in the calling thread's variant (iq256_variant: gather, AVX-VNNI;
+/// the same bits).  The engine takes it for IQ2_XXS and IQ2_XS with STRATA_CPU_IQ_ALL_EXACT1=1 (native_expert.cpp);
+/// IQ3_XXS, IQ3_S and IQ2_S keep iq256_gu_single_exact.  The caller checks the CPU and ggml's build (as above).
+void iq256_gu_rows_exact_one(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                             const void* act, float* ff, int r0, int r1);
+
 }  // namespace strata::kernels::cpu

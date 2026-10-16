@@ -582,4 +582,44 @@ void iq256_gu_single_exact(int type, const uint8_t* blob, size_t gu_row, size_t 
     }
 }
 
+// #1415 / #1544 (iq256_gu_rows_exact_one): the rows' own decode in ggml's float order, every variant
+void iq256_gu_rows_exact_one(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act,
+                             float* ff, int r0, int r1) {
+    const auto* y = (const block_q8_K*) act;
+    const bool g = (iq256_variant() & kIq256Gather) != 0;
+#if STRATA_AVXVNNI
+    if (vnni_on()) {
+        switch (type) {
+            case 16: vnni::gu_ggml_one<16>(blob, gu_row, up_off, n, y, ff, r0, r1); break;
+            case 17: vnni::gu_ggml_one<17>(blob, gu_row, up_off, n, y, ff, r0, r1); break;
+            case 18: if (g) vnni::gu_ggml_one<118>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                     else vnni::gu_ggml_one<18>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                     break;
+            case 21: if (g) vnni::gu_ggml_one<121>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                     else vnni::gu_ggml_one<21>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                     break;
+            case 22: if (g) vnni::gu_ggml_one<122>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                     else vnni::gu_ggml_one<22>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                     break;
+            default: break;
+        }
+        return;
+    }
+#endif
+    switch (type) {
+        case 16: plain::gu_ggml_one<16>(blob, gu_row, up_off, n, y, ff, r0, r1); break;
+        case 17: plain::gu_ggml_one<17>(blob, gu_row, up_off, n, y, ff, r0, r1); break;
+        case 18: if (g) plain::gu_ggml_one<118>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                 else plain::gu_ggml_one<18>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                 break;
+        case 21: if (g) plain::gu_ggml_one<121>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                 else plain::gu_ggml_one<21>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                 break;
+        case 22: if (g) plain::gu_ggml_one<122>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                 else plain::gu_ggml_one<22>(blob, gu_row, up_off, n, y, ff, r0, r1);
+                 break;
+        default: break;
+    }
+}
+
 }  // namespace strata::kernels::cpu

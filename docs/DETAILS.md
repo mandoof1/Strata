@@ -525,6 +525,9 @@ gate/up and IQ4_NL down rows both exact: gate/up 15.15-15.20 -> 13.97-14.18 ms p
 7.49-7.53 -> 7.62-7.72 ms (about +2%, slower, so the down rows stay on ggml's dot), the pool call 30.9-32.1 -> 29.8-30.4
 ms (about -3%). Decode speed did not change measurably at this configuration (23.47-23.77 -> 23.83-23.86 tok/s): the
 pool is about 30 ms of a 110 ms round. `STRATA_CPU_SINGLE_EXACT=0` keeps ggml's dot.
+`STRATA_CPU_IQ_ALL_EXACT1=1` (opt-in, #1415 / #1544) does the same for IQ2_XXS and IQ2_XS gate/up rows (and, with
+`STRATA_CPU_SINGLE_EXACT=0`, takes #1544's kernels for IQ3_XXS, IQ3_S and IQ2_S too); also ggml's bits
+(`iq_single_parity`, `iq_avx2_parity`).
 
 ### Running it at startup (Task Scheduler)
 

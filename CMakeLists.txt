@@ -1398,7 +1398,10 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_BUILD_TESTS)
     add_test(NAME iq_single_parity COMMAND iq_single_parity)
     add_test(NAME iq_single_parity_off COMMAND ${CMAKE_COMMAND} -E env STRATA_CPU_SINGLE_EXACT=0 $<TARGET_FILE:iq_single_parity>)
-    set_tests_properties(iq_single_parity iq_single_parity_off PROPERTIES SKIP_RETURN_CODE 77)
+    # #1415 / #1544: IQ2_XXS / IQ2_XS through the dispatch, and all five with #2215's kernel off
+    add_test(NAME iq_single_parity_all1 COMMAND ${CMAKE_COMMAND} -E env STRATA_CPU_IQ_ALL_EXACT1=1 $<TARGET_FILE:iq_single_parity>)
+    add_test(NAME iq_single_parity_all1_off COMMAND ${CMAKE_COMMAND} -E env STRATA_CPU_IQ_ALL_EXACT1=1 STRATA_CPU_SINGLE_EXACT=0 $<TARGET_FILE:iq_single_parity>)
+    set_tests_properties(iq_single_parity iq_single_parity_off iq_single_parity_all1 iq_single_parity_all1_off PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # the older CPUs' AVX1 expert rows (iq_avx1.cpp) against ggml-cpu's dots and against their own one-token
   # rows at every width; --bench: ms per expert, the weights streamed from DRAM.  Runs on any AVX CPU:

@@ -1,6 +1,8 @@
 // src/kernels/cpu/iq_single_parity.cpp - one token's gate/up rows on an AVX-2 CPU without AVX-512, bit for bit
-// ggml-cpu's AVX2 single-token vec_dot: iq256_gu_single_exact (IQ3_XXS, IQ3_S, IQ2_S, SwiGLU included) and the
-// engine's dispatch (native_gu_rows at nt = 1, which takes it unless STRATA_CPU_SINGLE_EXACT=0).  No GPU, no model:
+// ggml-cpu's AVX2 single-token vec_dot: iq256_gu_single_exact (IQ3_XXS, IQ3_S, IQ2_S, SwiGLU included),
+// iq256_gu_rows_exact_one (#1415 / #1544: IQ2_XXS, IQ2_XS and the same three) and the engine's dispatch
+// (native_gu_rows at nt = 1, which takes the first unless STRATA_CPU_SINGLE_EXACT=0, the second for IQ2_XXS / IQ2_XS
+// with STRATA_CPU_IQ_ALL_EXACT1=1).  No GPU, no model:
 // random blocks with finite scales.  Exit 77 (skipped) where ggml-cpu is not the AVX2 build or the CPU has AVX-512.
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
@@ -41,7 +43,11 @@ int main() {
     }
     std::mt19937 rng(42);
     constexpr int H = 2560, FF = 640, R0 = 3, R1 = FF - 1;
-    for (int ty : {18, 21, 22}) {
+    // IQ2_XXS (16) and IQ2_XS (17): #1415 / #1544's iq256_gu_rows_exact_one, which the dispatch takes with
+    // STRATA_CPU_IQ_ALL_EXACT1=1 (and for 18 / 21 / 22 too with STRATA_CPU_SINGLE_EXACT=0); the dispatch's rows must be
+    // ggml's bits either way
+    std::vector<float> ff3(FF);
+    for (int ty : {16, 17, 18, 21, 22}) {
         c::NativeFmt f;
         std::string err;
         if (!c::native_fmt(ty, 20, H, FF, f, err)) { std::printf("native_fmt: %s\n", err.c_str()); return 2; }
@@ -55,7 +61,9 @@ int main() {
             scales(blob.data(), f.down_off, gblk, rng);
             for (auto& v : x) v = float(int(rng() % 20001) - 10000) * 0.001f;
             c::native_quant_act(f, x.data(), act);
-            c::iq256_gu_single_exact(ty, blob.data(), f.gu_row, f.up_off, H, act, ff.data(), R0, R1);
+            const bool single = ty == 18 || ty == 21 || ty == 22;
+            if (single) c::iq256_gu_single_exact(ty, blob.data(), f.gu_row, f.up_off, H, act, ff.data(), R0, R1);
+            c::iq256_gu_rows_exact_one(ty, blob.data(), f.gu_row, f.up_off, H, act, ff3.data(), R0, R1);
             const void* acts[] = {act};
             float* ffs[] = {ff2.data()};
             c::native_gu_rows(f, blob.data(), acts, 1, ffs, R0, R1);
@@ -64,7 +72,8 @@ int main() {
                 gdot(H, &g, 0, blob.data() + size_t(r) * f.gu_row, 0, act, 0, 1);
                 gdot(H, &u, 0, blob.data() + f.up_off + size_t(r) * f.gu_row, 0, act, 0, 1);
                 const float ref = (g / (1.f + std::exp(-g))) * u;
-                check("gu_single_exact", ty, seed, r, ref, ff[r]);
+                if (single) check("gu_single_exact", ty, seed, r, ref, ff[r]);
+                check("gu_rows_exact_one", ty, seed, r, ref, ff3[r]);
                 check("native_gu_rows nt=1", ty, seed, r, ref, ff2[r]);
             }
         }
