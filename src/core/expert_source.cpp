@@ -4230,6 +4230,32 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] == -1 && ps->weights[i] >= ps->heavy) heavy_job[d.job_of[(size_t) ids[i]]] = true;
         static thread_local std::vector<ExpertJobMulti> order;
         order.clear();
+        // local (defer-cold-last, STRATA_DEFER_COLD_LAST=1, opt-in): inside each pass the experts prefetch sent to the
+        // drive go after the cached ones, as the cold-last order below does without the split, so a cold blob at the
+        // head of a pass does not hold every worker on its pages while the cached jobs wait.  Each job writes only its
+        // own rows and the pool's row cuts change no bit (pool_tasks_test), so the output is the same.
+        static const bool defer_cold_last = [] {
+            const char* v = std::getenv("STRATA_DEFER_COLD_LAST");
+            const bool on = v != nullptr && std::atoi(v) != 0;
+            if (on) std::fprintf(stderr, "strata verify: STRATA_DEFER_COLD_LAST=1: each pass of the deferred split runs its "
+                                         "cached CPU experts before the cold ones (same output)\n");
+            return on;
+        }();
+        if (defer_cold_last) {
+            bool cold_job[kMaxWindowEntries];
+            for (int j = 0; j < njobs; ++j) cold_job[j] = d.src->cold(d.layers, job_e[(size_t) j]);
+            for (int pass = 0; pass < 2; ++pass) {
+                int n_cold = 0, n_pass = 0;
+                for (int c = 0; c < 2; ++c)   // the pass's cached jobs, then its cold ones, each in routing order
+                    for (int j = 0; j < njobs; ++j)
+                        if (heavy_job[j] == (pass == 0) && cold_job[j] == (c == 1)) {
+                            order.push_back(d.jobs_multi[(size_t) j]);
+                            ++n_pass;
+                            n_cold += c;
+                        }
+                if (n_cold > 0 && n_cold < n_pass) d.cold_last_moved += n_cold;
+            }
+        } else
         for (int pass = 0; pass < 2; ++pass)
             for (int j = 0; j < njobs; ++j)
                 if (heavy_job[j] == (pass == 0)) order.push_back(d.jobs_multi[(size_t) j]);
