@@ -157,7 +157,7 @@ MtpDrafter::~MtpDrafter() {
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
-    if (owns_draft_head_ && dhead_) { strata::kernels::native_q6_k_unpack(dhead_); cudaFree(dhead_); }
+    if (owns_draft_head_ && dhead_ && !dhead_in_place_) { strata::kernels::native_q6_k_unpack(dhead_); cudaFree(dhead_); }
     if (owns_draft_head_ && dvocab_) cudaFree(dvocab_);
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
@@ -347,18 +347,28 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     const bool kv_int8_was = qsa_kv_int8();
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
-    uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
+    // iq3b S3 (STRATA_DRAFT_IDX_TRIM, default on; =0 keeps them): the drafter reads no indexer, so its pooled keys
+    // keep 2 rows (a ring already does)
+    static const bool idx_trim = [] { const char* v = std::getenv("STRATA_DRAFT_IDX_TRIM"); return v == nullptr || v[0] != '0'; }();
+    const bool with_idx = !idx_trim;
+    uint64_t sb = qsa_state_bytes(g, max_cells, false, ring, with_idx);
+    if (idx_trim) {
+        const uint64_t full = qsa_state_bytes(g, max_cells, false, ring, true);
+        if (full > sb)
+            std::fprintf(stderr, "strata mtp: STRATA_DRAFT_IDX_TRIM: the draft layer's K/V state keeps 2 indexer rows "
+                                 "(VRAM saved %.1f MiB; =0 keeps them all)\n", (double) (full - sb) / 1048576.0);
+    }
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
+    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring, with_idx) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
         cudaGetLastError();
         cudaFree(state_arena_);
         st_ = QsaState{};
         ring = -1;   // fully resident
-        sb = qsa_state_bytes(g, max_cells, false, ring);
+        sb = qsa_state_bytes(g, max_cells, false, ring, with_idx);
         if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
+        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring, with_idx) == 0) { err = "mtp: state init failed"; return false; }
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
@@ -536,14 +546,28 @@ void MtpDrafter::record_top2(int j) {
     top2_[(size_t) j] = b2 < 0 ? -1 : dhead_ != nullptr ? dvocab_host_[(size_t) b2] : (int32_t) b2;
 }
 
-uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
+namespace {
+// iq3b S2: STRATA_DRAFT_HEAD_SHARED=0 copies the draft head's rows out of the main head (the old layout)
+bool draft_head_shared_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DRAFT_HEAD_SHARED"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+}  // namespace
+
+bool MtpDrafter::head_in_place(int head_type, int head_dev) const {
+    return draft_head_shared_env() && head_shared_ok_ && !q4_head_ && head_type >= 0 && (head_dev < 0 || head_dev == device_) &&
+           strata::kernels::native_mmvq_rows_supported(head_type);
+}
+
+uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, int head_type, int head_dev) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
     if (dhead_ == nullptr && owns_draft_head_ && !full_head_env()) {
         if (FILE* f = std::fopen(vocab_file().c_str(), "rb")) {
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
             std::fclose(f);
-            if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
+            if (size >= 4 && size % 4 == 0)
+                bytes += (head_in_place(head_type, head_dev) ? 0 : (uint64_t) (size / 4) * head_row_bytes) + (uint64_t) size;
         }
     }
     // coupled draft sampling (STRATA_SPEC_COUPLED=1 only): an upper bound - the id -> subset map, the penalty ring,
@@ -682,6 +706,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             return false;
         }
         dhead_ = shared->dhead_;
+        dhead_in_place_ = shared->dhead_in_place_;
         dhead_type_ = shared->dhead_type_;   // the subset's type (the main head's, or Q4_0): -1 failed every --batch-mtp step
         dvocab_ = shared->dvocab_;
         n_dvocab_ = shared->n_dvocab_;
@@ -693,52 +718,81 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         if (read_file(vocab_file(), raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
-            if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
-                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
-                err = "mtp: the draft head does not fit";
-                draft_head_hint(n_dvocab_, row_bytes);
-                return false;
+            // iq3b S2: the subset's rows read in place from the main head (the same bytes the copy would hold, through
+            // the same kernel), when the head is on this card, its format has the row-indexed GEMV and every id is a row
+            bool in_place = head_in_place(head->type(), head->device()) &&
+                            strata::kernels::native_mmvq_weight_bytes(head->type(), (int) g_->n_embd, 1) == (size_t) row_bytes &&
+                            head->weight_bytes() == (uint64_t) n_vocab_ * (uint64_t) row_bytes;
+            for (int64_t i = 0; in_place && i < n_dvocab_; ++i) {
+                int32_t id;
+                std::memcpy(&id, raw.data() + (size_t) i * 4, 4);
+                if (id < 0 || id >= n_vocab_) in_place = false;
             }
-            cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
-            dvocab_host_.resize((size_t) n_dvocab_);
-            std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
-            const int head_dev = head->device();
-            if (head_dev >= 0 && head_dev != device_) {
-                // the main head is on another card (the drafter on the first stage of a layer split, 0.1.44): the rows are
-                // gathered where the head is and the subset copied over once
-                void* tmp = nullptr;
-                int32_t* dv = nullptr;
-                bool ok_x = true;
-                {
-                    const OnDevice on_head(head_dev);
-                    ok_x = cudaMalloc((void**) &tmp, (size_t) (n_dvocab_ * row_bytes)) == cudaSuccess &&
-                           cudaMalloc((void**) &dv, raw.size()) == cudaSuccess &&
-                           cudaMemcpy(dv, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
-                    if (ok_x) {
-                        strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dv, n_dvocab_,
-                                                     (uint8_t*) tmp, nullptr);
-                        ok_x = cudaDeviceSynchronize() == cudaSuccess;
+            if (in_place) {
+                if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess) {
+                    err = "mtp: the draft head's token list does not fit";
+                    return false;
+                }
+                cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+                dvocab_host_.resize((size_t) n_dvocab_);
+                std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
+                dhead_ = (uint8_t*) const_cast<void*>(head->weights());
+                dhead_in_place_ = true;
+                dhead_type_ = head->type();
+                cudaDeviceSynchronize();
+                vram_ += raw.size();
+                std::fprintf(stderr, "strata mtp: draft head over %lld tokens reads the main head's rows in place "
+                                     "(STRATA_DRAFT_HEAD_SHARED: VRAM saved %.1f MiB; =0 copies them)\n",
+                             (long long) n_dvocab_, (double) (n_dvocab_ * row_bytes) / 1048576.0);
+            }
+            if (!in_place) {
+                if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
+                    cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
+                    err = "mtp: the draft head does not fit";
+                    draft_head_hint(n_dvocab_, row_bytes);
+                    return false;
+                }
+                cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+                dvocab_host_.resize((size_t) n_dvocab_);
+                std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
+                const int head_dev = head->device();
+                if (head_dev >= 0 && head_dev != device_) {
+                    // the main head is on another card (the drafter on the first stage of a layer split, 0.1.44): the rows are
+                    // gathered where the head is and the subset copied over once
+                    void* tmp = nullptr;
+                    int32_t* dv = nullptr;
+                    bool ok_x = true;
+                    {
+                        const OnDevice on_head(head_dev);
+                        ok_x = cudaMalloc((void**) &tmp, (size_t) (n_dvocab_ * row_bytes)) == cudaSuccess &&
+                               cudaMalloc((void**) &dv, raw.size()) == cudaSuccess &&
+                               cudaMemcpy(dv, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+                        if (ok_x) {
+                            strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dv, n_dvocab_,
+                                                         (uint8_t*) tmp, nullptr);
+                            ok_x = cudaDeviceSynchronize() == cudaSuccess;
+                        }
                     }
+                    ok_x = ok_x && cudaMemcpy(dhead_, tmp, (size_t) (n_dvocab_ * row_bytes), cudaMemcpyDeviceToDevice) == cudaSuccess;
+                    {
+                        const OnDevice on_head(head_dev);
+                        if (tmp) cudaFree(tmp);
+                        if (dv) cudaFree(dv);
+                    }
+                    if (!ok_x) { err = "mtp: the draft head's rows could not be copied from the head's card"; return false; }
+                } else {
+                    strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
                 }
-                ok_x = ok_x && cudaMemcpy(dhead_, tmp, (size_t) (n_dvocab_ * row_bytes), cudaMemcpyDeviceToDevice) == cudaSuccess;
-                {
-                    const OnDevice on_head(head_dev);
-                    if (tmp) cudaFree(tmp);
-                    if (dv) cudaFree(dv);
-                }
-                if (!ok_x) { err = "mtp: the draft head's rows could not be copied from the head's card"; return false; }
-            } else {
-                strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
+                cudaDeviceSynchronize();
+                vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
+                std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
+                             (double) (n_dvocab_ * row_bytes) / 1048576.0);
+                dhead_type_ = head->type();
+                if (q4_head_ && !make_q4_head(err)) return false;
+                if (dhead_type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
+                    strata::kernels::native_q6_k_pack(dhead_, (int) (row_bytes / 210) * 256, (int) n_dvocab_,
+                                                      "MTP draft head");
             }
-            cudaDeviceSynchronize();
-            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
-            std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
-                         (double) (n_dvocab_ * row_bytes) / 1048576.0);
-            dhead_type_ = head->type();
-            if (q4_head_ && !make_q4_head(err)) return false;
-            if (dhead_type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
-                strata::kernels::native_q6_k_pack(dhead_, (int) (row_bytes / 210) * 256, (int) n_dvocab_,
-                                                  "MTP draft head");
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
@@ -1188,8 +1242,11 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
-                    (int) nv, T, cs);
+        if (sub && dhead_in_place_)   // iq3b S2: the subset's rows read in place from the main head
+            native_mmvq_rows(dhead_type_, dhead_, dvocab_, xq_, head_logits_, (int) N, (int) nv, T, cs);
+        else
+            native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
+                        (int) nv, T, cs);
         g_mp.stamp(14, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft

@@ -250,11 +250,14 @@ __device__ __forceinline__ float q5_q8_dot(const Q5KBlock* __restrict__ bq5,
 
 // The generic ncols=1 oracle uses 4 warps and 1 row (or 4 rows for small K),
 // eight weight blocks per K iteration, warp-ascending shared sum, then XOR tree.
-template<bool SmallK>
+// IDX (iq3b S2, native_mmvq_rows): output row r reads weight row rows[r] (the MTP draft head's subset, read in place
+// from the main head); every other line is the plain kernel's.
+template<bool SmallK, bool IDX = false>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q5_k_mmvq_kernel(const Q5KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out) {
+                                        float* __restrict__ y, int n_in, int n_out,
+                                        const int32_t* __restrict__ rows = nullptr) {
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = VDR * WARPS * WARP / QI;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -269,7 +272,7 @@ __global__ void native_q5_k_mmvq_kernel(const Q5KBlock* __restrict__ w,
             // The source assumes allocator padding for partial row groups. This
             // guard preserves every valid row's math without an out-of-bounds read.
             if (row0 + i < n_out) {
-                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                const std::size_t block = std::size_t(IDX ? rows[row0 + i] : row0 + i) * blocks_per_row + kbx;
                 tmp[i] += q5_q8_dot(w + block, x + kby, kqs);
             }
         }
@@ -499,11 +502,12 @@ __device__ __forceinline__ float iq4_xs_q8_dot(const IQ4XSBlock* __restrict__ w,
 }
 
 // IQ4_XS generic MMVQ: QK=256, QI=32, VDR=4,16 blocks per iteration.
-template<bool SmallK>
+template<bool SmallK, bool IDX = false>   // IDX: as native_q5_k_mmvq_kernel's
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_iq4_xs_mmvq_kernel(const IQ4XSBlock* __restrict__ w,
                                          const Q81Block* __restrict__ x,
-                                         float* __restrict__ y, int n_in, int n_out) {
+                                         float* __restrict__ y, int n_in, int n_out,
+                                         const int32_t* __restrict__ rows = nullptr) {
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = 4 * WARPS * WARP / 32;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -516,7 +520,7 @@ __global__ void native_iq4_xs_mmvq_kernel(const IQ4XSBlock* __restrict__ w,
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) {
             if (row0 + i < n_out) {
-                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                const std::size_t block = std::size_t(IDX ? rows[row0 + i] : row0 + i) * blocks_per_row + kbx;
                 tmp[i] += iq4_xs_q8_dot(w + block, x + kby, kqs);
             }
         }
@@ -2563,6 +2567,48 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
+}
+
+bool native_mmvq_rows_supported(int ggml_type) noexcept {
+#if defined(STRATA_HIP_GFX906)
+    if (!g_wave_off) return false;   // native_mmvq runs the wave kernels there
+#endif
+    return ggml_type == 13 || ggml_type == 23;
+}
+
+void native_mmvq_rows(int ggml_type, const void* weights, const int32_t* rows, const void* x_q8_1, float* y,
+                      int n_in, int n_rows, int ncols, void* stream) {
+    if (!native_mmvq_rows_supported(ggml_type)) throw std::invalid_argument("unsupported native MMVQ (rows) GGML type");
+    if (ncols != 1) throw std::invalid_argument("native MMVQ (rows) takes one column");
+    validate_shape(n_in, ncols, 256);
+    if (n_rows <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(rows);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    // the launch geometry of native_q5_k_mmvq / native_iq4_xs_mmvq for ncols = 1, so every row is the same bits
+    if (ggml_type == 13) {
+        const auto* w = static_cast<const Q5KBlock*>(weights);
+        if (n_in / QK < VDR * WARPS * WARP / QI) {
+            const unsigned blocks = unsigned((std::size_t(n_rows) + WARPS - 1) / WARPS);
+            native_q5_k_mmvq_kernel<true, true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_rows, rows);
+        } else {
+            native_q5_k_mmvq_kernel<false, true><<<unsigned(n_rows), threads, 0, s>>>(w, x, y, n_in, n_rows, rows);
+        }
+    } else {
+        const auto* w = static_cast<const IQ4XSBlock*>(weights);
+        if (n_in / 256 < 4 * WARPS * WARP / 32) {
+            const unsigned blocks = unsigned((std::size_t(n_rows) + WARPS - 1) / WARPS);
+            native_iq4_xs_mmvq_kernel<true, true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_rows, rows);
+        } else {
+            native_iq4_xs_mmvq_kernel<false, true><<<unsigned(n_rows), threads, 0, s>>>(w, x, y, n_in, n_rows, rows);
+        }
+    }
+    launch_check();
 }
 
 #if !defined(__HIPCC__)
