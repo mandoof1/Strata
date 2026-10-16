@@ -4,6 +4,7 @@
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
 #endif
+#include "strata/platform/memory.hpp"
 #include "mmq_resident_sort.hpp"
 #include "wmma_gemm.h"
 #include "strata/core/mtp.hpp"
@@ -525,6 +526,10 @@ struct Stager {
                 uint8_t* rd[kMaxBatch];
                 size_t nr = 0;
                 core::ExpertSource* from = nullptr;
+                // the mapped file tier: request the run's blobs before copying, so the OS reads them in large
+                // chunks; a page-cache-starved PC otherwise faults them in 4 KB at a time (no mmap read-around)
+                for (int i = j; i < j + k; ++i)
+                    if (jobs[(size_t) i].from == nullptr) platform::advise_willneed(jobs[(size_t) i].src, jobs[(size_t) i].bytes);
                 for (int i = j; i < j + k; ++i) {
                     const Job& jb = jobs[(size_t) i];
                     if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }

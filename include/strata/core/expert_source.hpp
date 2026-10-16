@@ -226,6 +226,9 @@ public:
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
+    /// local (io-prio): true when the last `prefetch` of `layer` had to read this expert from the drive (its pages were
+    /// not cached).  The CPU pool then computes it after the cached ones, so its read overlaps their compute.
+    virtual bool cold(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
     /// CS-T: the experts of `layer` a predictor expects next - a source that reads a file may start reading their
     /// pages now, in the background.  Only warms: what `blob` returns is unchanged.  Default: nothing.
     virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -463,6 +466,7 @@ struct ExpertDispatch {
     /// STRATA_ROUTE_TAIL_SKIP=R: entries skipped (a missed expert every token of the window routes only at rank >= R)
     /// and the distinct experts behind them (neither copied nor computed)
     int64_t tail_skipped = 0;
+    int64_t cold_last_moved = 0;   ///< local (io-prio): CPU jobs moved behind the cached ones (cold-last order)
     int64_t tail_experts = 0;
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
@@ -665,6 +669,11 @@ public:
     /// decode's choice: re-routed experts come back from it), the prompt path's batched stager reads (copy_blobs) go
     /// unbuffered instead - the same bytes, read in merged O_DIRECT requests.  False when not opened (and why).
     bool open_prompt_direct(std::string& why);
+    /// local (refill-cached): the blob's pages are in the page cache (four sampled pages), so reading it costs no drive read
+    bool blob_cached(int64_t layer, int64_t expert) const {
+        uint64_t total = 0;
+        return cached_bytes(layer, expert, total, false) >= total && total > 0;
+    }
     /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
     /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
@@ -708,6 +717,7 @@ public:
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
+    bool cold(int64_t layer, int64_t expert) const override;
     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
     /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
@@ -745,6 +755,7 @@ public:
         uint64_t pf_demand = 0;                              ///< blobs the layer asked for that the workers were handed
         uint64_t pf_jobs = 0, pf_read_blobs = 0, pf_resident_skips = 0, pf_dropped = 0;   ///< prefetch workers
         uint64_t pf_used = 0, pf_unused = 0;                 ///< prefetched blobs a layer then used / never used
+        uint64_t pf_stale = 0;                               ///< local (io-prio): predictions dropped, their layer already reached
         uint64_t crit_us = 0;                                ///< wall time the decode waited on file reads (prefetch + staged_blob)
         uint64_t crit_n = 0;
     };
@@ -841,6 +852,19 @@ private:
     std::mutex io_mu_;
     std::condition_variable io_cv_;
     std::deque<std::pair<int32_t, int32_t>> io_q_;   ///< (layer, expert) to read ahead
+    // local (io-prio, STRATA_IO_PRIO=0 turns it off): the blobs the layer being computed needs (prefetch) are their own
+    // FIFO queue and always go first; a read-ahead (warm) read starts only while no demand read is queued or in
+    // flight, at most io_ahead_max_ of them at once (STRATA_IO_AHEAD_INFLIGHT, default 2), and a prediction for a
+    // layer the decode has already reached is dropped.  On a SATA SSD the speculative reads otherwise took the
+    // bandwidth the current layer was waiting for.
+    std::deque<std::pair<int32_t, int32_t>> io_dq_;  ///< (layer, expert) the current layer needs
+    bool io_prio_ = true;
+    int io_ahead_max_ = 2;
+    int io_dem_busy_ = 0, io_ahead_busy_ = 0;        ///< reads in flight (under io_mu_)
+    std::atomic<int32_t> io_cur_layer_{-1};           ///< the layer the last prefetch was for
+    std::vector<uint32_t> io_cold_stamp_;             ///< per (layer, expert): io_cold_epoch_ when last read on demand
+    uint32_t io_cold_epoch_ = 0;
+    std::atomic<uint64_t> io_pf_stale_{0};
     bool io_quit_ = false;
     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
@@ -854,7 +878,7 @@ private:
     /// `exact` false: four sampled pages (a blob is cached when they are; a handful of syscalls, not hundreds of pages' walk).
     uint64_t cached_bytes(int64_t layer, int64_t expert, uint64_t& total, bool exact = true) const;
     void io_worker();
-    void io_enqueue(int64_t layer, int64_t expert);
+    void io_enqueue(int64_t layer, int64_t expert, bool demand = false);
     void io_stop();
     const uint8_t* io_blob(int64_t layer, int64_t expert);
     const uint8_t* base_ = nullptr;
@@ -897,6 +921,12 @@ private:
     void* mapping_ = nullptr;
 #else
     int fd_ = -1;
+    // local (split-file, STRATA_EXPERTS_HEAD=<file>): experts.bin's first split_n_ bytes are mapped from a copy on a
+    // faster drive and the rest from experts.bin itself, one contiguous view; head_fd_ backs the view's head,
+    // io_head_fd_ is the I/O threads' descriptor for it (POSIX_FADV_RANDOM)
+    uint64_t split_n_ = 0;
+    int head_fd_ = -1, io_head_fd_ = -1;
+    std::string head_path_;
 #endif
     bool unmapped_ = false;   ///< pp-opt: drop_mapping closed the view (base_ stays as the "opened" mark only)
     bool startup_ub_ = false;                 ///< begin_startup_unbuffered: until end_startup_unbuffered

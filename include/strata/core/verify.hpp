@@ -259,6 +259,13 @@ public:
         return true;
     }
     double ms_gate = 0;   ///< host time spent holding a layer's plan for the adaptive copies (decode timing prints it)
+    /// local GPU look-ahead (STRATA_GPU_LOOKAHEAD=1): after each layer's router the GPU also applies the NEXT layer's
+    /// router to this layer's MoE input (the residual stream changes little between layers), keeps each token's top
+    /// k minus the VRAM-resident experts, and publishes them with the doorbell; the host hands them to `fn` (the file
+    /// tier's read-ahead) before it computes this layer's CPU experts, so their cold pages are read a layer early.
+    /// Costs the CPU nothing (the CPU look-ahead spent ~34 ms a window on its GEMVs).  After `init`, before a capture.
+    bool set_gla(void (*fn)(void* user, int64_t layer, const int32_t* ids, int n), void* user, std::string& err);
+    int64_t gla_published = 0, gla_ids = 0;   ///< layers with a prediction handed over, ids handed over
     cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
@@ -480,6 +487,12 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    // local GPU look-ahead (set_gla): per layer [count + 1 | ids...] in mapped memory, the device scratch of the GEMV
+    int32_t* h_gla_ = nullptr;   int32_t* m_gla_ = nullptr;
+    int64_t gla_stride_ = 0;
+    float* gla_logits_ = nullptr; int32_t* gla_ids_ = nullptr; float* gla_w_ = nullptr;
+    void (*gla_fn_)(void*, int64_t, const int32_t*, int) = nullptr;
+    void* gla_user_ = nullptr;
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)

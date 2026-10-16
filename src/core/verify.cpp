@@ -87,6 +87,16 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// The verify window's per-layer wait limit (default 20 s).  STRATA_VERIFY_TIMEOUT_S raises it on a PC whose expert
+// reads can stall longer than that without being stuck (a SATA SSD under a page-fault storm, low RAM).
+inline std::chrono::seconds g_verify_timeout() {
+    static const std::chrono::seconds s = [] {
+        const char* v = std::getenv("STRATA_VERIFY_TIMEOUT_S");
+        const int n = v != nullptr ? std::atoi(v) : 0;
+        return std::chrono::seconds(n > 0 ? n : 20);
+    }();
+    return s;
+}
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
 // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
 struct RouteResidentCfg;
@@ -226,6 +236,11 @@ bool sh_stream_on() {
 // HIP keeps the commit graph after every window (STRATA_ONE_TOKEN_COMMIT=0 does too).
 // The head's hyper-connection read for the window's tokens in one launch set (CUDA; HIP keeps gr_read per token;
 // STRATA_HEAD_MIX_MULTI=0 does too): bitwise the same sums.
+// local: the verify window's routing in one projection + one top-k launch on HIP (see moe_route_window)
+bool route_window_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTE_WINDOW"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
 bool head_mix_multi_enabled() {
 #if defined(STRATA_USE_HIP)
     static const bool on = [] {
@@ -529,10 +544,38 @@ Verifier::~Verifier() {
     for (cudaEvent_t e : df_join_)
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
+    if (gla_logits_) cudaFree(gla_logits_);
+    if (gla_ids_) cudaFree(gla_ids_);
+    if (gla_w_) cudaFree(gla_w_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, h_gla_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
+}
+
+bool Verifier::set_gla(void (*fn)(void* user, int64_t layer, const int32_t* ids, int n), void* user, std::string& err) {
+    if (g_ == nullptr || ss_ == nullptr || max_t_ <= 0) { err = "GPU look-ahead: the verifier is not initialised"; return false; }
+    const int64_t NE = g_->n_expert, K = ss_->k;
+    if (NE != 512 || K != 10 || hits_.d_res == nullptr) {
+        err = "GPU look-ahead: needs the native 512 x 10 router and a VRAM expert cache";
+        return false;
+    }
+    const OnDevice on_device(device_);
+    gla_stride_ = ((int64_t) max_t_ * K + 1 + 15) & ~15ll;
+    if (h_gla_ == nullptr &&
+        !mapped((size_t) (g_->n_layers * gla_stride_ * 4), (void**) &h_gla_, (void**) &m_gla_)) {
+        err = "GPU look-ahead: mapped allocation failed";
+        return false;
+    }
+    if ((gla_logits_ == nullptr && cudaMalloc((void**) &gla_logits_, (size_t) (max_t_ * NE * 4)) != cudaSuccess) ||
+        (gla_ids_ == nullptr && cudaMalloc((void**) &gla_ids_, (size_t) (max_t_ * K * 4)) != cudaSuccess) ||
+        (gla_w_ == nullptr && cudaMalloc((void**) &gla_w_, (size_t) (max_t_ * K * 4)) != cudaSuccess)) {
+        err = "GPU look-ahead: device allocation failed";
+        return false;
+    }
+    gla_fn_ = fn;
+    gla_user_ = user;
+    return true;
 }
 
 bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) {
@@ -1481,8 +1524,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                           NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
-#if defined(STRATA_HIP_GFX906)
-        } else if (dec_batch) {
+#if defined(STRATA_HIP_GFX906) || defined(STRATA_USE_HIP)
+        } else if (dec_batch && route_window_on()) {
+            // local: on every HIP card, not only gfx906 (gfx1200: 2(T-1) fewer dependent launches per layer, ~2.4 us
+            // each in a graph; route_window_parity checks the batched kernels bit for bit on the card).
+            // STRATA_ROUTE_WINDOW=0 keeps the per-token launches.
             // gfx906: the Coder's 256-expert router (the native router is 512 x 10 only) for the whole window in one
             // multi-column BF16 projection and one top-k, bitwise the per-token calls (route_window_parity); ~3 ms
             // of a ~55 ms verify window on 2x MI50.  STRATA_ROUTE_PER_TOKEN=1: the per-token calls.
@@ -1514,6 +1560,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
         } else {
+            // local GPU look-ahead (set_gla): layer l+1's router on this layer's MoE input, before the doorbell so the
+            // host has the prediction when the ring reaches it
+            if (gla_fn_ != nullptr && G == 1 && l + 1 < le_ && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+                const LayerView vn(wt, l + 1);
+                const WeightRef* wr = vn.get("ffn_gate_inp.weight");
+                if (wr != nullptr) {
+                    try {
+                        bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wr->data, gla_logits_, NE, N, NE, n, cs);
+                        native_router_top10_multi(gla_logits_, gla_ids_, gla_w_, n, cs);
+                    } catch (const std::exception& e) { err = "verify GPU look-ahead: " + std::string(e.what()); return false; }
+                    static const int gla_k = [] { const char* e = std::getenv("STRATA_GLA_K"); return e ? std::atoi(e) : 10; }();
+                    gla_publish(gla_ids_, (int64_t) n * K, hits_.d_res + (l + 1) * g.n_expert, (int) g.n_expert,
+                                m_gla_ + (size_t) ((l + 1) * gla_stride_), (int) K, gla_k, cs);
+                }
+            }
             if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -2159,6 +2220,8 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_gla_ != nullptr)   // local GPU look-ahead: no layer's prediction is published yet
+        for (int64_t l = 0; l < g.n_layers; ++l) *(volatile int32_t*) (h_gla_ + l * gla_stride_) = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -2338,7 +2401,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
+            if (now - a > g_verify_timeout()) {
                 // #267: the caller ends the engine; no spin kernel may outlive it
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
                 trace_ev("TIMEOUT", k, l, (int64_t) launch.query());
@@ -2358,6 +2421,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         const Clock::time_point b = Clock::now();
         if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+        if (gla_fn_ != nullptr && l + 1 < le_) {   // local GPU look-ahead: the next layer's predicted misses, read ahead now
+            const int32_t* pg = h_gla_ + (size_t) ((l + 1) * gla_stride_);
+            const int32_t c = *(volatile const int32_t*) pg;
+            if (c > 1) {
+                std::atomic_thread_fence(std::memory_order_acquire);
+                gla_fn_(gla_user_, l + 1, pg + 1, c - 1);
+                ++gla_published;
+                gla_ids += c - 1;
+            }
+        }
         VDBG("layer %lld rang\n", (long long) l);
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && l >= 0 &&
             (size_t) l < adapt_gate_->has.size() && adapt_gate_->has[(size_t) l] != 0 &&
@@ -3075,7 +3148,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
+            if (now - a > g_verify_timeout()) {
                 err = "verify batch: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
                 return false;
             }
@@ -3230,7 +3303,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
                     b_running_ = false;
                     return -1;
                 }
-                if (now - b_last_ > std::chrono::seconds(20)) {
+                if (now - b_last_ > g_verify_timeout()) {
                     err = "verify batch: timed out at layer " + std::to_string(lb_ + b_k_) + released_note(release_gpu_waits(5000));
                     b_running_ = false;
                     return -1;

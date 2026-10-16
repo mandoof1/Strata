@@ -596,6 +596,47 @@ def experts_loading_words(args: list, size: str) -> str:
     return f"loading the experts into RAM ({size}) and locking part of them for the GPU."
 
 
+def _drive_of(path: str) -> str:
+    """The block device a file lives on (nvme0n1p3, sda2, ...), from /sys; '' when it cannot be told."""
+    try:
+        st = os.stat(path)
+        dev = f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
+        if os.path.exists(f"/sys/dev/block/{dev}"):
+            return os.path.basename(os.path.realpath(f"/sys/dev/block/{dev}"))
+        real, best, src = os.path.realpath(path), "", ""   # btrfs gives a subvolume an anonymous device: the source of
+        with open("/proc/self/mountinfo") as f:          # the deepest mount that holds the file
+            for row in f:
+                a, _, b = row.partition(" - ")
+                mnt = a.split()[4]
+                if (real == mnt or real.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(best) and len(b.split()) > 1:
+                    best, src = mnt, b.split()[1]
+        return os.path.basename(src) if src.startswith("/dev/") else ""
+    except (OSError, AttributeError, IndexError):
+        pass
+    return ""
+
+
+def expert_head_words(line: str) -> str:
+    """local (split-file): the engine's STRATA_EXPERTS_HEAD line as one start line that says whether the experts are
+    read from the fast copy (the NVMe) or from the pack itself, and why not."""
+    m = re.search(r"split file: the first ([\d.]+) GiB of experts\.bin \((\d+)%\) from (.+), the rest from (.+)$", line)
+    if m:
+        gib, pct, head, rest = m.groups()
+        drive = _drive_of(head)
+        what = "NVMe copy: ON" if drive.startswith("nvme") else f"fast copy: ON ({drive or 'drive unknown'}, not NVMe)"
+        where = f"{head}" + (f" ({drive})" if drive else "")
+        if pct == "100":
+            return f"[strata] {what} - all {gib} GiB of experts are read from {where}"
+        return f"[strata] {what} - the first {gib} GiB of experts ({pct}%) from {where}, the rest from {rest}"
+    m = re.search(r"STRATA_EXPERTS_HEAD=(.+) ignored \((.*)\): all of experts\.bin from (.+)$", line)
+    if m:
+        head, why, rest = m.groups()
+        drive = _drive_of(rest)
+        return (f"[strata] NVMe copy: OFF - {head} not used ({why}); all experts are read from {rest}"
+                + (f" ({drive})" if drive else "") + " - slower")
+    return "[strata] " + line.strip()
+
+
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
@@ -631,6 +672,11 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             cut = chunk.rfind(b"\n") + 1
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
+                if line.startswith("FileExpertSource: ") and ("split file:" in line or " ignored (" in line):
+                    say("head", expert_head_words(line))
+                elif "session is up" in line and "head" not in said:
+                    say("head", "[strata] NVMe copy: OFF - no STRATA_EXPERTS_HEAD in the config; the experts are "
+                                "read from the pack's own drive.")
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
                     say("arena", f"[strata] {loading}\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"

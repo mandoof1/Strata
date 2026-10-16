@@ -606,8 +606,22 @@ int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
     }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return 0;
-    out[0] = {b, layer_blob_bytes_[(size_t) layer], io_fds_.empty() ? -1 : io_fds_[0], (uint64_t) (b - base_), 0};
-    return 1;
+    const int main_fd = io_fds_.empty() ? -1 : io_fds_[0];
+    const uint64_t off = (uint64_t) (b - base_), n = layer_blob_bytes_[(size_t) layer];
+    if (split_n_ == 0 || off >= split_n_) {
+        out[0] = {b, n, main_fd, off, 0};
+        return 1;
+    }
+    // local (split-file): the head copy backs [0, split_n_) at the same offsets
+    const int head = io_head_fd_ >= 0 ? io_head_fd_ : -1;
+    if (off + n <= split_n_) {
+        out[0] = {b, n, head, off, 0};
+        return 1;
+    }
+    const uint64_t n0 = split_n_ - off;
+    out[0] = {b, n0, head, off, 0};
+    out[1] = {b + n0, n - n0, main_fd, split_n_, n0};
+    return 2;
 }
 
 uint64_t FileExpertSource::cached_bytes(int64_t layer, int64_t expert, uint64_t& total, bool exact) const {
@@ -641,6 +655,7 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     c.pf_dropped = io_pf_dropped_.load(std::memory_order_relaxed);
     c.pf_used = io_pf_used_.load(std::memory_order_relaxed);
     c.pf_unused = io_pf_unused_.load(std::memory_order_relaxed);
+    c.pf_stale = io_pf_stale_.load(std::memory_order_relaxed);
     c.crit_us = io_crit_us_.load(std::memory_order_relaxed);
     c.crit_n = io_crit_n_.load(std::memory_order_relaxed);
     return c;
@@ -662,6 +677,10 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
         fds.push_back(fd);
     }
     io_fds_ = std::move(fds);
+    if (split_n_ > 0 && !head_path_.empty()) {   // local (split-file): the head copy's own descriptor for the preads
+        io_head_fd_ = ::open(head_path_.c_str(), O_RDONLY | O_CLOEXEC);
+        if (io_head_fd_ >= 0) (void) posix_fadvise(io_head_fd_, 0, 0, POSIX_FADV_RANDOM);
+    }
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
@@ -669,6 +688,11 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     io_threads_ = threads > 0 ? threads : 8;
     if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::atoi(v) != 0;
+    if (const char* v = std::getenv("STRATA_IO_PRIO")) io_prio_ = std::atoi(v) != 0;
+    if (const char* v = std::getenv("STRATA_IO_AHEAD_INFLIGHT")) io_ahead_max_ = std::max(0, std::atoi(v));
+    io_cold_stamp_.assign((size_t) (n_layers_ * n_expert_), 0u);
+    io_cold_epoch_ = 0;
+    io_cur_layer_.store(-1, std::memory_order_relaxed);
     {   // experts.bin: fill the page cache from the workers and let the kernels read the mapping (STRATA_IO_PF_STAGE=1: stage)
         const char* v = std::getenv("STRATA_IO_PF_STAGE");
         io_fill_ = role_ptr_.empty() && !(v != nullptr && std::atoi(v) != 0);
@@ -687,6 +711,7 @@ void FileExpertSource::io_stop() {
         std::lock_guard<std::mutex> lk(io_mu_);
         io_quit_ = true;
         io_q_.clear();
+        io_dq_.clear();
     }
     io_cv_.notify_all();
     for (std::thread& t : io_workers_)
@@ -694,15 +719,23 @@ void FileExpertSource::io_stop() {
     io_workers_.clear();
 #if defined(__linux__)
     for (int f : io_fds_) ::close(f);
+    if (io_head_fd_ >= 0) ::close(io_head_fd_);
+    io_head_fd_ = -1;
 #endif
     io_fds_.clear();
     io_pf_ = false;
     io_quit_ = false;
+    io_dem_busy_ = io_ahead_busy_ = 0;
 }
 
-void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
+void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, bool demand) {
     {
         std::lock_guard<std::mutex> lk(io_mu_);
+        if (demand && io_prio_) {   // io-prio: the current layer's blobs, first come first served, never dropped
+            io_dq_.emplace_back((int32_t) layer, (int32_t) expert);
+            io_cv_.notify_one();
+            return;
+        }
         if (io_q_.size() >= 512) {   // the predictions run ahead of the reads: the oldest are the stalest
             io_q_.pop_front();
             io_pf_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -717,14 +750,56 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
 void FileExpertSource::io_worker() {
     for (;;) {
         int32_t layer, expert;
+        bool demand = false;
         {
             std::unique_lock<std::mutex> lk(io_mu_);
-            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty(); });
-            if (io_quit_) return;
-            layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
-            expert = io_q_.back().second;
-            io_q_.pop_back();
+            // io-prio: a read-ahead starts only while nothing the current layer needs is queued or being read
+            // local (STRATA_IO_AHEAD_WITH_DEMAND=1, NVMe): a read-ahead may also start while demand reads are in flight
+            // (still never while one is queued) - the drive serves several reads at once, so a prediction made a layer
+            // early (the GPU look-ahead) is not held back until the current layer's last miss has landed
+            static const bool with_demand = [] { const char* v = std::getenv("STRATA_IO_AHEAD_WITH_DEMAND"); return v != nullptr && v[0] == '1'; }();
+            auto ahead_ok = [&] {
+                return !io_q_.empty() && (!io_prio_ || (io_dq_.empty() && (with_demand || io_dem_busy_ == 0) &&
+                                                        io_ahead_busy_ < io_ahead_max_));
+            };
+            bool got = false;
+            while (!got) {
+                io_cv_.wait(lk, [&] { return io_quit_ || !io_dq_.empty() || ahead_ok(); });
+                if (io_quit_) return;
+                if (!io_dq_.empty()) {
+                    layer = io_dq_.front().first;
+                    expert = io_dq_.front().second;
+                    io_dq_.pop_front();
+                    demand = got = true;
+                    ++io_dem_busy_;
+                    break;
+                }
+                layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
+                expert = io_q_.back().second;
+                io_q_.pop_back();
+                // io-prio: a prediction for a layer the decode has already reached is of no use any more
+                const int32_t cur = io_cur_layer_.load(std::memory_order_relaxed);
+                if (io_prio_ && cur >= 0 && layer <= cur) {
+                    io_pf_stale_.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                got = true;
+                ++io_ahead_busy_;
+            }
         }
+        // whatever path this iteration takes, the in-flight count goes back down and the waiting workers re-check
+        struct InFlight {
+            FileExpertSource* s;
+            bool demand;
+            ~InFlight() {
+                {
+                    std::lock_guard<std::mutex> lk(s->io_mu_);
+                    if (demand) --s->io_dem_busy_;
+                    else --s->io_ahead_busy_;
+                }
+                s->io_cv_.notify_all();
+            }
+        } in_flight{this, demand};
         io_pf_jobs_.fetch_add(1, std::memory_order_relaxed);
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
         if (complement_ready_ && resident_blob(index) != nullptr) continue;
@@ -735,10 +810,36 @@ void FileExpertSource::io_worker() {
             Span sp[3];
             const int ns = spans(layer, expert, sp);
             bool any = false;
+            // local (io-populate, STRATA_IO_POPULATE=0: the pread below): one large asynchronous read of the blob
+            // (readahead ignores the descriptor's FADV_RANDOM), then MADV_POPULATE_READ waits for it and maps the pages
+            // into this process's page tables - no 2 MB copy through the L3 the pool is working in, and the kernels'
+            // first touch of the blob is not a page fault.  The thread still holds its io-prio slot until the bytes
+            // are in, so the demand-first accounting is unchanged.
+            static const bool populate = [] { const char* v = std::getenv("STRATA_IO_POPULATE"); return v == nullptr || std::atoi(v) != 0; }();
             for (int i = 0; i < ns; ++i) {
                 if (sp[i].fd < 0 || resident_sampled_n(sp[i].p, sp[i].n)) continue;
-                if (scratch.size() < sp[i].n) scratch.resize((size_t) sp[i].n);
                 const auto t0 = std::chrono::steady_clock::now();
+                if (populate) {
+                    constexpr int kMadvPopulateRead = 22;   // MADV_POPULATE_READ (Linux 5.14)
+                    const uintptr_t a = (uintptr_t) sp[i].p & ~(uintptr_t) 4095;
+                    const size_t len = (size_t) ((((uintptr_t) sp[i].p + sp[i].n + 4095) & ~(uintptr_t) 4095) - a);
+                    // in 128 KiB steps (platform::advise_willneed's): the kernel clips one readahead() to the
+                    // device's read_ahead_kb (256 KiB on the NVMe), so a 1.5-2 MB blob got its first 256 KiB
+                    // ahead and MADV_POPULATE_READ faulted the rest in synchronously (measured: 3.0 -> 1.8 ms
+                    // per cold 1.5 MB blob at QD1, 0.7-0.9 -> 1.2 GB/s with 4 readers)
+                    for (uint64_t at = 0; at < (uint64_t) sp[i].n; at += 128ull << 10)
+                        (void) ::readahead(sp[i].fd, (off64_t) (sp[i].off + at),
+                                           (size_t) std::min<uint64_t>(128ull << 10, (uint64_t) sp[i].n - at));
+                    if (::madvise((void*) a, len, kMadvPopulateRead) == 0) {
+                        io_pread_bytes_.fetch_add(sp[i].n, std::memory_order_relaxed);
+                        io_pread_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                                               std::memory_order_relaxed);
+                        io_pread_n_.fetch_add(1, std::memory_order_relaxed);
+                        any = true;
+                        continue;
+                    }
+                }
+                if (scratch.size() < sp[i].n) scratch.resize((size_t) sp[i].n);
                 if (pread_full(sp[i].fd, scratch.data(), sp[i].n, sp[i].off)) {
                     io_pread_bytes_.fetch_add(sp[i].n, std::memory_order_relaxed);
                     io_pread_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
@@ -971,7 +1072,55 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         err = buf;
         return false;
     }
-    void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, 0);
+    void* view = MAP_FAILED;
+    // local (split-file): STRATA_EXPERTS_HEAD names a copy of experts.bin's first N bytes (N a multiple of 4096) on a
+    // faster drive.  One address range is reserved, the head copy is mapped over its first N bytes and experts.bin
+    // (from offset N) over the rest, so every blob pointer, mincore and madvise works as before; the I/O threads read
+    // a blob's bytes from whichever file backs them (spans).  16 pages spread over the head are compared with
+    // experts.bin first: a stale or foreign copy is refused and everything is read from experts.bin.
+    if (const char* hp = std::getenv("STRATA_EXPERTS_HEAD"); hp != nullptr && hp[0] != '\0') {
+        const int hfd = ::open(hp, O_RDONLY);
+        struct stat hs{};
+        std::string why;
+        if (hfd < 0) why = "cannot open it";
+        else if (fstat(hfd, &hs) != 0 || hs.st_size <= 0) why = "cannot stat it";
+        else if ((uint64_t) hs.st_size > want || ((uint64_t) hs.st_size < want && hs.st_size % 4096 != 0))
+            why = "its size is not a multiple of 4096 up to experts.bin's";
+        else {
+            const uint64_t n = (uint64_t) hs.st_size;
+            std::vector<uint8_t> a(4096), b(4096);
+            for (int k = 0; k < 16 && why.empty(); ++k) {
+                const uint64_t off = (n / 4096 - 1) * (uint64_t) k / 15 * 4096;
+                if (pread(hfd, a.data(), 4096, (off_t) off) != 4096 || pread(fd, b.data(), 4096, (off_t) off) != 4096 ||
+                    std::memcmp(a.data(), b.data(), 4096) != 0)
+                    why = "it differs from experts.bin at byte " + std::to_string(off);
+            }
+            if (why.empty()) {
+                void* res = mmap(nullptr, (size_t) want, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+                if (res == MAP_FAILED) why = "no address range";
+                else if (mmap(res, (size_t) n, PROT_READ, MAP_SHARED | MAP_FIXED, hfd, 0) == MAP_FAILED ||
+                         (n < want &&   // a head as big as experts.bin is the whole file: nothing from experts.bin
+                          mmap((uint8_t*) res + n, (size_t) (want - n), PROT_READ, MAP_SHARED | MAP_FIXED, fd, (off_t) n) == MAP_FAILED)) {
+                    munmap(res, (size_t) want);
+                    why = "the split mapping failed";
+                } else {
+                    view = res;
+                    split_n_ = n;
+                    head_fd_ = hfd;
+                    head_path_ = hp;
+                    std::fprintf(stderr, "FileExpertSource: split file: the first %.2f GiB of experts.bin (%.0f%%) from %s, "
+                                         "the rest from %s\n", (double) n / 1073741824.0, 100.0 * (double) n / (double) want,
+                                 hp, path.c_str());
+                }
+            }
+        }
+        if (view == MAP_FAILED) {
+            std::fprintf(stderr, "FileExpertSource: STRATA_EXPERTS_HEAD=%s ignored (%s): all of experts.bin from %s\n", hp,
+                         why.c_str(), path.c_str());
+            if (hfd >= 0) ::close(hfd);
+        }
+    }
+    if (view == MAP_FAILED) view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, 0);
     if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
     fd_ = fd;
     base_ = (const uint8_t*) view;
@@ -1087,6 +1236,9 @@ void FileExpertSource::close() {
     if (base_ != nullptr) munmap((void*) base_, (size_t) mapped_bytes_);
     if (fd_ >= 0) ::close(fd_);
     fd_ = -1;
+    if (head_fd_ >= 0) ::close(head_fd_);   // local (split-file)
+    head_fd_ = -1;
+    split_n_ = 0;
 #endif
     base_ = nullptr;
     blobs_ = 0;
@@ -1438,9 +1590,16 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
     return ok ? dst : nullptr;
 }
 
+bool FileExpertSource::cold(int64_t layer, int64_t expert) const {
+    if (io_cold_stamp_.empty() || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return false;
+    return io_cold_epoch_ != 0 && io_cold_stamp_[(size_t) (layer * n_expert_ + expert)] == io_cold_epoch_;
+}
+
 void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n) {
     if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return;
     if (io_fill_ && io_pf_ && direct_.empty()) {   // hand the layer's uncached blobs to the workers and go on: the kernels
+        io_cur_layer_.store((int32_t) layer, std::memory_order_relaxed);
+        if (++io_cold_epoch_ == 0) io_cold_epoch_ = 1;   // 0 marks "never"
         for (int64_t i = 0; i < n; ++i) {          // that reach one before it lands wait on its pages, the rest compute
             const int64_t e = experts[i];
             if (e < 0 || e >= n_expert_) continue;
@@ -1450,7 +1609,8 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             uint64_t total = 0;
             if (cached_bytes(layer, e, total, false) >= total) continue;
             io_pf_demand_.fetch_add(1, std::memory_order_relaxed);
-            io_enqueue(layer, e);
+            if (!io_cold_stamp_.empty()) io_cold_stamp_[index] = io_cold_epoch_;
+            io_enqueue(layer, e, /*demand=*/true);
         }
         return;
     }
@@ -1651,7 +1811,11 @@ bool FileExpertSource::open_prompt_direct(std::string& why) {
     if (base_ == nullptr || paths_.empty()) { why = "no expert files open"; return false; }
     if (!direct_.empty()) { why = "the file tier reads unbuffered already"; return false; }
     if (!pdirect_.empty()) return true;
-    for (const std::string& path : paths_) {
+    for (size_t pi = 0; pi < paths_.size(); ++pi) {
+        // local (split-file): with the whole of experts.bin on the head copy's drive (STRATA_EXPERTS_HEAD), the prompt's
+        // unbuffered reads come from that copy too - the same bytes at the same offsets, from the faster drive
+        const std::string& path = (pi == 0 && paths_.size() == 1 && !head_path_.empty() && split_n_ >= mapped_bytes_)
+                                      ? head_path_ : paths_[pi];
         const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
         if (fd < 0) {
             why = "cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + ")";
@@ -2182,7 +2346,8 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
             ranges.push_back({(PVOID) p, (SIZE_T) role_bytes_[i]});
 #else
             const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
-            (void) madvise((void*) a, (size_t) ((uintptr_t) p + role_bytes_[i] - a), MADV_WILLNEED);
+            // in 128 KiB steps: one MADV_WILLNEED is clipped to the device's read_ahead_kb
+            strata::platform::advise_willneed((const void*) a, (uint64_t) ((uintptr_t) p + role_bytes_[i] - a));
 #endif
         }
     }
@@ -2613,6 +2778,82 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
                 return 0;
             }
         }
+        return whole;   // bytes advised, not a measurement of physical RAM reclaimed
+    };
+    if (role_ptr_.empty()) {
+        const uint8_t* p = mapped_blob(layer, expert);
+        return p == nullptr ? 0 : trim(p, layer_blob_bytes_[(size_t) layer]);
+    }
+    uint64_t bytes = 0;
+    for (int r = 0; r < 3; ++r) {
+        const size_t i = (size_t) (3 * layer + r);
+        bytes += trim(role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]), role_bytes_[i]);
+    }
+    return bytes;
+#elif defined(__linux__)
+    // local (Linux, opt-in STRATA_FILE_RELEASE=1): the same trim with madvise.  A VRAM-held expert's page-cache copy
+    // is dead weight (the GPU never reads it) that crowds out the experts the CPU pool reads from the page cache.
+    // MADV_PAGEOUT drops the clean pages now (it needs the file's owner or write access, else MADV_COLD: first to go).
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_FILE_RELEASE");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    if (!enabled || base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+        return 0;
+    static const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+    // STRATA_FILE_RELEASE_ADVICE=cold: MADV_COLD (the pages go first under pressure, but stay while there is none)
+    static std::atomic<int> advice{[] { const char* v = std::getenv("STRATA_FILE_RELEASE_ADVICE");
+                                        return v != nullptr && std::strcmp(v, "cold") == 0 ? MADV_COLD : MADV_PAGEOUT; }()};
+    auto trim = [&](const uint8_t* p, uint64_t bytes) -> uint64_t {
+        const uint64_t misalignment = (uintptr_t) p % page;
+        const uint64_t skip = misalignment == 0 ? 0 : page - misalignment;
+        if (bytes <= skip) return 0;
+        const uint64_t whole = (bytes - skip) / page * page;
+        if (whole == 0) return 0;
+        void* a = (void*) (p + (size_t) skip);
+        auto advise = [](void* a, size_t whole) {
+            if (madvise(a, whole, advice.load(std::memory_order_relaxed)) != 0) {
+                if (advice.exchange(MADV_COLD) == MADV_PAGEOUT) {
+                    std::fprintf(stderr, "FileExpertSource: MADV_PAGEOUT refused (%s), released experts use MADV_COLD\n",
+                                 std::strerror(errno));
+                    std::fflush(stderr);
+                }
+                (void) madvise(a, whole, MADV_COLD);
+            }
+        };
+        // the page-out reclaims synchronously (~0.25 ms a blob): on the decode thread it cost ~2 ms a window, so it
+        // runs on a helper thread of its own (STRATA_FILE_RELEASE_SYNC=1: inline, as first measured)
+        static const bool sync = [] { const char* v = std::getenv("STRATA_FILE_RELEASE_SYNC"); return v != nullptr && v[0] == '1'; }();
+        if (sync) { advise(a, (size_t) whole); return whole; }
+        struct Releaser {
+            std::mutex mu;
+            std::condition_variable cv;
+            std::deque<std::pair<void*, size_t>> q;
+            void (*fn)(void*, size_t) = nullptr;
+        };
+        static Releaser* rel = [&] {
+            Releaser* r = new Releaser();   // lives as long as the process (the thread is detached)
+            std::thread([r] {
+                strata::aux_cpus::pin_current_thread();
+                for (;;) {
+                    std::pair<void*, size_t> job;
+                    {
+                        std::unique_lock<std::mutex> lk(r->mu);
+                        r->cv.wait(lk, [r] { return !r->q.empty(); });
+                        job = r->q.front();
+                        r->q.pop_front();
+                    }
+                    r->fn(job.first, job.second);
+                }
+            }).detach();
+            return r;
+        }();
+        {
+            std::lock_guard<std::mutex> lk(rel->mu);
+            rel->fn = +advise;
+            rel->q.emplace_back(a, (size_t) whole);
+        }
+        rel->cv.notify_one();
         return whole;   // bytes advised, not a measurement of physical RAM reclaimed
     };
     if (role_ptr_.empty()) {
@@ -3911,6 +4152,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
     int njobs = 0;
+    static thread_local std::vector<int64_t> job_e;   // local (io-prio): each job's expert, for the cold-last order
+    if (job_e.size() < (size_t) d.n_expert) job_e.resize((size_t) d.n_expert);
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
@@ -3952,6 +4195,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     return;
                 }
                 jo = (int16_t) njobs++;
+                job_e[(size_t) jo] = e;
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
@@ -3963,6 +4207,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++jb.nt;
             ++d.multi_entries;
         }
+    // local (io-prio): the experts prefetch had to send to the drive go last, so the pool computes the cached ones while
+    // their reads land instead of a worker (and, with the row split, every worker) waiting on a cold blob first.  Each
+    // job writes only its own rows, so the order changes no bit.  STRATA_COLD_LAST=0 keeps the routing order.
+    static const bool cold_last = [] { const char* v = std::getenv("STRATA_COLD_LAST"); return v == nullptr || std::atoi(v) != 0; }();
+    if (cold_last && njobs > 1) {
+        int n_cold = 0;
+        for (int j = 0; j < njobs; ++j) n_cold += d.src->cold(d.layers, job_e[(size_t) j]) ? 1 : 0;
+        if (n_cold > 0 && n_cold < njobs) {
+            static thread_local std::vector<ExpertJobMulti> tmp;
+            tmp.assign(d.jobs_multi.begin(), d.jobs_multi.begin() + njobs);
+            int w = 0;
+            for (int pass = 0; pass < 2; ++pass)
+                for (int j = 0; j < njobs; ++j)
+                    if (d.src->cold(d.layers, job_e[(size_t) j]) == (pass == 1)) d.jobs_multi[(size_t) w++] = tmp[(size_t) j];
+            d.cold_last_moved += n_cold;
+        }
+    }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     if (njobs > 0) {
@@ -4824,7 +5085,7 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
     const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
-    madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
+    strata::platform::advise_willneed((const uint8_t*) map_ + off, end - off);   // 128 KiB steps (read_ahead_kb clip)
 #endif
 }
 

@@ -382,6 +382,36 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
     check_launch("doorbell_publish");
 }
 
+__global__ void gla_publish_kernel(const int32_t* __restrict__ ids, int nk, const int32_t* __restrict__ d_res,
+                                   int n_expert, int32_t* out, int k, int kk) {
+    __shared__ unsigned int bits[32];
+    __shared__ int cnt;
+    if (threadIdx.x < 32) bits[threadIdx.x] = 0u;
+    if (threadIdx.x == 0) cnt = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < nk; i += blockDim.x) {
+        if (i % k >= kk) continue;   // each token's first kk picks only (the router's top-k, best first)
+        const int32_t id = ids[i];
+        if (id < 0 || id >= n_expert || (d_res != nullptr && d_res[id] >= 0)) continue;
+        const unsigned int m = 1u << (id & 31);
+        if ((atomicOr(&bits[id >> 5], m) & m) == 0u) out[1 + atomicAdd(&cnt, 1)] = id;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *(volatile int32_t*) out = cnt + 1;
+        __threadfence_system();
+    }
+}
+
+void gla_publish(const int32_t* ids, int64_t nk, const int32_t* d_res, int n_expert, int32_t* out, int k, int kk,
+                 void* stream) {
+    if (nk <= 0) return;
+    if (nk > 1024 || n_expert > 1024 || k <= 0) { std::fprintf(stderr, "gla_publish: too many ids or experts\n"); std::exit(1); }
+    gla_publish_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(ids, (int) nk, d_res, n_expert, out, k, kk < 1 ? 1 : kk);
+    check_launch("gla_publish");
+}
+
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
                           float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish_res: k too large\n"); std::exit(1); }
