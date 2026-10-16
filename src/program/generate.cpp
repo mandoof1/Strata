@@ -12696,12 +12696,53 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
+            // STRATA_SPEC_CUM=S (opt-in; unset or 0 = off): the MTP part of a window keeps a draft only while the product of
+            // the draft layer's probabilities up to it (the chance that every draft so far holds) is at least S, beside
+            // --spec-min-p's per-draft floor.  It only chooses which drafts are verified: the output is unchanged.
+            static const double spec_cum = [] { const char* e = std::getenv("STRATA_SPEC_CUM"); return e ? std::atof(e) : 0.0; }();
+            // STRATA_SPEC_LOG=<file> (measurement): one line per window - its size, the MTP part, the chained tokens, the
+            // drafts accepted, the draft layer's probabilities, and the verify / commit / draft times
+            static std::FILE* const spec_log = [] {
+                const char* e = std::getenv("STRATA_SPEC_LOG");
+                return e != nullptr && *e != 0 ? std::fopen(e, "a") : nullptr;
+            }();
+            // STRATA_SPEC_CAL=1 (with STRATA_SPEC_CUM): the product is taken over calibrated probabilities - how often a
+            // draft at that depth and with that probability held, counted over the windows served so far (decayed; a cell
+            // without counts keeps the draft layer's own probability).  The draft layer is overconfident past its first
+            // draft (2nd drafts at p 0.8-0.9 held 57% of the time on this model).
+            static const bool spec_cal_on = [] { const char* e = std::getenv("STRATA_SPEC_CAL"); return e && std::atoi(e) != 0; }();
+            struct SpecCal {
+                enum { D = 8, B = 8 };
+                double n[D][B] = {}, ok[D][B] = {};
+                static int bin(float p) {
+                    const float e[B - 1] = {0.3f, 0.5f, 0.7f, 0.8f, 0.9f, 0.95f, 0.99f};
+                    int b = 0;
+                    while (b < B - 1 && p >= e[b]) ++b;
+                    return b;
+                }
+                double q(int j, float p) const { const int b = bin(p); return (ok[j][b] + 4.0 * p) / (n[j][b] + 4.0); }
+                void observe(int j, float p, bool held) {
+                    const int b = bin(p);
+                    n[j][b] = n[j][b] * 0.995 + 1.0;
+                    ok[j][b] = ok[j][b] * 0.995 + (held ? 1.0 : 0.0);
+                }
+            };
+            static SpecCal spec_cal;   // kept across requests
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    double cum = 1.0;
+                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) {
+                        cum *= spec_cal_on ? spec_cal.q(T - 1, dprob[(size_t) T - 1]) : (double) dprob[(size_t) T - 1];
+                        if (spec_cum > 0.0 && cum < spec_cum) break;
+                        ++T;
+                    }
                 }
+                float wprob[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // this window's draft probabilities (log, calibration)
+                int wn = 0;
+                if ((spec_log != nullptr || spec_cal_on) && use_mtp)
+                    for (; wn < 8 && wn < (int) dprob.size() && dprob[(size_t) wn] > 0.0f; ++wn) wprob[wn] = dprob[(size_t) wn];
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
@@ -12814,6 +12855,8 @@ int main(int argc, char** argv) {
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
                     for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
+                if (spec_cal_on && !from_sfx && !first_window)   // the drafts this window reached: did each hold?
+                    for (int d = 0; d < T_mtp - 1 && d < wn && d <= a; ++d) spec_cal.observe(d, wprob[d], d < a);
                 if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
@@ -12842,6 +12885,7 @@ int main(int argc, char** argv) {
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
                 draft_accepted += a;
+                const bool first_window_was = first_window;
                 first_window = false;
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
@@ -12885,6 +12929,13 @@ int main(int argc, char** argv) {
                 if (timed_round && !eos && chain_n == 0 && T >= 1 && T <= 8) {   // local: per-size round stats (timing line)
                     tT_n[(size_t) T] += 1; tT_tok[(size_t) T] += a + 1;
                     tT_ms[(size_t) T] += std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+                }
+                if (spec_log != nullptr) {
+                    auto msd2 = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+                    std::fprintf(spec_log, "W %d %d %d %d %d %d %d %.3f %.3f %.3f", first_window_was ? 1 : 0, T, T_mtp, chain_n,
+                                 from_sfx ? 1 : 0, a, wn, msd2(round0, Clock::now()), msd2(tw0, tw1), msd2(tw2, Clock::now()));
+                    for (int i = 0; i < wn; ++i) std::fprintf(spec_log, " %.4f", wprob[i]);
+                    std::fprintf(spec_log, "\n");
                 }
                 if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,

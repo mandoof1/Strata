@@ -1648,7 +1648,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
         n = 1;
-        for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+        // STRATA_SPEC_CUM (see the serve loop): no further draft once the chance that every draft so far holds is below S
+        static const double spec_cum = [] { const char* e = std::getenv("STRATA_SPEC_CUM"); return e ? std::atof(e) : 0.0; }();
+        double cum = pj;
+        for (int j = 1; j < max_steps && pj >= min_p && (spec_cum <= 0.0 || cum >= spec_cum); ++j) {
             if (dt) cudaEventRecord(g_dt.eb[j], cs_);
             tl = Clock::now();
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
@@ -1665,6 +1668,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;
+            cum *= pj;
             ++n;
         }
         prefetch_ple(drafts[n - 1]);
