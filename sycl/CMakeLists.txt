@@ -397,5 +397,9 @@ if(STRATA_SYCL_PARITY)
     target_link_libraries(iq_single_parity PRIVATE strata_kernels_cpu)
     add_test(NAME iq_single_parity COMMAND iq_single_parity)
     set_tests_properties(iq_single_parity PROPERTIES SKIP_RETURN_CODE 77)
+    # the real ExpertPool at decode's batch size (one layer's CPU experts a call), with an output hash: its batching
+    # against kq_cpu_bench, and STRATA_POOL_FUSED against the phases
+    add_executable(pool_layer_bench ${STRATA_ROOT}/src/kernels/cpu/pool_layer_bench.cpp)
+    target_link_libraries(pool_layer_bench PRIVATE strata_kernels_cpu)
   endif()
 endif()
