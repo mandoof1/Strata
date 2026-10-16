@@ -7192,6 +7192,17 @@ int main(int argc, char** argv) {
     }
     // (the arena mode has no RAM copy to exchange with: its experts are always in RAM, the tier only copies them in)
     if (o.adapt_async && !src.complement_ready() && srcp != &arena_src) adapt_async_off("the resident RAM mode is not running");
+#if defined(__linux__)
+    // local: STRATA_PROMPT_DIRECT=1 without a RAM copy too (--mmap-experts alone, a 15 GB box): a prompt's chunks read every
+    // expert, and through the file cache that evicts the pages the decode reuses; unbuffered, the cache keeps them
+    if (srcp == &src && o.mmap_experts && o.resident_budget <= 0 && !src.unbuffered() &&
+        [] { const char* v = std::getenv("STRATA_PROMPT_DIRECT"); return v != nullptr && v[0] == '1'; }()) {
+        std::string pw;
+        const bool pd = src.open_prompt_direct(pw);
+        std::fprintf(stderr, "strata generate: the prompt path's expert reads %s\n",
+                     pd ? "go unbuffered (STRATA_PROMPT_DIRECT=1)" : ("stay buffered: " + pw).c_str());
+    }
+#endif
     // pp-opt: with the file tier unbuffered, the mapped view of experts.bin is only a fallback from here on - and while
     // it exists NTFS serves the unbuffered reads one at a time (drop_mapping).  STRATA_KEEP_MAPPING=1 keeps it (A/B).
     if (srcp == &src && src.unbuffered() && std::getenv("STRATA_KEEP_MAPPING") == nullptr) {
