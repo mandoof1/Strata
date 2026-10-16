@@ -12789,7 +12789,10 @@ int main(int argc, char** argv) {
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-                if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                drive.d.cold_skip_window = true;   // local (cold-skip): a decode window (the prompt's never set it)
+                const bool ran = ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err);
+                drive.d.cold_skip_window = false;
+                if (!ran || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
@@ -13166,6 +13169,20 @@ int main(int argc, char** argv) {
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
                                      "start\n", (long long) drive.d.tail_experts, (long long) drive.d.tail_skipped);
+            if (strata::core::cold_skip_below() > 0.0f) {   // local (cold-skip, STRATA_COLD_SKIP_BELOW), this request
+                static int64_t cs_e = 0, cs_n = 0, cs_c = 0, cs_w = 0;
+                static uint64_t cs_r = 0, cs_k = 0, cs_d = 0;
+                const strata::core::FileExpertSource::IoCounters cic = src.io_counters();
+                std::fprintf(stderr, "strata serve: cold-skip: %lld experts skipped (%lld entries, %lld light misses over the "
+                                     "per-token cap), %lld warm-up reads queued (%llu read from storage, %llu already "
+                                     "cached, %llu dropped) this request\n",
+                             (long long) (drive.d.cold_skip_experts - cs_e), (long long) (drive.d.cold_skip_entries - cs_n),
+                             (long long) (drive.d.cold_skip_capped - cs_c), (long long) (drive.d.cold_skip_warm - cs_w),
+                             (unsigned long long) (cic.warm_read - cs_r), (unsigned long long) (cic.warm_cached - cs_k),
+                             (unsigned long long) (cic.warm_dropped - cs_d));
+                cs_e = drive.d.cold_skip_experts; cs_n = drive.d.cold_skip_entries; cs_c = drive.d.cold_skip_capped;
+                cs_w = drive.d.cold_skip_warm; cs_r = cic.warm_read; cs_k = cic.warm_cached; cs_d = cic.warm_dropped;
+            }
             // the resident RAM mode, cumulative: experts read from experts.bin since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
             if (src.complement_ready())
@@ -13967,7 +13984,10 @@ int main(int argc, char** argv) {
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-            if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
+            drive.d.cold_skip_window = true;   // local (cold-skip): a decode window
+            const bool ran = ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err);
+            drive.d.cold_skip_window = false;
+            if (!ran) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }

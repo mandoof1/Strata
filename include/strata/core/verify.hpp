@@ -515,6 +515,8 @@ private:
     uint32_t* h_pflag_ = nullptr; uint32_t* m_pflag_ = nullptr;  // the pool has written the heavy CPU rows (partial flag)
     bool defer_ok(int T, std::string* why) const;   ///< the T-token window may be captured with deferral
     bool heavy_layer(int T, int64_t l) const;       ///< STRATA_VERIFY_DEFER_CPU_BELOW: post(l) waits for the partial flag
+    /// local (cold-skip): whether the T-token window's doorbells publish the routing weights to the host (h_w_)
+    bool route_w_live(int T) const;
 
     // device
     void* arena_ = nullptr;

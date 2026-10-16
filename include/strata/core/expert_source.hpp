@@ -229,6 +229,19 @@ public:
     /// local (io-prio): true when the last `prefetch` of `layer` had to read this expert from the drive (its pages were
     /// not cached).  The CPU pool then computes it after the cached ones, so its read overlaps their compute.
     virtual bool cold(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// local (cold-skip): the probe `prefetch` makes, asked before it - 1 when the expert's blob would have to be read
+    /// from the drive (its sampled pages are not in the page cache), 0 when not, -1 when this source cannot tell (no
+    /// io-prefetch page-cache tier).  No state: the caller hands the answers to `prefetch_probed`.
+    virtual int probe_cold(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return -1; }
+    /// local (cold-skip): `prefetch` with the answers of `probe_cold` the caller already has (`known[i]` -1: not probed,
+    /// probe it; 0 / 1: its answer), so no blob is probed twice.  Default: `prefetch`.
+    virtual void prefetch_probed(int64_t layer, const int64_t* experts, int64_t n, const int8_t* known) {
+        (void) known;
+        prefetch(layer, experts, n);
+    }
+    /// local (cold-skip): reads the blob into the page cache in the background - behind every demand read, never
+    /// dropped as stale - for a later window.  The bytes are the same.  False when this source has no such queue.
+    virtual bool warm_background(int64_t layer, int64_t expert) { (void) layer; (void) expert; return false; }
     /// CS-T: the experts of `layer` a predictor expects next - a source that reads a file may start reading their
     /// pages now, in the background.  Only warms: what `blob` returns is unchanged.  Default: nothing.
     virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -340,7 +353,14 @@ struct GpuPlanSink {
     const float* weights = nullptr;
     float heavy = 0.0f;
     void (*partial)(void* ctx) = nullptr;
+    /// local (cold-skip, STRATA_COLD_SKIP_BELOW): the group's routing weights (entry token * k + j) when the doorbell
+    /// published them for this layer - set by the verifier per layer only while cold-skip is on; null otherwise.
+    const float* route_w = nullptr;
 };
+
+/// local (cold-skip): STRATA_COLD_SKIP_BELOW=<w> (read once; 0 = off): the routing weight below which a cold missed
+/// expert of a decode window is skipped (expert_pool_dispatch_multi).
+float cold_skip_below();
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ForesightSwap;
@@ -474,6 +494,11 @@ struct ExpertDispatch {
     int64_t tail_skipped = 0;
     int64_t cold_last_moved = 0;   ///< local (io-prio): CPU jobs moved behind the cached ones (cold-last order)
     int64_t tail_experts = 0;
+    /// local (cold-skip, STRATA_COLD_SKIP_BELOW): set by the driver around its decode windows only (never the prompt's
+    /// verify windows), so only those skip.  The counters: distinct experts skipped and their entries, light misses left
+    /// computed because the per-token cap was reached, and the background reads queued for the skipped blobs.
+    bool cold_skip_window = false;
+    int64_t cold_skip_experts = 0, cold_skip_entries = 0, cold_skip_capped = 0, cold_skip_warm = 0;
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
@@ -724,6 +749,9 @@ public:
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
     bool cold(int64_t layer, int64_t expert) const override;
+    int probe_cold(int64_t layer, int64_t expert) const override;
+    void prefetch_probed(int64_t layer, const int64_t* experts, int64_t n, const int8_t* known) override;
+    bool warm_background(int64_t layer, int64_t expert) override;
     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
     /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
@@ -764,6 +792,8 @@ public:
         uint64_t pf_stale = 0;                               ///< local (io-prio): predictions dropped, their layer already reached
         uint64_t crit_us = 0;                                ///< wall time the decode waited on file reads (prefetch + staged_blob)
         uint64_t crit_n = 0;
+        /// local (cold-skip): background warm-up reads queued, read from storage, found cached by then, dropped (queue full)
+        uint64_t warm_queued = 0, warm_read = 0, warm_cached = 0, warm_dropped = 0;
     };
     IoCounters io_counters() const;
 
@@ -864,6 +894,12 @@ private:
     // layer the decode has already reached is dropped.  On a SATA SSD the speculative reads otherwise took the
     // bandwidth the current layer was waiting for.
     std::deque<std::pair<int32_t, int32_t>> io_dq_;  ///< (layer, expert) the current layer needs
+    // local (cold-skip): the blobs a decode window skipped cold (warm_background), read only while no demand read and no
+    // prediction is queued or in flight and fewer than io_ahead_max_ read-aheads are; first in first out, never dropped as
+    // stale, at most kWarmQueueMax (the oldest goes)
+    std::deque<std::pair<int32_t, int32_t>> io_wq_;
+    static constexpr size_t kWarmQueueMax = 64;
+    std::atomic<uint64_t> io_warm_queued_{0}, io_warm_read_{0}, io_warm_cached_{0}, io_warm_dropped_{0};
     bool io_prio_ = true;
     int io_ahead_max_ = 2;
     int io_dem_busy_ = 0, io_ahead_busy_ = 0;        ///< reads in flight (under io_mu_)

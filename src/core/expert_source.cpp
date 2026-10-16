@@ -658,6 +658,10 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     c.pf_stale = io_pf_stale_.load(std::memory_order_relaxed);
     c.crit_us = io_crit_us_.load(std::memory_order_relaxed);
     c.crit_n = io_crit_n_.load(std::memory_order_relaxed);
+    c.warm_queued = io_warm_queued_.load(std::memory_order_relaxed);
+    c.warm_read = io_warm_read_.load(std::memory_order_relaxed);
+    c.warm_cached = io_warm_cached_.load(std::memory_order_relaxed);
+    c.warm_dropped = io_warm_dropped_.load(std::memory_order_relaxed);
     return c;
 }
 
@@ -712,6 +716,7 @@ void FileExpertSource::io_stop() {
         io_quit_ = true;
         io_q_.clear();
         io_dq_.clear();
+        io_wq_.clear();
     }
     io_cv_.notify_all();
     for (std::thread& t : io_workers_)
@@ -750,16 +755,20 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, bool demand) {
 void FileExpertSource::io_worker() {
     for (;;) {
         int32_t layer, expert;
-        bool demand = false;
+        bool demand = false, warm = false;
         {
             std::unique_lock<std::mutex> lk(io_mu_);
             // io-prio: a read-ahead starts only while nothing the current layer needs is queued or being read
             auto ahead_ok = [&] {
                 return !io_q_.empty() && (!io_prio_ || (io_dq_.empty() && io_dem_busy_ == 0 && io_ahead_busy_ < io_ahead_max_));
             };
+            // local (cold-skip): a background warm-up read, only behind every demand read and prediction
+            auto warm_ok = [&] {
+                return !io_wq_.empty() && io_q_.empty() && io_dq_.empty() && io_dem_busy_ == 0 && io_ahead_busy_ < io_ahead_max_;
+            };
             bool got = false;
             while (!got) {
-                io_cv_.wait(lk, [&] { return io_quit_ || !io_dq_.empty() || ahead_ok(); });
+                io_cv_.wait(lk, [&] { return io_quit_ || !io_dq_.empty() || ahead_ok() || warm_ok(); });
                 if (io_quit_) return;
                 if (!io_dq_.empty()) {
                     layer = io_dq_.front().first;
@@ -767,6 +776,14 @@ void FileExpertSource::io_worker() {
                     io_dq_.pop_front();
                     demand = got = true;
                     ++io_dem_busy_;
+                    break;
+                }
+                if (!ahead_ok()) {   // then warm_ok() holds (io_wq_ is empty unless cold-skip queued a read)
+                    layer = io_wq_.front().first;
+                    expert = io_wq_.front().second;
+                    io_wq_.pop_front();
+                    warm = got = true;
+                    ++io_ahead_busy_;
                     break;
                 }
                 layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
@@ -845,6 +862,7 @@ void FileExpertSource::io_worker() {
             }
             if (any) io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
             else io_pf_skips_.fetch_add(1, std::memory_order_relaxed);
+            if (warm) (any ? io_warm_read_ : io_warm_cached_).fetch_add(1, std::memory_order_relaxed);
 #endif
             continue;
         }
@@ -1590,7 +1608,37 @@ bool FileExpertSource::cold(int64_t layer, int64_t expert) const {
     return io_cold_epoch_ != 0 && io_cold_stamp_[(size_t) (layer * n_expert_ + expert)] == io_cold_epoch_;
 }
 
+int FileExpertSource::probe_cold(int64_t layer, int64_t expert) const {
+    if (!(staged() && io_fill_ && io_pf_ && direct_.empty()) || layer < 0 || layer >= n_layers_ || expert < 0 ||
+        expert >= n_expert_) return -1;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (complement_ready_ && resident_blob(index) != nullptr) return 0;   // as prefetch: no read for these
+    if (!override_.empty() && override_[index] != nullptr) return 0;
+    uint64_t total = 0;
+    return cached_bytes(layer, expert, total, false) < total ? 1 : 0;
+}
+
+bool FileExpertSource::warm_background(int64_t layer, int64_t expert) {
+    if (!(io_fill_ && io_pf_ && direct_.empty()) || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_)
+        return false;
+    {
+        std::lock_guard<std::mutex> lk(io_mu_);
+        if (io_wq_.size() >= kWarmQueueMax) {
+            io_wq_.pop_front();
+            io_warm_dropped_.fetch_add(1, std::memory_order_relaxed);
+        }
+        io_wq_.emplace_back((int32_t) layer, (int32_t) expert);
+    }
+    io_warm_queued_.fetch_add(1, std::memory_order_relaxed);
+    io_cv_.notify_one();
+    return true;
+}
+
 void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n) {
+    prefetch_probed(layer, experts, n, nullptr);
+}
+
+void FileExpertSource::prefetch_probed(int64_t layer, const int64_t* experts, int64_t n, const int8_t* known) {
     if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return;
     if (io_fill_ && io_pf_ && direct_.empty()) {   // hand the layer's uncached blobs to the workers and go on: the kernels
         io_cur_layer_.store((int32_t) layer, std::memory_order_relaxed);
@@ -1602,7 +1650,10 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             if (complement_ready_ && resident_blob(index) != nullptr) continue;
             if (!override_.empty() && override_[index] != nullptr) continue;
             uint64_t total = 0;
-            if (cached_bytes(layer, e, total, false) >= total) continue;
+            // local (cold-skip): the caller's probe_cold answer, made this layer, instead of a second probe
+            if (known != nullptr && known[i] >= 0) {
+                if (known[i] == 0) continue;
+            } else if (cached_bytes(layer, e, total, false) >= total) continue;
             io_pf_demand_.fetch_add(1, std::memory_order_relaxed);
             if (!io_cold_stamp_.empty()) io_cold_stamp_[index] = io_cold_epoch_;
             io_enqueue(layer, e, /*demand=*/true);
@@ -3913,6 +3964,36 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+namespace {
+// local (cold-skip): STRATA_COLD_SKIP_BELOW=<w> and STRATA_COLD_SKIP_MAX=<n> (default 2), read once
+struct ColdSkipCfg {
+    float below = 0.0f;
+    int max = 2;
+};
+const ColdSkipCfg& cold_skip_cfg() {
+    static const ColdSkipCfg c = [] {
+        ColdSkipCfg r;
+        if (const char* v = std::getenv("STRATA_COLD_SKIP_BELOW")) {
+            const float w = (float) std::atof(v);
+            r.below = w > 0.0f && w <= 1.0f ? w : 0.0f;
+            if (r.below <= 0.0f)
+                std::fprintf(stderr, "strata verify: STRATA_COLD_SKIP_BELOW=%s is not a routing weight in (0, 1]: no cold "
+                                     "skip\n", v);
+        }
+        if (const char* v = std::getenv("STRATA_COLD_SKIP_MAX")) r.max = std::max(0, std::min(10, std::atoi(v)));
+        if (r.below > 0.0f)
+            std::fprintf(stderr, "strata verify: STRATA_COLD_SKIP_BELOW=%g (changes the output): in decode windows a missed "
+                                 "expert whose blob is not in the page cache and whose routing weight is below %g for every "
+                                 "token of the window is skipped like the route tail skip (zero rows, no renormalisation), "
+                                 "lightest first, at most %d per token and layer (STRATA_COLD_SKIP_MAX), and its blob is read "
+                                 "in the background behind the demand reads\n", (double) r.below, (double) r.below, r.max);
+        return r;
+    }();
+    return c;
+}
+}  // namespace
+float cold_skip_below() { return cold_skip_cfg().below; }
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -3956,7 +4037,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
-    int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe (-2 tail skip, -3 cold skip: no work)
+    // local (cold-skip): the experts probe_cold answered for (prefetch takes the answers) and the skipped ones to warm
+    int32_t pr_e[kMaxWindowEntries];
+    int8_t pr_c[kMaxWindowEntries];
+    int64_t warm_e[kMaxWindowEntries];
+    int npr = 0, nwarm = 0;
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
@@ -4003,6 +4089,72 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ++d.tail_experts;
             }
         }
+        // local (cold-skip, STRATA_COLD_SKIP_BELOW=w, opt-in, changes the output): in a decode window, a missed expert
+        // that is neither in VRAM nor in the page cache and whose largest routing weight over the window's tokens is below
+        // w is skipped as the tail skip above skips (neither copied nor computed, zero rows, no renormalisation): the
+        // lightest first, at most STRATA_COLD_SKIP_MAX per token of the layer.  Its blob is read in the background (after
+        // this layer's demand reads, below) so the next window that routes it finds it cached.  The page-cache probe is
+        // prefetch's own, made here instead and handed to it (prefetch_probed), so no blob is probed twice; only the
+        // light candidates within the cap are probed.  Not with a peer, helper or Foresight GPU (as the tail skip).
+        bool cskip_d[kMaxWindowEntries];
+        for (int q = 0; q < nd; ++q) cskip_d[q] = false;
+        const ColdSkipCfg& csk = cold_skip_cfg();
+        if (csk.below > 0.0f && csk.max > 0 && d.cold_skip_window && d.peer == nullptr && d.remote_count == 0 &&
+            d.fs == nullptr) {
+            const float* rw = d.plan->route_w;
+            if (rw == nullptr) {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "strata verify: STRATA_COLD_SKIP_BELOW: a decode window without the routing "
+                                         "weights published to the host: no cold skip there (said once)\n");
+            } else {
+                int qof[kMaxWindowEntries];   // entry -> its distinct expert
+                float maxw[kMaxWindowEntries];
+                for (int q = 0; q < nd; ++q) maxw[q] = 0.0f;
+                for (int64_t i = 0; i < n; ++i) {
+                    int q = 0;
+                    while (q < nd && distinct[q] != first_of[i]) ++q;
+                    qof[i] = q;
+                    if (q < nd) maxw[q] = std::max(maxw[q], rw[i]);
+                }
+                int cand[kMaxWindowEntries], nc = 0;
+                for (int q = 0; q < nd; ++q) {
+                    const int32_t e = ids[distinct[q]];
+                    if (skip_d[q] || e < 0 || e >= d.n_expert || !(maxw[q] < csk.below)) continue;
+                    if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                    int at = nc++;
+                    while (at > 0 && maxw[cand[at - 1]] > maxw[q]) { cand[at] = cand[at - 1]; --at; }   // lightest first
+                    cand[at] = q;
+                }
+                int per_tok[MAXT];
+                for (int64_t t = 0; t < n_tok; ++t) per_tok[t] = 0;
+                for (int c = 0; c < nc; ++c) {
+                    const int q = cand[c];
+                    bool fits = true;
+                    for (int64_t i = 0; i < n && fits; ++i)
+                        if (qof[i] == q && per_tok[i / k] >= csk.max) fits = false;
+                    if (!fits) { ++d.cold_skip_capped; continue; }
+                    const int32_t e = ids[distinct[q]];
+                    const int pc = d.src->probe_cold(d.layers, e);
+                    if (pc < 0) {
+                        static std::atomic<bool> said{false};
+                        if (!said.exchange(true))
+                            std::fprintf(stderr, "strata verify: STRATA_COLD_SKIP_BELOW: the expert source cannot tell the "
+                                                 "page cache's blobs (it needs --mmap-experts with STRATA_IO_PREFETCH=1): no "
+                                                 "cold skip (said once)\n");
+                        break;
+                    }
+                    if (npr < kMaxWindowEntries) { pr_e[npr] = e; pr_c[npr] = (int8_t) pc; ++npr; }
+                    if (pc == 0) continue;
+                    skip_d[q] = cskip_d[q] = true;
+                    --nmiss;
+                    for (int64_t i = 0; i < n; ++i)
+                        if (qof[i] == q) ++per_tok[i / k];
+                    ++d.cold_skip_experts;
+                    warm_e[nwarm++] = e;
+                }
+            }
+        }
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
         int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         // STRATA_PCIE_MIN1 (opt-in): the share rounds to 0 for 1-2 misses per layer, so the PCIe lane idles on the typical
@@ -4019,9 +4171,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int32_t e = ids[i0];
             int kd = -1;
             unsigned long long ptr = 0;
-            if (skip_d[q]) {                       // STRATA_ROUTE_TAIL_SKIP: neither copied nor computed
+            if (skip_d[q]) {                       // STRATA_ROUTE_TAIL_SKIP (or the cold skip): neither copied nor computed
                 for (int64_t i = i0; i < n; ++i)
-                    if (first_of[i] == i0) kind[i] = -2;
+                    if (first_of[i] == i0) kind[i] = cskip_d[q] ? -3 : -2;
                 continue;
             }
             if (e >= 0 && e < d.n_expert) {
@@ -4121,7 +4273,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
     bool any_cpu = false;
     for (int64_t i = 0; i < n; ++i)
-        if (kind[i] == -1) { any_cpu = true; break; }   // -2: skipped (STRATA_ROUTE_TAIL_SKIP), no work
+        if (kind[i] == -1) { any_cpu = true; break; }   // -2 / -3: skipped (STRATA_ROUTE_TAIL_SKIP / cold skip), no work
     const auto c1 = std::chrono::steady_clock::now();
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
@@ -4144,8 +4296,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
+        if (npr > 0) {   // local (cold-skip): the misses probe_cold already answered for are not probed again
+            static thread_local std::vector<int8_t> known;
+            known.assign(miss.size(), (int8_t) -1);
+            for (size_t m = 0; m < miss.size(); ++m)
+                for (int r = 0; r < npr; ++r)
+                    if (pr_e[r] == miss[m]) { known[m] = pr_c[r]; break; }
+            d.src->prefetch_probed(d.layers, miss.data(), (int64_t) miss.size(), known.data());
+        } else
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
+    // local (cold-skip): the skipped cold blobs into the page cache in the background, queued after this layer's demand
+    // reads so they never go before them
+    for (int w = 0; w < nwarm; ++w)
+        if (d.src->warm_background(d.layers, warm_e[w])) ++d.cold_skip_warm;
     int njobs = 0;
     static thread_local std::vector<int64_t> job_e;   // local (io-prio): each job's expert, for the cold-last order
     if (job_e.size() < (size_t) d.n_expert) job_e.resize((size_t) d.n_expert);
@@ -4161,9 +4325,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_expert = e;
                 return;
             }
-            if (kind[i] == -2) {            // STRATA_ROUTE_TAIL_SKIP: a skipped tail expert contributes zero
+            if (kind[i] == -2 || kind[i] == -3) {   // STRATA_ROUTE_TAIL_SKIP / cold skip: a skipped expert contributes zero
                 std::memset(row, 0, (size_t) H * sizeof(float));
-                ++d.tail_skipped;
+                ++(kind[i] == -2 ? d.tail_skipped : d.cold_skip_entries);
                 continue;
             }
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below

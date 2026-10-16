@@ -2065,6 +2065,15 @@ bool Verifier::heavy_layer(int T, int64_t l) const {
     return defer_ok(T, nullptr);
 }
 
+// local (cold-skip): record_window's doorbell choice - doorbell_publish_value (STRATA_DOORBELL_STORE, HIP) and
+// doorbell_publish write the weights, doorbell_publish_res does not
+bool Verifier::route_w_live(int T) const {
+#if defined(STRATA_USE_HIP)
+    if (g_doorbell_store) return true;
+#endif
+    return remote_opt_ != nullptr || always_publish_ || (defer_heavy_ > 0.0f && defer_ok(T, nullptr));
+}
+
 bool Verifier::capture(int T, std::string& err) {
     cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
     if (exec_t != nullptr) return true;
@@ -2568,6 +2577,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.weights = split ? h_w_ + (size_t) tb * ss.k : nullptr;
             sink_.partial = split ? &Verifier::raise_partial : nullptr;
         }
+        // local (cold-skip): the layer's routing weights for the pool, where the doorbell published them
+        sink_.route_w = strata::core::cold_skip_below() > 0.0f && route_w_live(T) ? h_w_ + (size_t) tb * ss.k : nullptr;
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -3300,6 +3311,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
         sink_.weights = nullptr;   // (STRATA_VERIFY_DEFER_CPU_BELOW: a batch window never defers - one pass)
         sink_.partial = nullptr;
+        sink_.route_w = nullptr;   // (local cold-skip: not in batch windows)
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
@@ -3457,6 +3469,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
         sink_.weights = nullptr;   // (as run_slot_rows)
         sink_.partial = nullptr;
+        sink_.route_w = nullptr;
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
@@ -3744,6 +3757,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             sink_.weights = split ? h_w_ + (size_t) tb * ss.k : nullptr;
             sink_.partial = split ? &Verifier::raise_partial : nullptr;
         }
+        sink_.route_w = strata::core::cold_skip_below() > 0.0f && route_w_live(T) ? h_w_ + (size_t) tb * ss.k : nullptr;   // (as run)
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
