@@ -259,6 +259,9 @@ public:
         return true;
     }
     double ms_gate = 0;   ///< host time spent holding a layer's plan for the adaptive copies (decode timing prints it)
+    /// local (STRATA_NO_PCIE_WAIT=1): the caller knows no miss can take the PCIe path (no pinned RAM copy), so the
+    /// window graphs leave out the flag-B wait and the PCIe group launch of every layer.  Before a capture.
+    void set_no_pcie(bool on) { no_pcie_ = on; }
     cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
@@ -364,6 +367,7 @@ private:
     // pipelined windows (pl_launch ...)
     cudaStream_t ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
     bool always_publish_ = false;
+    bool no_pcie_ = false;   ///< local: set_no_pcie
     bool adapt_gate_wait(int32_t layer, std::string& err);
     AdaptGate* adapt_gate_ = nullptr;     ///< 0.1.43: STRATA_ADAPT_OVERLAP's gate (null: off)
     void pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]);

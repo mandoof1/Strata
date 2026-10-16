@@ -7966,6 +7966,16 @@ int main(int argc, char** argv) {
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+        // local (STRATA_NO_PCIE_WAIT=1): no miss can take the PCIe path (no pinned RAM copy, one GPU, no helper caches):
+        // the window graphs leave out every layer's flag-B wait and empty PCIe group launch (see Verifier::set_no_pcie)
+        if (const char* nv = std::getenv("STRATA_NO_PCIE_WAIT"); nv != nullptr && nv[0] == '1') {
+            bool none = srcp == &src && n_stages == 1 && !remote_opt && !src.complement_ready();
+            for (const int r : o.expert_cache_remote) none = none && r <= 0;
+            for (int64_t l = 0; l < g.n_layers && none; ++l) none = !src.pcie_layer(l);
+            ver.set_no_pcie(none);
+            std::fprintf(stderr, "strata serve: STRATA_NO_PCIE_WAIT: %s\n",
+                         none ? "the PCIe share's per-layer wait and launch are left out" : "kept (a PCIe path exists)");
+        }
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {
