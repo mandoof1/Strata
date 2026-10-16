@@ -124,12 +124,6 @@ void doorbell_publish_value(const float* x, const int32_t* ids, const float* wei
                             void* stream);
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
                           float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream);
-/// local GPU look-ahead (STRATA_GPU_LOOKAHEAD=1): the `nk` predicted expert ids of the next layer, minus the ones its
-/// residency table `d_res` holds in VRAM and minus repeats, to mapped host memory: out[1..] the ids, then out[0] =
-/// their count + 1 (0 means not published yet).  n_expert <= 1024, nk <= 1024.  `k` ids per token, of which the first
-/// `kk` are used (STRATA_GLA_K).
-void gla_publish(const int32_t* ids, int64_t nk, const int32_t* d_res, int n_expert, int32_t* out, int k, int kk,
-                 void* stream);
 /// SYCL: publishes launched or recorded while `on` store the payload with plain stores instead of uncached ones, for
 /// a caller that reads the payload only after the publishing kernel has ended (the stepped verify window).
 void doorbell_plain_payload(bool on);

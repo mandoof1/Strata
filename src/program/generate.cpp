@@ -143,12 +143,6 @@ static bool release_swaps_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_FILE_RELEASE_SWAPS"); return !e || e[0] != '0'; }();
     return on;
 }
-// local: STRATA_EVICT_PREFETCH=0 - an expert the adaptive tier evicts from VRAM is not read back into the page cache
-// ahead (the next demand read brings it if it is routed again)
-static bool evict_prefetch_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_EVICT_PREFETCH"); return !e || e[0] != '0'; }();
-    return on;
-}
 
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
@@ -7961,24 +7955,6 @@ int main(int argc, char** argv) {
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
-        // local GPU look-ahead (STRATA_GPU_LOOKAHEAD=1, see Verifier::set_gla): the next layer's predicted misses go to
-        // the file tier's read-ahead a layer early
-        if (const char* gv = std::getenv("STRATA_GPU_LOOKAHEAD"); gv != nullptr && gv[0] == '1') {
-            if (n_stages > 1 || srcp != &src || !src.warms()) {
-                std::fprintf(stderr, "strata serve: GPU look-ahead off (one GPU with the file tier's read-ahead only)\n");
-            } else if (!ver.set_gla([](void* u, int64_t layer, const int32_t* ids, int n) {
-                           int64_t e[1024];
-                           const int m = n < 1024 ? n : 1024;
-                           for (int i = 0; i < m; ++i) e[i] = ids[i];
-                           static_cast<strata::core::FileExpertSource*>(u)->warm(layer, e, m);
-                       }, &src, err)) {
-                std::fprintf(stderr, "strata serve: GPU look-ahead off: %s\n", err.c_str());
-                err.clear();
-            } else {
-                std::fprintf(stderr, "strata serve: GPU look-ahead on (the next layer's router on the GPU feeds the file "
-                                     "tier's read-ahead)\n");
-            }
-        }
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {
@@ -9020,7 +8996,7 @@ int main(int argc, char** argv) {
                     cp_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
                     main_live = true;
                     host_res[out] = strata::core::kNotResident;
-                    if (evict_prefetch_on()) srcp->prefetch(s.layer, s.out);
+                    srcp->prefetch(s.layer, s.out);
                     pending.emplace_back((int32_t) in, slot);
                     continue;
                 }
@@ -9035,7 +9011,7 @@ int main(int argc, char** argv) {
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
-                if (evict_prefetch_on()) srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
+                srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
                 if (aov && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
                     (agate.hland != nullptr
@@ -12702,22 +12678,6 @@ int main(int argc, char** argv) {
                     T = 1;
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
-                // local O7 (opt-in STRATA_COST_T=1): of the sizes the min_p rule allows, the window with the most expected
-                // tokens per ms - E(t) = 1 + p1 + p1p2 + .. from the drafts' own probabilities over the policy's measured
-                // round time of a t-token window.  On a box where every extra token adds cold CPU experts a long window
-                // of shaky drafts can cost more per token than a short one.
-                static const bool cost_t = [] { const char* v = std::getenv("STRATA_COST_T"); return v != nullptr && v[0] == '1'; }();
-                if (cost_t && use_mtp && !first_window && T > 2) {
-                    double c = 1.0, e = 1.0, best = 1.0 / policy.cost_ms(1);
-                    int bt = 1;
-                    for (int t = 2; t <= T; ++t) {
-                        c *= (double) dprob[(size_t) t - 2];
-                        e += c;
-                        const double r = e / policy.cost_ms(t);
-                        if (r > best) { best = r; bt = t; }
-                    }
-                    T = bt;
-                }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
@@ -12942,8 +12902,7 @@ int main(int argc, char** argv) {
                                           tT_ms[(size_t) t] / tT_tok[(size_t) t]);
                             bt += b;
                         }
-                    std::fprintf(stderr, "strata decode by window size:%s; GPU look-ahead %lld layers, %lld ids\n", bt.c_str(),
-                             (long long) ver.gla_published, (long long) ver.gla_ids);
+                    std::fprintf(stderr, "strata decode by window size:%s\n", bt.c_str());
                 }
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
@@ -13860,7 +13819,7 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
-                if (evict_prefetch_on()) srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
+                srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),

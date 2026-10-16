@@ -754,13 +754,8 @@ void FileExpertSource::io_worker() {
         {
             std::unique_lock<std::mutex> lk(io_mu_);
             // io-prio: a read-ahead starts only while nothing the current layer needs is queued or being read
-            // local (STRATA_IO_AHEAD_WITH_DEMAND=1, NVMe): a read-ahead may also start while demand reads are in flight
-            // (still never while one is queued) - the drive serves several reads at once, so a prediction made a layer
-            // early (the GPU look-ahead) is not held back until the current layer's last miss has landed
-            static const bool with_demand = [] { const char* v = std::getenv("STRATA_IO_AHEAD_WITH_DEMAND"); return v != nullptr && v[0] == '1'; }();
             auto ahead_ok = [&] {
-                return !io_q_.empty() && (!io_prio_ || (io_dq_.empty() && (with_demand || io_dem_busy_ == 0) &&
-                                                        io_ahead_busy_ < io_ahead_max_));
+                return !io_q_.empty() && (!io_prio_ || (io_dq_.empty() && io_dem_busy_ == 0 && io_ahead_busy_ < io_ahead_max_));
             };
             bool got = false;
             while (!got) {
