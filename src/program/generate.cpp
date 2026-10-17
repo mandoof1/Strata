@@ -266,6 +266,28 @@ bool refill_blocking() {
     return v;
 }
 
+// local (iq3d) STRATA_PROMPT_SEED=N (1 = 2048): the routing of a prompt's last N tokens seeds the adaptive tier before
+// its reply - added to the decayed usage counts at the decode's scale (STRATA_PROMPT_SEED_SCALE, default 1: the steady
+// state of a 5-token window at --adapt-decay 0.9) - and the slots the prompt borrowed are refilled with the layer's
+// most used non-resident experts where they beat the old occupant by --adapt-min-gain (STRATA_PROMPT_SEED_SWAP=0: seed
+// only).  Residency only (which experts the GPU holds), as the adaptive tier's own swaps.
+int64_t prompt_seed_tail() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PROMPT_SEED");
+        if (e == nullptr || e[0] == '\0') return (int64_t) 0;
+        const long long x = std::atoll(e);
+        return x == 1 ? (int64_t) 2048 : (int64_t) std::clamp(x, 0LL, 16384LL);
+    }();
+    return v;
+}
+// local (iq3d) STRATA_PROMPT_WARM_MB=N: after a prompt's refill, a background thread reads up to N MB of the most used
+// non-resident experts (by the seeded usage) into the page cache, one blob at a time, so the reply's first CPU experts
+// are RAM reads.  Stopped when the next prompt starts.  Page cache only (no result changes).
+int64_t prompt_warm_mb() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PROMPT_WARM_MB"); return e ? std::max(0LL, std::atoll(e)) : 0LL; }();
+    return v;
+}
+
 using Clock = std::chrono::steady_clock;
 
 // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
@@ -9220,6 +9242,17 @@ int main(int argc, char** argv) {
         // the coldest experts of the VRAM set.  Their slots stay empty, and the adaptive tier admits the decode's most
         // used missed experts into them (no victim), up to STRATA_FREE_ADMIT (default 16) per round, from cached pages.
         std::vector<int32_t> free_slots;
+        // local (iq3d, STRATA_PROMPT_WARM_MB): the page-cache warm-up after a prompt (stopped by the next prompt / the exit)
+        struct PromptWarm {
+            std::thread t;
+            std::atomic<bool> stop{false};
+            void halt() {
+                stop.store(true, std::memory_order_release);
+                if (t.joinable()) t.join();
+                stop.store(false, std::memory_order_release);
+            }
+            ~PromptWarm() { halt(); }
+        } pwarm;
         const bool refill_cached_only = [&] {
             const char* v = std::getenv("STRATA_REFILL_CACHED_ONLY");
             // only when the adaptive tier really runs (a round every few windows): it is what fills the empty slots
@@ -12125,6 +12158,88 @@ int main(int argc, char** argv) {
                 };
                 // local (refill-cached): only what the page cache holds is refilled, so nothing is read ahead either
                 const bool cached_only = refill_cached_only && p.dev < 0;
+                // local (iq3d, STRATA_REFILL_DIRECT=1 with STRATA_PROMPT_DIRECT=1): the lent slots' experts are read by the
+                // prompt path's stager - unbuffered, both drives, many reads in flight - and DMA'd from its pinned ring on
+                // the stream the queued fills use, instead of a pageable copy out of the mapping per slot (which faults the
+                // blobs in one at a time and puts them in the page cache).  The same bytes into the same slots.
+                // local (iq3d, STRATA_PROMPT_SEED): the prompt's routing seeds the adaptive tier; the lent slots take the
+                // layer's most used non-resident experts (same layer: the same blob size) where they beat the old occupant
+                if (prompt_seed_tail() > 0 && p.sp == &sp && p.dev < 0 && !cached_only && !drive.d.usage.empty() &&
+                    host_res.size() == drive.d.usage.size()) {
+                    std::vector<float> rh;
+                    const int64_t rt = sp.take_route_hist(rh);
+                    if (rt > 0 && rh.size() == drive.d.usage.size()) {
+                        static const float seed_scale = [] { const char* v = std::getenv("STRATA_PROMPT_SEED_SCALE"); return v ? (float) std::atof(v) : 1.0f; }();
+                        static const bool seed_swap = [] { const char* v = std::getenv("STRATA_PROMPT_SEED_SWAP"); return v == nullptr || v[0] != '0'; }();
+                        // a pick probability p per token is 5p per 5-token window, 50p at the decayed steady state
+                        const float sc = seed_scale * 5.0f / std::max(1e-3f, 1.0f - o.adapt_decay) / (float) rt;
+                        for (size_t i = 0; i < rh.size(); ++i) drive.d.usage[i] += sc * rh[i];
+                        int64_t moved = 0;
+                        if (seed_swap) {
+                            std::vector<char> busy(host_res.size(), 0);   // occupants of lent slots, swaps in flight
+                            for (const auto& [i, slot] : p.lent) busy[(size_t) i] = 1;
+                            for (const auto& [i, slot] : pending) busy[(size_t) i] = 1;
+                            auto score = [&](size_t i) {
+                                return drive.d.usage[i] + (rank_bonus.empty() ? 0.0f : rank_bonus[i]);
+                            };
+                            std::vector<std::vector<size_t>> occ((size_t) g.n_layers);   // lent entries per layer
+                            for (size_t k = 0; k < p.lent.size(); ++k) occ[(size_t) (p.lent[k].first / g.n_expert)].push_back(k);
+                            std::vector<std::pair<float, int32_t>> cand;
+                            for (int64_t l = 0; l < g.n_layers; ++l) {
+                                auto& ol = occ[(size_t) l];
+                                if (ol.empty()) continue;
+                                cand.clear();
+                                for (int32_t ex = 0; ex < (int32_t) g.n_expert; ++ex) {
+                                    const size_t i = (size_t) (l * g.n_expert + ex);
+                                    if (host_res[i] >= 0 || busy[i] || helper_holds(l, ex)) continue;
+                                    if (drive.d.usage[i] >= 2.0f) cand.emplace_back(score(i), (int32_t) i);
+                                }
+                                if (cand.empty()) continue;
+                                std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                                std::sort(ol.begin(), ol.end(), [&](size_t a, size_t b) {
+                                    return score((size_t) p.lent[a].first) < score((size_t) p.lent[b].first);
+                                });
+                                const size_t nc = std::min(cand.size(), ol.size());
+                                for (size_t k = 0; k < nc; ++k) {
+                                    const float old_s = score((size_t) p.lent[ol[k]].first);
+                                    if (cand[k].first < old_s + o.adapt_min_gain) break;
+                                    p.lent[ol[k]].first = cand[k].second;   // refilled below with the new expert
+                                    ++moved;
+                                }
+                            }
+                        }
+                        std::fprintf(stderr, "strata serve: prompt-seed: the routing of %lld prompt tokens seeded the adaptive tier "
+                                             "(x%.2f); %lld of %zu lent slots refilled with other experts\n",
+                                     (long long) rt, sc, (long long) moved, p.lent.size());
+                    }
+                }
+                static const bool refill_direct = [] { const char* v = std::getenv("STRATA_REFILL_DIRECT"); return v != nullptr && v[0] == '1'; }();
+                if (refill_direct && !cached_only && !refill_blocking() && p.dev < 0 && p.sp != nullptr && srcp == &src &&
+                    src.prompt_direct() && !p.lent.empty()) {
+                    std::vector<int32_t> rl, re;
+                    std::vector<uint8_t*> rd;
+                    std::vector<int64_t> rb;
+                    rl.reserve(p.lent.size()); re.reserve(p.lent.size()); rd.reserve(p.lent.size()); rb.reserve(p.lent.size());
+                    bool all = true;
+                    for (const auto& [i, slot] : p.lent) {
+                        uint8_t* d = p.cache->device_slot(slot);
+                        if (d == nullptr) { all = false; break; }
+                        rl.push_back(i / (int32_t) g.n_expert);
+                        re.push_back(i % (int32_t) g.n_expert);
+                        rd.push_back(d);
+                        rb.push_back((int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert));
+                    }
+                    const auto t_rd = Clock::now();
+                    if (all && p.sp->stream_to_device(rl.data(), re.data(), rd.data(), rb.data(), rl.size(), (void*) 0, e)) {
+                        for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
+                        if (trace)
+                            std::fprintf(stderr, "strata trace: refill-direct: %zu slots queued in %.1f ms\n", p.lent.size(),
+                                         std::chrono::duration<double, std::milli>(Clock::now() - t_rd).count());
+                        return true;
+                    }
+                    if (!e.empty()) return false;   // a copy failed: the stream is in an unknown state
+                    // the stager could not take them (none queued): the copies below, as before
+                }
                 if (!cached_only)
                     for (size_t n = 0; n < kAhead; ++n) advise_lent(n);
                 size_t done_n = 0;
@@ -12182,6 +12297,37 @@ int main(int argc, char** argv) {
                         if (!p.lent.empty() && !refill_one(p, e)) return false;
                 }
                 if (n_parts > 0) res_upload();
+                // local (iq3d, STRATA_PROMPT_WARM_MB): the reply's likely CPU experts into the page cache, in the background
+                if (n_parts > 0 && prompt_warm_mb() > 0 && srcp == &src && !drive.d.usage.empty() &&
+                    host_res.size() == drive.d.usage.size()) {
+                    pwarm.halt();
+                    std::vector<std::pair<float, int32_t>> wl;
+                    for (size_t i = 0; i < host_res.size(); ++i)
+                        if (host_res[i] < 0 && drive.d.usage[i] >= 2.0f) wl.emplace_back(drive.d.usage[i], (int32_t) i);
+                    const uint64_t budget = (uint64_t) prompt_warm_mb() << 20;
+                    const size_t keep = std::min<size_t>(wl.size(), (size_t) (budget / (uint64_t) std::max<int64_t>(1,
+                                            (int64_t) strata::kernels::cpu::expert_layout().max_blob)) * 2 + 16);
+                    std::partial_sort(wl.begin(), wl.begin() + (ptrdiff_t) keep, wl.end(),
+                                      [](auto& a, auto& b) { return a.first > b.first; });
+                    wl.resize(keep);
+                    const int64_t ne = g.n_expert;
+                    pwarm.t = std::thread([&src, &pwarm, wl = std::move(wl), budget, ne] {
+                        const auto t0 = Clock::now();
+                        uint64_t read = 0;
+                        size_t n = 0, cached = 0;
+                        for (const auto& [u, i] : wl) {
+                            if (pwarm.stop.load(std::memory_order_acquire) || read >= budget) break;
+                            const uint64_t got = src.page_in(i / ne, i % ne);
+                            read += got;
+                            ++n;
+                            if (got == 0) ++cached;
+                        }
+                        std::fprintf(stderr, "strata serve: prompt-warm: %zu experts looked at, %zu already cached, %.1f MB read "
+                                             "into the page cache in %.1f s%s\n", n, cached, (double) read / 1e6,
+                                     std::chrono::duration<double>(Clock::now() - t0).count(),
+                                     pwarm.stop.load() ? " (stopped by the next prompt)" : "");
+                    });
+                }
                 if (trace && n_parts > 0) {
                     if (refill_cached_only)
                         std::fprintf(stderr, "strata trace: refill-cached: %lld lent slots left empty so far, %lld free slots now, "
@@ -12199,6 +12345,8 @@ int main(int argc, char** argv) {
             // participant's own cache, and marking only that participant's own layers
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+                pwarm.halt();   // local (iq3d): the prompt's reads come first
+                if (prompt_seed_tail() > 0) sp.set_route_tail(prompt_seed_tail());
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
@@ -13985,6 +14133,22 @@ int main(int argc, char** argv) {
                     io_prev = io_now;
                     ic_prev = ic;
                     fb_prev = fb;
+                }
+                // local (iq3d): what the prompt path's unbuffered reads did this request
+                if (src.prompt_direct()) {
+                    static strata::core::FileExpertSource::PromptDirectCounters pd_prev;
+                    const strata::core::FileExpertSource::PromptDirectCounters pd = src.prompt_direct_counters();
+                    std::fprintf(stderr, "strata serve: prompt-direct this request: %llu blobs %.1f MB unbuffered (drive 1 %.1f MB, "
+                                         "drive 2 %.1f MB), %llu blobs %.1f MB from the page cache, %llu failed batches, "
+                                         "%.1f s of reader time\n",
+                                 (unsigned long long) (pd.direct_blobs - pd_prev.direct_blobs),
+                                 (double) (pd.direct_bytes - pd_prev.direct_bytes) / 1e6,
+                                 (double) (pd.drive_bytes[0] - pd_prev.drive_bytes[0]) / 1e6,
+                                 (double) (pd.drive_bytes[1] - pd_prev.drive_bytes[1]) / 1e6,
+                                 (unsigned long long) (pd.cached_blobs - pd_prev.cached_blobs),
+                                 (double) (pd.cached_bytes - pd_prev.cached_bytes) / 1e6,
+                                 (unsigned long long) (pd.fallbacks - pd_prev.fallbacks), (double) (pd.us - pd_prev.us) / 1e6);
+                    pd_prev = pd;
                 }
             }
             if (drive.d.alt != nullptr) {   // local (STRATA_ALT_EXPERTS): where this request's CPU experts came from

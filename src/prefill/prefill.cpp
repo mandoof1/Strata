@@ -137,6 +137,13 @@ inline bool stream_ahead_enabled() {
 // attention halves instead of waiting for each layer's routing.
 // #828: STRATA_TEST_PAGEABLE=1 makes every pinned host allocation with a pageable fallback in Prefill::init fail, so the
 // fallbacks (what an LXC container's memlock limit forces) run on a PC that can pin - for ASan / MALLOC_CHECK_=3 runs.
+// local (iq3d): STRATA_PROMPT_DIRECT_SMALL=1 - with prompt-direct on, a staged chunk (below stream_all_min(), its routed
+// experts only) reads unbuffered too.  Off by default: those blobs are the ones the decode reads next, so the page cache
+// is the better place for them.
+inline bool prompt_direct_small() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PROMPT_DIRECT_SMALL"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
 inline bool force_pageable() {
     static const bool v = [] { const char* e = std::getenv("STRATA_TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
     return v;
@@ -788,6 +795,11 @@ struct PinnedUpload {
 };
 
 struct Prefill::Impl {
+    // local (iq3d, STRATA_PROMPT_SEED): the routed ids of the last `rtail` tokens of each run, per layer, copied to
+    // pinned rows (rpin: n_layers x rtail x K) and counted into rhist ([n_layers * n_expert]) at the chunk's end
+    int64_t rtail = 0, rtokens = 0;
+    int32_t* rpin = nullptr;
+    std::vector<float> rhist;
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -980,6 +992,7 @@ void Prefill::reset() {
 void Prefill::release() {
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
+    if (impl_->rpin) { cudaFreeHost(impl_->rpin); impl_->rpin = nullptr; }
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->copy2) cudaStreamSynchronize(impl_->copy2);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
@@ -1280,15 +1293,26 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
             }
         }
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+        // local (iq3d): STRATA_PROMPT_DIRECT=1 on a pack's experts.bin through --mmap-experts - the streamed chunks' blobs
+        // are read by the source with O_DIRECT (copy_blobs): 8 threads, runs of 4 neighbouring blobs (one merged request
+        // each), a 128-deep pinned ring (~300 MB of host RAM: the read-ahead past the GPU's 96-slot ring, which costs no
+        // VRAM, and room for a second drive's later batches) - ~56 MB in flight, where 2 threads copying the mapping kept
+        // ~2 blobs in flight
+        const bool pdirect = !files && src != nullptr && src->prompt_direct();
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : pdirect ? 8 : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
+        if (pdirect && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = std::clamp(16 * threads, 16, 256);
         // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
         // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
         {
             const char* bv = std::getenv("STRATA_STAGER_BATCH");
-            const int want = bv ? std::atoi(bv) : files ? 8 : 1;
+            const int want = bv ? std::atoi(bv) : files ? 8 : pdirect ? 4 : 1;
             m.stager->batch = std::clamp(want, 1, Stager::kMaxBatch);
         }
+        if (pdirect)
+            std::fprintf(stderr, "prefill: prompt-direct (STRATA_PROMPT_DIRECT=1): streamed chunks read unbuffered by %d stager "
+                                 "threads, runs of %d blobs, a %d-blob pinned ring%s\n", threads, std::min(m.stager->batch, m.stager->kRing),
+                         m.stager->kRing, prompt_direct_small() ? "; staged chunks too (STRATA_PROMPT_DIRECT_SMALL=1)" : "");
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
         m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
     }
@@ -2000,6 +2024,43 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
 double Prefill::pinned_share() { return g_pinned_share; }
 int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 
+void Prefill::set_route_tail(int64_t tail) { impl_->rtail = std::clamp<int64_t>(tail, 0, 16384); }
+
+int64_t Prefill::take_route_hist(std::vector<float>& out) {
+    Impl& m = *impl_;
+    out.swap(m.rhist);
+    m.rhist.clear();
+    const int64_t t = m.rtokens;
+    m.rtokens = 0;
+    return t;
+}
+
+bool Prefill::stream_to_device(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, const int64_t* bytes,
+                               size_t n, void* stream, std::string& err) {
+    Impl& m = *impl_;
+    if (n == 0) return true;
+    if (!m.stager || m.src == nullptr || !m.src->prompt_direct() || n >= 0xffff) return false;
+    const cudaStream_t st = (cudaStream_t) stream;
+    // (at most 0xfffe jobs: the stager's claim word holds a 16-bit count; a loan is a few thousand slots)
+    std::vector<Stager::Job> js;
+    js.reserve(n);
+    for (size_t i = 0; i < n; ++i) js.push_back({nullptr, (size_t) bytes[i], m.src, layers[i], experts[i]});
+    m.stager->start(std::move(js));
+    struct Done {
+        Stager* s;
+        ~Done() { s->finish(); }
+    } done{m.stager.get()};
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t* hb = m.stager->wait((int) i);
+        if (cudaMemcpyAsync(dst[i], hb, (size_t) bytes[i], cudaMemcpyHostToDevice, st) != cudaSuccess) {
+            err = "prefill: a direct refill copy failed";
+            return false;
+        }
+        m.stager->issued_one((int) i, st);
+    }
+    return true;
+}
+
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
     return bytes_needed_impl(g, ss, chunk, false, src);
 }
@@ -2372,6 +2433,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
         }
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
+        // local (iq3d, STRATA_PROMPT_SEED): this chunk's rows among the run's last rtail tokens
+        const int64_t r_t0 = m.rtail > 0 ? std::clamp<int64_t>(n - m.rtail - c0, 0, T) : T;
+        const int64_t r_rows = T - r_t0;
+        if (r_rows > 0 && m.rpin == nullptr) {
+            void* h = nullptr;
+            if (cudaHostAlloc(&h, (size_t) g.n_layers * (size_t) m.rtail * (size_t) K * 4, cudaHostAllocDefault) == cudaSuccess)
+                m.rpin = (int32_t*) h;
+            else { cudaGetLastError(); m.rtail = 0; std::fprintf(stderr, "prefill: STRATA_PROMPT_SEED: no pinned rows, off\n"); }
+        }
+        const bool r_cap = r_rows > 0 && m.rpin != nullptr;
+        std::vector<char> r_layer(r_cap ? (size_t) g.n_layers : 0, 0);
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
         const auto tsetup = Clock::now();
@@ -2573,6 +2645,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (stream_all) {
             seq_start.assign((size_t) g.n_layers + 1, 0);
             std::vector<Stager::Job> js;
+            const bool pd_stream = m.src->prompt_direct();   // local (iq3d)
             if (ps_on) {
                 m.pp->pseq.clear();
                 m.pp->pseq_start.assign((size_t) g.n_layers + 1, 0);
@@ -2588,8 +2661,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
-                    if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
-                        job = (int) js.size();
+                    if (m.src->transient(l, e) || (pd_stream && !m.src->pinned(l, e))) {   // CS-T: copied by the source into the stager's buffer
+                        job = (int) js.size();   // (iq3d prompt-direct: the source reads it unbuffered)
                         js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
                     } else {
                         b = m.src->blob_stable(l, e);
@@ -3259,6 +3332,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    if (r_cap && cudaMemcpyAsync(m.rpin + (size_t) l * (size_t) m.rtail * K, m.ids + r_t0 * K,
+                                                 (size_t) (r_rows * K) * 4, cudaMemcpyDeviceToHost, m.cs) == cudaSuccess)
+                        r_layer[(size_t) l] = 1;   // local (iq3d): counted at the chunk's end
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
@@ -4114,7 +4190,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
-                                if (m.src->transient(l, e)) {   // CS-T: copied by the source
+                                if (m.src->transient(l, e) || (prompt_direct_small() && m.src->prompt_direct())) {   // CS-T: copied by the source
                                     js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
                                     continue;
                                 }
@@ -4612,6 +4688,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.experts_dma += iss_dma;
         }
         stats_.tokens += T;
+        if (r_cap) {   // local (iq3d, STRATA_PROMPT_SEED): the captured rows have landed; count them
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            if (m.rhist.size() != (size_t) (g.n_layers * g.n_expert)) m.rhist.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                if (!r_layer[(size_t) l]) continue;
+                const int32_t* ids = m.rpin + (size_t) l * (size_t) m.rtail * K;
+                float* h = m.rhist.data() + l * g.n_expert;
+                for (int64_t i = 0; i < r_rows * K; ++i)
+                    if (ids[i] >= 0 && ids[i] < g.n_expert) h[ids[i]] += 1.0f;
+            }
+            m.rtokens += r_rows;
+        }
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {

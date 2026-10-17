@@ -224,6 +224,9 @@ public:
     /// blob of (layers[i], experts[i]).  A source that reads a drive may merge neighbouring blobs into one request.
     /// Default: copy_blob one by one.
     virtual bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n);
+    /// local (iq3d prompt-direct, a pack's experts.bin through --mmap-experts): true when the prompt path's stager should
+    /// hand this source its copies (copy_blobs, unbuffered reads) instead of copying the mapping itself.  False by default.
+    virtual bool prompt_direct() const { return false; }
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -799,6 +802,23 @@ public:
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// pp-opt, unbuffered: the file-tier blobs of the run in one read_direct batch (neighbours merged into one request)
     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
+    /// local (iq3d): STRATA_PROMPT_DIRECT=1 opened its descriptors on a pack's experts.bin (no RAM copy, no unbuffered
+    /// file tier): the prompt path's streamed blobs are read with O_DIRECT (copy_blobs), the page cache keeps the decode's
+    /// pages.  Blobs whose pages are cached anyway are copied from the cache (STRATA_PROMPT_DIRECT_CACHED, default 0.5:
+    /// at least that share of the blob's pages cached -> a buffered read, which reads only the missing pages).
+    bool prompt_direct() const override { return !pdirect_.empty() && direct_.empty() && role_ptr_.empty(); }
+    /// local (iq3d): STRATA_PROMPT_DIRECT2=1|<path>: a byte-identical second copy of experts.bin on another drive (1: the
+    /// pack's own experts.bin when the reads come from the STRATA_EXPERTS_HEAD copy); each copy_blobs batch goes to the
+    /// drive whose queue drains first (bytes in flight / weight, STRATA_PROMPT_DIRECT2_W, default 0.3 for the second).
+    bool prompt_direct_second() const { return pd2_fd_ >= 0; }
+    struct PromptDirectCounters {
+        uint64_t direct_blobs = 0, direct_bytes = 0, cached_blobs = 0, cached_bytes = 0, drive_bytes[2] = {0, 0};
+        uint64_t fallbacks = 0, us = 0;
+    };
+    PromptDirectCounters prompt_direct_counters() const;
+    /// local (iq3d, STRATA_PROMPT_WARM_MB): reads the blob's pages that are not cached into the page cache (a buffered
+    /// pread on the I/O descriptors); returns the bytes read (0: cached already, or no I/O descriptors).  Thread-safe.
+    uint64_t page_in(int64_t layer, int64_t expert) const;
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
@@ -868,12 +888,20 @@ private:
     void fill_many(const std::vector<Fill>& todo);
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
-    bool read_direct(const Fill* fills, size_t n) const;
+    bool read_direct(const Fill* fills, size_t n, int fd_override = -1) const;
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> pdirect_;              ///< open_prompt_direct: O_DIRECT fds for copy_blobs only
+    // local (iq3d prompt-direct): the second drive's O_DIRECT fd, its weight, the bytes each drive has in flight, counters
+    int pd2_fd_ = -1;
+    double pd2_w_ = 0.3;
+    double pd_cached_min_ = 0.5;
+    std::atomic<uint64_t> pd_inflight_[2]{};
+    std::atomic<uint64_t> pd_direct_blobs_{0}, pd_direct_bytes_{0}, pd_cached_blobs_{0}, pd_cached_bytes_{0};
+    std::atomic<uint64_t> pd_drive_bytes_[2]{};
+    std::atomic<uint64_t> pd_fallbacks_{0}, pd_us_{0};
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
