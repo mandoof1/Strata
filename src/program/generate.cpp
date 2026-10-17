@@ -44,6 +44,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -994,6 +995,9 @@ struct Drive {
     strata::core::ExpertDispatch d;
     double cpu_ms = 0;
     int64_t calls = 0;
+    /// STRATA_ADAPT_LAYERWAIT: the adaptive tier's copy event of each layer the window may not plan before (null: none)
+    std::vector<cudaEvent_t> layer_wait;
+    double layer_wait_ms = 0;   ///< the time those waits blocked (STRATA_DECODE_TIMING)
     /// THE ROUTING TRACE, which is P0.S8 and a stated prerequisite of Phase 3.  `drive_pool` is called once
     /// per layer from the main loop - the workers live inside `expert_pool_dispatch` - so a single FILE* here
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
@@ -1035,6 +1039,13 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
                       int64_t layer) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
+    // STRATA_ADAPT_LAYERWAIT: this layer's swapped-in experts are planned for the GPU only once their copies landed
+    if (layer >= 0 && (size_t) layer < t->layer_wait.size() && t->layer_wait[(size_t) layer] != nullptr) {
+        const Clock::time_point w0 = Clock::now();
+        cudaEventSynchronize(t->layer_wait[(size_t) layer]);
+        t->layer_wait[(size_t) layer] = nullptr;
+        t->layer_wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - w0).count();
+    }
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
@@ -2836,6 +2847,12 @@ int main(int argc, char** argv) {
             (void) strata::prefill::mmq::supported(f.d_type);
 #endif
         }
+    }
+    if (std::getenv("STRATA_CPU_PARITY") != nullptr) {
+        std::string why;
+        strata::kernels::cpu::cpu_parity_init(strata::kernels::swiglu_sexp(), why);
+        std::fprintf(stderr, "strata generate: STRATA_CPU_PARITY: %s%s\n", why.c_str(),
+                     strata::kernels::cpu::cpu_parity() ? " (the CPU expert rows in the GPU's arithmetic, bit for bit)" : "");
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
@@ -5309,6 +5326,14 @@ int main(int argc, char** argv) {
                                  "%zu slots (the profile is the ceiling on a native pack; a profile that ranks every "
                                  "(layer, expert) pair lifts it - tools/make_profile.py)\n", o.expert_cache,
                          profile.size(), o.expert_profile.c_str(), profile.size());
+        // STRATA_EXPERT_SLOTS_MAX=N (tests): at most N slots, the profile's hottest first - two runs whose free VRAM
+        // differs by a few MB then hold the same experts, so a bitwise (KL) comparison is not moved by placement
+        if (const char* v = std::getenv("STRATA_EXPERT_SLOTS_MAX"); v != nullptr && std::atoll(v) > 0 &&
+            sized_slots.size() > (size_t) std::atoll(v)) {
+            sized_slots.resize((size_t) std::atoll(v));
+            std::fprintf(stderr, "strata generate: STRATA_EXPERT_SLOTS_MAX: the expert cache capped at %zu slots\n",
+                         sized_slots.size());
+        }
         o.expert_cache = (int) sized_slots.size();
     }
     // #533: --vram-elastic: the cache in physical segments (the VRAM command resizes it between requests).  One GPU,
@@ -8835,6 +8860,12 @@ int main(int argc, char** argv) {
                     c.stage_parts.push_back(std::move(part));
                 }
             }
+            if (std::getenv("STRATA_CKPT_HASH")) {   // debug: the saved state's hash, to compare two chunkings
+                auto fnv = [](const std::vector<uint8_t>& v) { uint64_t h = 1469598103934665603ull; for (uint8_t x : v) { h ^= x; h *= 1099511628211ull; } return h; };
+                std::fprintf(stderr, "strata serve: checkpoint %lld%s: gdn %016llx ple %016llx tails %016llx dead %016llx pos %016llx\n",
+                             (long long) L, parts ? " (snapshot)" : "", (unsigned long long) fnv(c.gdn), (unsigned long long) fnv(c.ple),
+                             (unsigned long long) fnv(c.tails), (unsigned long long) fnv(c.dead), (unsigned long long) fnv(c.block_pos));
+            }
             c.used = ++check_clock;
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
@@ -8875,7 +8906,22 @@ int main(int argc, char** argv) {
         // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
         static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
+        // STRATA_PF_PIECE: a periodic checkpoint at a piece end inside a larger chunk, where a chunk of the piece's size
+        // would have ended - the same positions and the same state as with those chunks (Prefill::want_snapshot)
+        sp.want_snapshot = nullptr;
+        if (!multi_gpu && o.prompt_cache > 0 && o.prompt_cache_every > 0)
+            sp.want_snapshot = [&](int64_t pos) -> bool {
+                if (pos < pp_next_check) return false;
+                pp_next_check = pos + o.prompt_cache_every;
+                return true;
+            };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+            for (strata::prefill::Prefill::Snapshot& sn : sp.take_snapshots()) {
+                std::vector<ConvCheckpoint> parts(1);
+                parts[0].gdn = std::move(sn.gdn); parts[0].ple = std::move(sn.ple); parts[0].tails = std::move(sn.tails);
+                parts[0].dead = std::move(sn.dead); parts[0].block_pos = std::move(sn.block_pos);
+                if (!checkpoint_at(sn.pos, &parts)) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
+            }
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
@@ -9127,6 +9173,34 @@ int main(int argc, char** argv) {
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        // STRATA_ADAPT_COPY2 (on; =0 one stream): a round's copies alternate over two streams - the card's two DMA
+        // engines, as the prompt path's (STRATA_PF_COPY2): 48 copies of 2.2 MB in 3.70 instead of 4.00 ms (28.6 vs
+        // 26.4 GB/s; one or two copies are no faster).  adapt_stream waits for the second before adapt_ev, so every
+        // wait on adapt_ev covers both; the same bytes into the same slots.
+        static const bool adapt_copy2_on = [] { const char* v = std::getenv("STRATA_ADAPT_COPY2"); return v == nullptr || v[0] != '0'; }();
+        cudaStream_t adapt_stream2 = nullptr;
+        cudaEvent_t adapt_ev2 = nullptr;
+        if (adapt_copy2_on && (cudaStreamCreateWithFlags(&adapt_stream2, cudaStreamNonBlocking) != cudaSuccess ||
+                               cudaEventCreateWithFlags(&adapt_ev2, cudaEventDisableTiming) != cudaSuccess)) {
+            (void) cudaGetLastError();
+            adapt_stream2 = nullptr;
+        }
+        // STRATA_ADAPT_LAYERWAIT=1 (opt-in; default: the window waits for every copy of the round first, #463): a round's
+        // copies go out in layer order with an event after each layer's last one; the next window takes the swapped-in
+        // experts into the residency table at its start, as before, without waiting for the copies, and the pool waits
+        // for a layer's event before it plans that layer - the GPU reads an expert's slot only through that plan.  The
+        // same window computes each swapped-in expert on the GPU from the same bytes, so the output is unchanged; the
+        // copies run under the window's first layers instead of before it.  One GPU, no peer / remote tier, unbatched
+        // copies, the whole expert set in RAM (the low-RAM resident mode keeps the old wait).
+        // Measured (7900 XTX, 20-48 swaps a window): the 0.7-2.4 ms wait before a window goes, but the window gets as much
+        // slower - its own PCIe expert copies share the link with the swaps' - so 20.37 vs 20.37 ms a window: off.
+        static const bool layer_wait_on = [] { const char* v = std::getenv("STRATA_ADAPT_LAYERWAIT"); return v != nullptr && v[0] == '1'; }();
+        std::vector<cudaEvent_t> layer_ev((size_t) g.n_layers, nullptr);
+        std::vector<uint8_t> layer_has((size_t) g.n_layers, 0);
+        bool round_layered = false;               // the pending round's copies carry per-layer events
+        std::vector<int32_t> deferred_release;    // swapped-in experts whose RAM is released once the round has landed
+        bool deferred_finalize = false;
+        drive.layer_wait.assign((size_t) g.n_layers, nullptr);
         // 0.1.43 STRATA_ADAPT_OVERLAP=1 (adapt_overlap above): the single-GPU, plain-RAM-arena decode loop only
         strata::core::AdaptGate agate;
         bool aflipped = false;   // the pending swaps are in the tables and their copies may still be landing
@@ -9203,7 +9277,18 @@ int main(int argc, char** argv) {
                 res_put(st->d_res);
             }
         };
+        // a layered round's deferred work: every layer has waited for its copies by now (or the sync does it here)
+        auto finalize_layered = [&]() {
+            if (!deferred_finalize) return;
+            cudaEventSynchronize(adapt_ev);
+            src.commit_exchanges();
+            for (const int32_t i : deferred_release) srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
+            deferred_release.clear();
+            std::fill(drive.layer_wait.begin(), drive.layer_wait.end(), nullptr);
+            deferred_finalize = false;
+        };
         auto apply_pending = [&](bool wait) {
+            finalize_layered();
             if (peer.valid()) peer.apply_pending(wait);
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
@@ -9225,6 +9310,26 @@ int main(int argc, char** argv) {
             agate.active.store(false, std::memory_order_release);   // 0.1.43: the copies have landed (STRATA_ADAPT_OVERLAP)
             aflipped = false;
             res_upload();
+            std::fill(layer_has.begin(), layer_has.end(), (uint8_t) 0);   // (a layered round taken with the wait)
+            round_layered = false;
+        };
+        // STRATA_ADAPT_LAYERWAIT: the pending (layered) round taken at a window's start without waiting for its copies
+        auto apply_pending_layered = [&]() {
+            finalize_layered();
+            if (pending.empty()) return;
+            for (const auto& [i, slot] : pending) {
+                host_res[(size_t) i] = slot;
+                deferred_release.push_back(i);
+            }
+            pending.clear();
+            pending_age = 0;
+            res_upload();
+            for (size_t l = 0; l < layer_has.size(); ++l) {
+                drive.layer_wait[l] = layer_has[l] ? layer_ev[l] : nullptr;
+                layer_has[l] = 0;
+            }
+            deferred_finalize = true;
+            round_layered = false;
         };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
@@ -9338,6 +9443,16 @@ int main(int argc, char** argv) {
             std::vector<void*> cp_dst;
             std::vector<const void*> cp_src;
             std::vector<size_t> cp_bytes;
+            // STRATA_ADAPT_LAYERWAIT: the same swaps, issued layer by layer (the copies' order changes nothing else)
+            const bool layered = layer_wait_on && !multi_gpu && !peer.valid() && !remote_opt && dma_mode == 0 &&
+                                 !adapt_fence && !pin_blobs_on() && !src.complement_ready() && stages.empty();
+            if (layered)
+                std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.layer < b.layer; });
+            // STRATA_ADAPT_COPY2: the main card's copies over two streams (not with per-layer events, nor the low-RAM
+            // resident mode's copies back, which share adapt_stream with them)
+            const bool copy2 = adapt_stream2 != nullptr && !layered && !multi_gpu && dma_mode == 0 && !src.complement_ready();
+            size_t n_main = 0;
+            bool used2 = false;
             for (size_t si = 0; si < swaps.size(); ++si) {
                 const Swap& s = swaps[si];
                 if (aov && (si == 0 || swaps[si - 1].layer != s.layer)) {
@@ -9363,10 +9478,14 @@ int main(int argc, char** argv) {
                     pending.emplace_back((int32_t) in, slot);
                     continue;
                 }
+                cudaStream_t cst = gs ? gs->adapt_stream : adapt_stream;
+                if (!gs && copy2 && (n_main++ & 1)) {
+                    cst = adapt_stream2;
+                    used2 = true;
+                }
                 if (slot < 0 || b == nullptr ||
                     adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
-                                   (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                   gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
+                                   (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cst) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s\n",
                                  (int) s.layer, (int) slot, pin_live.empty() ? 0 : 1, cudaGetErrorString(cudaGetLastError()));
                     return false;
@@ -9376,6 +9495,12 @@ int main(int argc, char** argv) {
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+                if (layered && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer)) {
+                    cudaEvent_t& ev = layer_ev[(size_t) s.layer];
+                    if (ev == nullptr) cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+                    cudaEventRecord(ev, adapt_stream);
+                    layer_has[(size_t) s.layer] = 1;
+                }
                 if (aov && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
                     (agate.hland != nullptr
                          ? cudaMemcpyAsync((void*) agate.hland, agate.dvals + s.layer, 4, cudaMemcpyDeviceToHost, adapt_stream)
@@ -9389,11 +9514,16 @@ int main(int argc, char** argv) {
                     agate.landed.store((int32_t) g.n_layers, std::memory_order_release);
                 }
             }
+            round_layered = layered && !swaps.empty();
             if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),
                                                             adapt_stream, dma_mode) != cudaSuccess) {
                 std::fprintf(stderr, "strata serve: adaptive swap copy failed (batched): %s\n",
                              cudaGetErrorString(cudaGetLastError()));
                 return false;
+            }
+            if (used2) {   // STRATA_ADAPT_COPY2: adapt_ev after both streams' copies
+                cudaEventRecord(adapt_ev2, adapt_stream2);
+                cudaStreamWaitEvent(adapt_stream, adapt_ev2, 0);
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             // #2188: hand the copies and their landing signals to the GPU now.  WDDM batches a stream's work until a
@@ -11830,10 +11960,14 @@ int main(int argc, char** argv) {
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 pp_exact = true;   // between windows the session is exactly at `a`
+                // STRATA_READ_WINDOW=N (debug): read through windows of at most N tokens (1 = one token a window, the
+                // reference for checks that a window's tokens come out as they would alone)
+                static const int read_window = [] { const char* v = std::getenv("STRATA_READ_WINDOW"); return v ? std::atoi(v) : 0; }();
+                const int S_read = read_window > 0 ? std::min(read_window, S) : S;
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     pp_exact = false;   // until this window and the drafter's rows are in
-                    const int T = (int) std::min<int64_t>(S, b - q);
+                    const int T = (int) std::min<int64_t>(S_read, b - q);
                     for (int t = 0; t < T; ++t) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
                         nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
@@ -12353,7 +12487,8 @@ int main(int argc, char** argv) {
             std::vector<int32_t> drafts(DS, 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob(DS, 0.0f);
             std::vector<int32_t> sbuf((size_t) S, 0);
-            const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
+            // STRATA_SPEC_LOOKUP_Q (the lookup-boosted draft rule) needs the suffix index too
+            const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0 || [] { const char* e = std::getenv("STRATA_SPEC_LOOKUP_Q"); return e && std::atof(e) > 0; }();
             if (sfx_on) {
                 sfx.reset();
                 for (int64_t t : ids) sfx.append((int32_t) t);
@@ -12390,6 +12525,11 @@ int main(int argc, char** argv) {
             };
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
+            // STRATA_DECODE_TIMING: the time between the windows' timed parts - the adaptive tier's copies waited for
+            // before a window, its swap round's own time and the wait for it after the draft (diagnostics only)
+            double dt_pend = 0, dt_join = 0, dt_adapt = 0;
+            drive.layer_wait_ms = 0;   // STRATA_ADAPT_LAYERWAIT's waits, this request
+            long long n_swaps = 0, n_adapt = 0;
             double dt_adapt_wait = 0, dt_adapt_join = 0;   // the tier's wait before a window / join after the draft (ms, summed)
             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
             int64_t dec_windows = 0, dec_T = 0;
@@ -13059,12 +13199,73 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
+            // STRATA_SPEC_CUM=S (opt-in; unset or 0 = off): the MTP part of a window keeps a draft only while the product of
+            // the draft layer's probabilities up to it (the chance that every draft so far holds) is at least S, beside
+            // --spec-min-p's per-draft floor.  It only chooses which drafts are verified: the output is unchanged.
+            static const double spec_cum = [] { const char* e = std::getenv("STRATA_SPEC_CUM"); return e ? std::atof(e) : 0.0; }();
+            // STRATA_SPEC_LOG=<file> (measurement): one line per window - its size, the MTP part, the chained tokens, the
+            // drafts accepted, the draft layer's probabilities, and the verify / commit / draft times
+            static std::FILE* const spec_log = [] {
+                const char* e = std::getenv("STRATA_SPEC_LOG");
+                return e != nullptr && *e != 0 ? std::fopen(e, "a") : nullptr;
+            }();
+            // STRATA_SPEC_CAL=1 (with STRATA_SPEC_CUM): the product is taken over calibrated probabilities - how often a
+            // draft at that depth and with that probability held, counted over the windows served so far (decayed; a cell
+            // without counts keeps the draft layer's own probability).  The draft layer is overconfident past its first
+            // draft (2nd drafts at p 0.8-0.9 held 57% of the time on this model).
+            static const bool spec_cal_on = [] { const char* e = std::getenv("STRATA_SPEC_CAL"); return e && std::atoi(e) != 0; }();
+            struct SpecCal {
+                enum { D = 8, B = 8 };
+                double n[D][B] = {}, ok[D][B] = {};
+                static int bin(float p) {
+                    const float e[B - 1] = {0.3f, 0.5f, 0.7f, 0.8f, 0.9f, 0.95f, 0.99f};
+                    int b = 0;
+                    while (b < B - 1 && p >= e[b]) ++b;
+                    return b;
+                }
+                double q(int j, float p) const { const int b = bin(p); return (ok[j][b] + 4.0 * p) / (n[j][b] + 4.0); }
+                void observe(int j, float p, bool held) {
+                    const int b = bin(p);
+                    n[j][b] = n[j][b] * 0.995 + 1.0;
+                    ok[j][b] = ok[j][b] * 0.995 + (held ? 1.0 : 0.0);
+                }
+            };
+            static SpecCal spec_cal;   // kept across requests
+            // STRATA_SPEC_LOOKUP_Q=q (with STRATA_SPEC_CUM): a draft that the suffix lookup (prompt + output so far) also
+            // proposes at its place counts q in the product - the lookup's agreement was the strongest sign that a
+            // draft holds (logistic fit over logged windows: weight +1.5, the draft layer's own log-probability +0.8).
+            // STRATA_SPEC_DEPTH_DECAY=d: every other draft counts p * d^j (the draft layer is overconfident past its
+            // first draft).  Replayed on logged windows: STRATA_SPEC_CUM=0.3 + q 0.95 + d 0.9 +3.9% over CUM 0.5.
+            static const double spec_lookup_q = [] { const char* e = std::getenv("STRATA_SPEC_LOOKUP_Q"); return e ? std::atof(e) : 0.0; }();
+            static const double spec_depth_decay = [] { const char* e = std::getenv("STRATA_SPEC_DEPTH_DECAY"); return e ? std::atof(e) : 1.0; }();
+            int32_t spec_lk[8];
+            int spec_lk_n = 0;   // the suffix lookup's proposal for the next window's drafts (made with them)
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    double cum = 1.0;
+                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) {
+                        const int j = T - 1;
+                        if (spec_lookup_q > 0.0 && !first_window)
+                            cum *= mtp.stop_q(j, drafts[(size_t) j], dprob[(size_t) j]);   // the same hint the drafter had
+                        else
+                            cum *= spec_cal_on ? spec_cal.q(j, dprob[(size_t) j]) : (double) dprob[(size_t) j];
+                        if (spec_cum > 0.0 && cum < spec_cum) break;
+                        ++T;
+                    }
                 }
+                float wprob[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // this window's draft probabilities (log, calibration)
+                float wp2[8] = {0, 0, 0, 0, 0, 0, 0, 0}, wh[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // STRATA_SPEC_FEAT
+                int32_t wtok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                int wn = 0;
+                if ((spec_log != nullptr || spec_cal_on) && use_mtp)
+                    for (; wn < 8 && wn < (int) dprob.size() && dprob[(size_t) wn] > 0.0f; ++wn) {
+                        wprob[wn] = dprob[(size_t) wn];
+                        wtok[wn] = drafts[(size_t) wn];
+                        wp2[wn] = mtp.feat_p2[wn];
+                        wh[wn] = mtp.feat_h[wn];
+                    }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
@@ -13108,23 +13309,30 @@ int main(int argc, char** argv) {
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
                 const Clock::time_point taw0 = Clock::now();
-                if (adapt_nowait()) apply_pending(false);
-                else if (aov && !pending.empty() && !aflipped) {
-                    // 0.1.43 STRATA_ADAPT_OVERLAP: the tables take the swaps now, exactly where the wait would have ended;
-                    // the copies still landing are waited for per layer inside the window (AdaptGate)
-                    // (resident RAM mode: the staged evicted experts look committed to the planner at once, the RAM
-                    // copy's places stay as they are until the copies have landed; see soft_commit_exchanges)
-                    if (src.complement_ready() && !src.soft_commit_exchanges()) {
-                        apply_pending(true);   // not possible here: the plain wait
-                    } else {
-                        for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
-                        res_upload();
-                        aflipped = true;
-                        ++aov_flips;
-                        agate.active.store(true, std::memory_order_release);
+                {
+                    const Clock::time_point tp0 = Clock::now();
+                    if (adapt_nowait()) apply_pending(false);
+                    else if (aov && !pending.empty() && !aflipped) {
+                        // 0.1.43 STRATA_ADAPT_OVERLAP: the tables take the swaps now, exactly where the wait would have ended;
+                        // the copies still landing are waited for per layer inside the window (AdaptGate)
+                        // (resident RAM mode: the staged evicted experts look committed to the planner at once, the RAM
+                        // copy's places stay as they are until the copies have landed; see soft_commit_exchanges)
+                        if (src.complement_ready() && !src.soft_commit_exchanges()) {
+                            apply_pending(true);   // not possible here: the plain wait
+                        } else {
+                            for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+                            res_upload();
+                            aflipped = true;
+                            ++aov_flips;
+                            agate.active.store(true, std::memory_order_release);
+                        }
                     }
+                    else if (pending.empty() || ++pending_age >= adapt_lag()) {
+                        if (round_layered && adapt_lag() == 1) apply_pending_layered();
+                        else apply_pending(true);
+                    }
+                    dt_pend += std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
                 }
-                else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
@@ -13183,16 +13391,27 @@ int main(int argc, char** argv) {
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
                     for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
+                if (spec_cal_on && !from_sfx && !first_window)   // the drafts this window reached: did each hold?
+                    for (int d = 0; d < T_mtp - 1 && d < wn && d <= a; ++d) spec_cal.observe(d, wprob[d], d < a);
                 if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
                 const Clock::time_point tw1 = Clock::now();
+                finalize_layered();   // STRATA_ADAPT_LAYERWAIT: every layer has waited for its copies in this window
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
-                    adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
+                    adapt_thr = std::thread([&] {
+                        strata::aux_cpus::pin_current_thread();
+                        const Clock::time_point ta0 = Clock::now();
+                        const size_t before = pending.size();
+                        adapt_ok = adapt();
+                        dt_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta0).count();
+                        n_swaps += (long long) (pending.size() >= before ? pending.size() - before : 0);
+                        ++n_adapt;
+                    });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
@@ -13211,6 +13430,7 @@ int main(int argc, char** argv) {
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
                 draft_accepted += a;
+                const bool first_window_was = first_window;
                 first_window = false;
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
@@ -13229,6 +13449,10 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                if (spec_lookup_q > 0.0 && use_mtp && sfx_on) {   // the history ends with the next window's first token
+                    spec_lk_n = sfx.propose(std::min(8, S_mtp), spec_lk);
+                    mtp.set_stop_hint(spec_lk, spec_lk_n, spec_lookup_q, spec_depth_decay);
+                }
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
@@ -13242,6 +13466,7 @@ int main(int argc, char** argv) {
                     const Clock::time_point taj0 = Clock::now();
                     adapt_thr.join();
                     dt_adapt_join += std::chrono::duration<double, std::milli>(Clock::now() - taj0).count();
+                    dt_join += std::chrono::duration<double, std::milli>(Clock::now() - taj0).count();
                 }
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
@@ -13254,6 +13479,21 @@ int main(int argc, char** argv) {
                 if (timed_round && !eos && chain_n == 0 && T >= 1 && T <= 8) {   // local: per-size round stats (timing line)
                     tT_n[(size_t) T] += 1; tT_tok[(size_t) T] += a + 1;
                     tT_ms[(size_t) T] += std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+                }
+                if (spec_log != nullptr) {
+                    auto msd2 = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+                    std::fprintf(spec_log, "W %d %d %d %d %d %d %d %.3f %.3f %.3f", first_window_was ? 1 : 0, T, T_mtp, chain_n,
+                                 from_sfx ? 1 : 0, a, wn, msd2(round0, Clock::now()), msd2(tw0, tw1), msd2(tw2, Clock::now()));
+                    for (int i = 0; i < wn; ++i) std::fprintf(spec_log, " %.4f", wprob[i]);
+                    if (strata::core::MtpDrafter::feat_env()) {   // the draft tokens, runner-up probabilities, entropies
+                        std::fprintf(spec_log, " |");
+                        for (int i = 0; i < wn; ++i) std::fprintf(spec_log, " %d", (int) wtok[i]);
+                        std::fprintf(spec_log, " |");
+                        for (int i = 0; i < wn; ++i) std::fprintf(spec_log, " %.4f", wp2[i]);
+                        std::fprintf(spec_log, " |");
+                        for (int i = 0; i < wn; ++i) std::fprintf(spec_log, " %.4f", wh[i]);
+                    }
+                    std::fprintf(spec_log, "\n");
                 }
                 if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
@@ -13297,6 +13537,12 @@ int main(int argc, char** argv) {
                         }
                     std::fprintf(stderr, "strata decode by window size:%s\n", bt.c_str());
                 }
+                std::fprintf(stderr, "strata decode timing: between the windows (ms/window): adaptive copies waited %.2f "
+                                     "(in the window's layers %.2f), "
+                                     "adapt join %.2f (its round %.2f, %.1f swaps a round over %lld rounds), the rest %.2f\n",
+                             dt_pend / w, drive.layer_wait_ms / w, dt_join / w, n_adapt > 0 ? dt_adapt / (double) n_adapt : 0.0,
+                             n_adapt > 0 ? (double) n_swaps / (double) n_adapt : 0.0, n_adapt,
+                             (decode_ms - dt_run - dt_commit - dt_draft - dt_pend - dt_join) / w);
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
                                  (long long) aov_flips, ver.ms_gate);

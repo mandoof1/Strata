@@ -39,6 +39,9 @@ public:
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
+    /// True when f16(X, W, Y, T, N, K) with beta 0 and ldy N runs rocBLAS's hipblasGemmEx (no opt-in GEMM, no FP16 out,
+    /// no hipBLASLt solution): the call STRATA_PF_GU_EXACT reproduces bit for bit.
+    bool f16_on_rocblas(int64_t T, int64_t N, int64_t K) const;
 
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` (> K) is
     /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).

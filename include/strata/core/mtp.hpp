@@ -148,6 +148,25 @@ public:
     const int32_t* chain_tok() const { return chain_tok_; }
     const float* chain_prob() const { return chain_prob_; }
 
+    /// STRATA_SPEC_FEAT=1 (measurement; slow): per draft of the last draft() - the runner-up's probability and the entropy
+    /// (nats) of the draft layer's distribution, from its logits copied to the host after each step (-1: not captured)
+    float feat_p2[8] = {}, feat_h[8] = {};
+    static bool feat_env();
+    /// STRATA_SPEC_CUM with STRATA_SPEC_LOOKUP_Q / STRATA_SPEC_DEPTH_DECAY: the next draft() stops where the serve loop's
+    /// window rule will - a draft that equals the suffix lookup's proposal at its place counts `q_agree`, any other
+    /// `p * decay^j`; drafting ends once the product falls below STRATA_SPEC_CUM.  n = 0: the plain product of p.
+    void set_stop_hint(const int32_t* lookup, int n, double q_agree, double decay) {
+        hint_n_ = n < 0 ? 0 : n > 8 ? 8 : n;
+        for (int i = 0; i < hint_n_; ++i) hint_tok_[i] = lookup[i];
+        hint_q_ = q_agree;
+        hint_decay_ = decay;
+    }
+    double stop_q(int j, int32_t tok, float p) const {
+        if (hint_q_ > 0.0 && j < hint_n_ && hint_tok_[j] == tok) return hint_q_;
+        double q = p;
+        for (int i = 0; i < j; ++i) q *= hint_decay_;
+        return q;
+    }
     double ms_draft = 0, ms_prefill = 0;
     double ms_src = 0;      ///< the host time spent staging the source rows (a cross-card copy when the drafter is on another card)
     int64_t n_src = 0;
@@ -217,6 +236,7 @@ private:
     bool make_q4_dense(const std::vector<uint8_t>& blob, std::string& err);
     bool make_q4_head(std::string& err);
     void record_top2(int j);
+    void record_feat(int j, int32_t tok);
     std::vector<int32_t> top2_, dvocab_host_;
     std::vector<float> lg_host_;
     // --pipeline-windows 2 (chain_launch)
@@ -227,6 +247,9 @@ private:
     cudaEvent_t ev_chain_ = nullptr;
     cudaEvent_t ev_step_[8] = {};                       ///< after each of the first n_early outputs
     int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
+    int32_t hint_tok_[8] = {};
+    int hint_n_ = 0;
+    double hint_q_ = 0.0, hint_decay_ = 1.0;
     int32_t chain_tok_[8] = {};
     float chain_prob_[8] = {};
     int64_t n_vocab_ = 0;

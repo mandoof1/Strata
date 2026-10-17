@@ -3913,6 +3913,35 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+// STRATA_ROUTE_DUMP=<file> (measurement only): one record per pool call - the layer, the MoE input of the call's tokens,
+// their routed ids and the layer's VRAM residency at that moment - to score expert predictors offline.  It only writes.
+// Record: int32 magic 'RDP1', layer, n_tok, k, int64 window, int32 n_expert, H; float x[n_tok][H]; int32 ids[n_tok][k];
+// int8 resident[n_expert].
+static void route_dump_write(const ExpertDispatch& d, const float* x, const int32_t* ids, int64_t n_tok, int64_t k) {
+    static std::FILE* const f = [] {
+        const char* p = std::getenv("STRATA_ROUTE_DUMP");
+        std::FILE* fp = p != nullptr && *p != 0 ? std::fopen(p, "wb") : nullptr;
+        if (fp != nullptr) std::fprintf(stderr, "strata: STRATA_ROUTE_DUMP: writing the routing of every pool call to %s\n", p);
+        return fp;
+    }();
+    if (f == nullptr) return;
+    static int64_t window = -1, last_layer = 1 << 30;
+    if (d.layers < last_layer) ++window;
+    last_layer = d.layers;
+    const int32_t h[4] = {0x31504452, (int32_t) d.layers, (int32_t) n_tok, (int32_t) k};
+    const int32_t g[2] = {(int32_t) d.n_expert, strata::kernels::cpu::H};
+    std::fwrite(h, sizeof h, 1, f);
+    std::fwrite(&window, sizeof window, 1, f);
+    std::fwrite(g, sizeof g, 1, f);
+    std::fwrite(x, sizeof(float), (size_t) (n_tok * strata::kernels::cpu::H), f);
+    std::fwrite(ids, sizeof(int32_t), (size_t) (n_tok * k), f);
+    std::vector<int8_t> res((size_t) d.n_expert, 0);
+    if (d.host_res != nullptr)
+        for (int64_t e = 0; e < d.n_expert; ++e) res[(size_t) e] = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
+    std::fwrite(res.data(), 1, res.size(), f);
+    if (d.layers == 0) std::fflush(f);
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -3923,6 +3952,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    route_dump_write(d, x_f, ids, n_tok, k);
     if (d.lookahead != nullptr) {
         if (d.lookahead->stats_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
@@ -3969,15 +3999,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (d.remote[r]->holds(d.layers, e)) return true;
             return false;
         };
+        // STRATA_FS_TAKE_FIRST=1 (with the Foresight swap space): a missed expert a landed slot holds is taken here, before
+        // the PCIe share is sized, so the share is a fraction of the misses that are left and the slot's expert comes off
+        // the CPU's list (taken in the loop below, it took the PCIe share's places and the CPU kept its work)
+        static const bool fs_first = [] { const char* v = std::getenv("STRATA_FS_TAKE_FIRST"); return v && std::atoi(v) != 0; }();
+        bool fs_taken[kMaxWindowEntries];
+        unsigned long long fs_ptr[kMaxWindowEntries];
         for (int64_t i = 0; i < n; ++i) {
             first_of[i] = i;
             for (int64_t j = 0; j < i; ++j)
                 if (ids[j] == ids[i]) { first_of[i] = first_of[j]; break; }
             if (first_of[i] == i) {
+                fs_taken[nd] = false;
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
-                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
+                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) {
+                    if (fs_first && d.fs != nullptr && d.fs->take(d.layers, e, fs_ptr[nd - 1])) fs_taken[nd - 1] = true;
+                    else ++nmiss;
+                }
             }
         }
         // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
@@ -3996,7 +4036,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
+                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank || fs_taken[q]) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
                 skip_d[q] = true;
                 --nmiss;
@@ -4036,7 +4076,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {
                     // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above)
-                } else if (d.fs != nullptr && d.fs->take(d.layers, e, ptr)) {
+                } else if (fs_taken[q]) {
+                    kd = 0;                        // STRATA_FS_TAKE_FIRST: taken above
+                    ptr = fs_ptr[q];
+                } else if (!fs_first && d.fs != nullptr && d.fs->take(d.layers, e, ptr)) {
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);

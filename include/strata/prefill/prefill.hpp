@@ -21,6 +21,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
@@ -149,6 +150,17 @@ public:
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
 
+    /// STRATA_PF_PIECE: a chunk larger than a piece has piece ends inside it where a P-token chunk would have ended.
+    /// Asked once per inner piece end (absolute position, in order) before the chunk is read: true takes the running
+    /// state there - what conversation_checkpoint_save would copy after a chunk ending at that position, the same bits -
+    /// and the caller collects it with take_snapshots() (after the chunk, from on_chunk).  Single GPU only.
+    std::function<bool(int64_t pos)> want_snapshot;
+    struct Snapshot {
+        int64_t pos = 0;
+        std::vector<uint8_t> gdn, ple, tails, dead, block_pos;   // conversation_checkpoint_save's layout
+    };
+    std::vector<Snapshot> take_snapshots() { std::vector<Snapshot> v; v.swap(snapshots_); return v; }
+
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
     const float* const* embd_rows = nullptr;
@@ -188,6 +200,7 @@ public:
     static void arm_cpu_share(bool applies, bool by_default = false);
 
 private:
+    std::vector<Snapshot> snapshots_;
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
