@@ -128,6 +128,11 @@ public:
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
 
+    /// local (iq3d, STRATA_PROMPT_SEED): count the experts the router picks for the last `tail` tokens of every run (0: off)
+    void set_route_tail(int64_t tail);
+    /// Those counts since the last take ([n_layers * n_expert] routed picks; empty when none) and the tokens they cover;
+    /// clears them.
+    int64_t take_route_hist(std::vector<float>& out);
     /// local (iq3d, STRATA_REFILL_DIRECT=1): the blobs of (layers[i], experts[i]) to the device addresses dst[i], read by
     /// this prompt path's stager through the source's prompt-direct reads (copy_blobs) and queued as DMAs on `stream`
     /// (the caller synchronizes it).  False when the stager or the source cannot (the caller copies them itself).

@@ -2822,6 +2822,25 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
     return true;
 }
 
+uint64_t FileExpertSource::page_in(int64_t layer, int64_t expert) const {
+#if defined(__linux__)
+    if (base_ == nullptr || unmapped_) return 0;
+    Span sp[3];
+    const int ns = spans(layer, expert, sp);
+    thread_local std::vector<uint8_t> buf;
+    uint64_t got = 0;
+    for (int k = 0; k < ns; ++k) {
+        if (sp[k].fd < 0 || resident_in(sp[k].p, sp[k].n) >= sp[k].n) continue;
+        buf.resize((size_t) sp[k].n);
+        if (pread_full(sp[k].fd, buf.data(), sp[k].n, sp[k].off)) got += sp[k].n;
+    }
+    return got;
+#else
+    (void) layer; (void) expert;
+    return 0;
+#endif
+}
+
 FileExpertSource::PromptDirectCounters FileExpertSource::prompt_direct_counters() const {
     PromptDirectCounters c;
     c.direct_blobs = pd_direct_blobs_.load(std::memory_order_relaxed);

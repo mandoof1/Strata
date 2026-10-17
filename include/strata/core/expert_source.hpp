@@ -736,6 +736,9 @@ public:
         uint64_t fallbacks = 0, us = 0;
     };
     PromptDirectCounters prompt_direct_counters() const;
+    /// local (iq3d, STRATA_PROMPT_WARM_MB): reads the blob's pages that are not cached into the page cache (a buffered
+    /// pread on the I/O descriptors); returns the bytes read (0: cached already, or no I/O descriptors).  Thread-safe.
+    uint64_t page_in(int64_t layer, int64_t expert) const;
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.

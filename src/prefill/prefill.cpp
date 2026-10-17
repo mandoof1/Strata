@@ -767,6 +767,11 @@ struct PinnedUpload {
 };
 
 struct Prefill::Impl {
+    // local (iq3d, STRATA_PROMPT_SEED): the routed ids of the last `rtail` tokens of each run, per layer, copied to
+    // pinned rows (rpin: n_layers x rtail x K) and counted into rhist ([n_layers * n_expert]) at the chunk's end
+    int64_t rtail = 0, rtokens = 0;
+    int32_t* rpin = nullptr;
+    std::vector<float> rhist;
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -951,6 +956,7 @@ void Prefill::reset() {
 void Prefill::release() {
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
+    if (impl_->rpin) { cudaFreeHost(impl_->rpin); impl_->rpin = nullptr; }
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
     for (int i = 0; i < RING_MAX; ++i) {
@@ -1888,6 +1894,17 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
 double Prefill::pinned_share() { return g_pinned_share; }
 int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 
+void Prefill::set_route_tail(int64_t tail) { impl_->rtail = std::clamp<int64_t>(tail, 0, 16384); }
+
+int64_t Prefill::take_route_hist(std::vector<float>& out) {
+    Impl& m = *impl_;
+    out.swap(m.rhist);
+    m.rhist.clear();
+    const int64_t t = m.rtokens;
+    m.rtokens = 0;
+    return t;
+}
+
 bool Prefill::stream_to_device(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, const int64_t* bytes,
                                size_t n, void* stream, std::string& err) {
     Impl& m = *impl_;
@@ -2229,6 +2246,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
+        // local (iq3d, STRATA_PROMPT_SEED): this chunk's rows among the run's last rtail tokens
+        const int64_t r_t0 = m.rtail > 0 ? std::clamp<int64_t>(n - m.rtail - c0, 0, T) : T;
+        const int64_t r_rows = T - r_t0;
+        if (r_rows > 0 && m.rpin == nullptr) {
+            void* h = nullptr;
+            if (cudaHostAlloc(&h, (size_t) g.n_layers * (size_t) m.rtail * (size_t) K * 4, cudaHostAllocDefault) == cudaSuccess)
+                m.rpin = (int32_t*) h;
+            else { cudaGetLastError(); m.rtail = 0; std::fprintf(stderr, "prefill: STRATA_PROMPT_SEED: no pinned rows, off\n"); }
+        }
+        const bool r_cap = r_rows > 0 && m.rpin != nullptr;
+        std::vector<char> r_layer(r_cap ? (size_t) g.n_layers : 0, 0);
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
         const auto tsetup = Clock::now();
@@ -2995,6 +3023,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    if (r_cap && cudaMemcpyAsync(m.rpin + (size_t) l * (size_t) m.rtail * K, m.ids + r_t0 * K,
+                                                 (size_t) (r_rows * K) * 4, cudaMemcpyDeviceToHost, m.cs) == cudaSuccess)
+                        r_layer[(size_t) l] = 1;   // local (iq3d): counted at the chunk's end
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
@@ -4203,6 +4234,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.experts_dma += iss_dma;
         }
         stats_.tokens += T;
+        if (r_cap) {   // local (iq3d, STRATA_PROMPT_SEED): the captured rows have landed; count them
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            if (m.rhist.size() != (size_t) (g.n_layers * g.n_expert)) m.rhist.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                if (!r_layer[(size_t) l]) continue;
+                const int32_t* ids = m.rpin + (size_t) l * (size_t) m.rtail * K;
+                float* h = m.rhist.data() + l * g.n_expert;
+                for (int64_t i = 0; i < r_rows * K; ++i)
+                    if (ids[i] >= 0 && ids[i] < g.n_expert) h[ids[i]] += 1.0f;
+            }
+            m.rtokens += r_rows;
+        }
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {
