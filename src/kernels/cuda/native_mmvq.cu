@@ -1170,7 +1170,7 @@ static bool s26_tsum_on() {
 // S26 STRATA_LFUSE (PAIR): blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
 // input in one launch; each output's code is the single matrix's)
 template<typename F, int NCOLS, int NW, int ROWS, bool TS = false, bool PAIR = false>
-__launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
+__launch_bounds__(NW * WARP, (ROWS <= 4 ? 4 : 1))   // (ROWS 3-4 only under iq3b's STRATA_MMVQ_ROWS=4)
 __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
                                          int n_in, int n_out,
                                          const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr) {
@@ -1335,6 +1335,17 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         const dim3 grid(grid_pad(unsigned(n_out), WARP * WARPS));
         if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, false>, grid, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
         else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, false>, grid, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
+        return;
+    }
+    // iq3b STRATA_MMVQ_ROWS=4 (default 2): four rows a block instead of two.  Each row keeps its own partial sums, warp
+    // partials and reduction (the thread / block-element assignment along the row does not depend on ROWS), so every
+    // output is the same bits; a block reads twice the weights per reduction (the 2560-wide rows of the window's dense
+    // projections are 10 blocks of 256: most of a 2-row block's time is its reduction).  Not with STRATA_TSUM.
+    static const bool rows4 = [] { const char* v = std::getenv("STRATA_MMVQ_ROWS"); return v != nullptr && std::atoi(v) == 4; }();
+    if (rows4 && !s26_tsum_on()) {
+        constexpr int R4 = 4;
+        const dim3 grid4(grid_pad(unsigned((std::size_t(n_out) + R4 - 1) / R4), WARP * WARPS));
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, R4, false, false>, grid4, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
         return;
     }
     constexpr int ROWS = 2;
