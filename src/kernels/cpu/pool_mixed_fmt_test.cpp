@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -71,6 +72,7 @@ int main() {
     // the IQ3_XXS pack's and the IQ2_XS pack's kinds of layers: IQ4_NL or Q2_0 down
     const int pairs[][4] = {{21, 20, 22, 42}, {18, 42, 16, 42}, {21, 20, 16, 20}, {17, 20, 29, 42}};
     int checks = 0, failures = 0;
+    uint64_t hash = 1469598103934665603ull;   // FNV-1a over every mixed call's output: the same in every pool mode
     for (const auto& pr : pairs) {
         Pack A, B;
         std::string err;
@@ -107,6 +109,10 @@ int main() {
                         std::printf("FAIL types %d/%d + %d/%d workers %d n %d\n", pr[0], pr[1], pr[2], pr[3], workers, n);
                     ++failures;
                 }
+                for (size_t b = 0; b < mixed.size() * sizeof(float); ++b) {
+                    hash ^= ((const uint8_t*) mixed.data())[b];
+                    hash *= 1099511628211ull;
+                }
                 bool finite = true;   // IQ1_M's scale is spread over its blocks: random bytes may make it inf
                 if (pr[0] != 29 && pr[2] != 29)
                     for (float v : mixed) finite = finite && std::isfinite(v);
@@ -114,7 +120,9 @@ int main() {
             }
         }
     }
-    std::printf("pool_mixed_fmt_test (STRATA_POOL_FUSED=%s): %d of %d mixed calls differ bitwise\n",
-                std::getenv("STRATA_POOL_FUSED") ? std::getenv("STRATA_POOL_FUSED") : "unset", failures, checks);
+    std::printf("pool_mixed_fmt_test (STRATA_POOL_FUSED=%s STRATA_POOL_ONEPHASE=%s): %d of %d mixed calls differ bitwise, "
+                "output hash %016llx\n", std::getenv("STRATA_POOL_FUSED") ? std::getenv("STRATA_POOL_FUSED") : "unset",
+                std::getenv("STRATA_POOL_ONEPHASE") ? std::getenv("STRATA_POOL_ONEPHASE") : "unset", failures, checks,
+                (unsigned long long) hash);
     return failures ? 1 : 0;
 }
