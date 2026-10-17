@@ -209,6 +209,23 @@ public:
     /// Byte offset of slot `s` in the arena (s == slots(): the end).
     uint64_t slot_offset(int64_t s) const { return off_.empty() ? (uint64_t) s * (uint64_t) blob_ : off_[(size_t) s]; }
 
+    /// **iq3b design A (STRATA_KV_LEND): GUEST SLOTS OUTSIDE THE ARENA.**  Extra slots in device memory the cache does
+    /// not own (the unused tail of the K/V), indexed after the arena's: guest g is slot `full_slots() + g`.  Every
+    /// arena semantic (`slots()`, `bytes()`, the prompt path's loan of the last arena slots, `slot_offsets()`'s byte
+    /// math) is unchanged; `device_slot`, the fills and `verify_slot` accept guests too.  The owner of the memory
+    /// evicts a guest (its caller's residency table) before it uses the bytes again.  Sized arena only.
+    int32_t add_guest(uint8_t* ptr, int64_t bytes);
+    int64_t guests() const { return (int64_t) guests_.size(); }
+    int64_t total_slots() const { return slots_ + (int64_t) guests_.size(); }
+    bool is_guest(int32_t slot) const { return slot >= slots_ && slot < total_slots(); }
+    /// Bytes slot `s` holds (an arena slot's sized room, or the guest's).
+    int64_t slot_bytes(int32_t slot) const;
+    /// Writes the residency table entry `(layer, expert) -> slot` (the startup fill of a guest).
+    void set_resident(int64_t layer, int64_t expert, int32_t slot);
+    /// The per-slot offsets the kernels add to `device_slot(0)`: `slot_offsets()` for the arena's slots, then each
+    /// guest's `ptr - base` (mod 2^64, the consumers add in 64-bit unsigned arithmetic).  total_slots() entries.
+    const uint64_t* device_slot_offsets() const { return guests_.empty() ? slot_offsets() : dev_off_.data(); }
+
 private:
 #if defined(STRATA_USE_HIP)
     bool ensure_blocking_staging(std::size_t bytes, std::string& err);
@@ -239,6 +256,9 @@ private:
     bool per_layer_ = false;
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
+    struct Guest { uint8_t* ptr; int64_t bytes; };
+    std::vector<Guest> guests_;         ///< iq3b design A: slots full_slots() + g
+    std::vector<uint64_t> dev_off_;     ///< iq3b design A: off_[0, slots) then each guest's offset from base_
     int64_t admitted_ = 0;
 };
 

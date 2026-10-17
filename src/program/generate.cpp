@@ -5557,6 +5557,137 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- iq3b design A (STRATA_KV_LEND=1, default off): GUEST SLOTS IN THE K/V's UNUSED TAIL.  Every QSA state (and
+    // the drafter's) holds --max-context cells, but a request uses a prefix of them: each INT8 code array and pooled key
+    // array fills from its base, so its unused top is one contiguous region.  The profile's next pairs after the arena's
+    // go there as extra cache slots (ExpertCache::add_guest: slots full_slots() + g, the arena and its loan untouched),
+    // the hottest at the highest cells.  Before the context comes within `guard` cells of a guest it is evicted (a
+    // residency flip and a memset, kvl_ensure at the K/V growth points); a later shorter conversation lends it again and
+    // refills it (kvl_trim).  qsa_state_zero keeps below the lowest live guest (qsa_set_zero_limit).
+    struct KvLendRegion {
+        uint8_t* base;
+        uint64_t bytes, unit_bytes;   // a unit: a page of codes (page_size cells) or a pooled row (idx_block cells)
+        int64_t unit_cells;
+        uint64_t top;                 // the carve's cursor (bytes from base)
+    };
+    struct KvLendGuest { int32_t slot; int64_t lo; int32_t region; bool live; };
+    struct KvLend {
+        bool on = false, check = false, refill_all = false;
+        int64_t guard = 2048, min_cell = 4096, hyst = 4096;
+        int64_t floor = INT64_MAX;    // the lowest cell of a live guest
+        std::vector<KvLendRegion> regions;
+        std::vector<KvLendGuest> guests;
+        int64_t evicted = 0, relent = 0, refilled = 0, req_evicted = 0, checks = 0;
+        uint64_t rng = 0x9e3779b97f4a7c15ull;
+    } kvl;
+    if (const char* ev = std::getenv("STRATA_KV_LEND"); ev != nullptr && ev[0] == '1' && o.expert_cache > 0 && prefilled > 0) {
+        bool remote = false;
+        for (const int r : o.expert_cache_remote) remote = remote || r > 0;
+        const char* why = !o.serve ? "it needs --serve"
+                        : multi_gpu || !stages.empty() ? "one GPU only"
+                        : !native_pack || xcache.slot_offsets() == nullptr ? "it needs a native pack's sized cache"
+                        : profile.empty() || srcp == nullptr ? "it needs an expert profile"
+                        : xcache.per_layer_admission() ? "not with per-layer admission"
+                        : o.kv_resident > 0 ? "not with --kv-resident"
+                        : strata::core::qsa_kv_elastic() ? "not with --kv-grow's elastic K/V"
+                        : o.batch > 0 ? "not with --batch"
+                        : o.pipeline_windows > 0 ? "not with --pipeline-windows"
+                        : o.resident_cpu_experts ? "not with the resident RAM mode"
+                        : o.vram_elastic || xcache.segmented() || xcache.vmm_range() != nullptr ? "not with --vram-elastic"
+                        : o.peer_device >= 0 || remote ? "not with helper GPUs"
+                        : nullptr;
+        const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
+        auto add_state = [&](const strata::core::QsaState& st, bool pooled) -> bool {
+            if (st.kv_mode != 0 || st.kv_elastic >= 0 || !st.kv_int8 || st.kv_hybrid || st.kv_q4 || st.k_q == nullptr ||
+                st.v_q == nullptr || st.n_slots != st.n_pages || st.max_cells != st.n_pages * qs.page_size) return false;
+            const uint64_t page = (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size * (uint64_t) qs.head_dim;
+            kvl.regions.push_back(KvLendRegion{(uint8_t*) st.k_q, (uint64_t) st.n_pages * page, page, qs.page_size, (uint64_t) st.n_pages * page});
+            kvl.regions.push_back(KvLendRegion{(uint8_t*) st.v_q, (uint64_t) st.n_pages * page, page, qs.page_size, (uint64_t) st.n_pages * page});
+            // the pooled keys: row r holds cells [r * idx_block, (r + 1) * idx_block); the 2 rows past max_cells are left out
+            const int64_t rows = st.max_cells / qs.idx_block;
+            if (pooled && st.idx_pooled != nullptr && st.idx_pooled_rows >= rows) {
+                const uint64_t row = (uint64_t) qs.idx_dim * 4;
+                kvl.regions.push_back(KvLendRegion{(uint8_t*) st.idx_pooled, (uint64_t) rows * row, row, qs.idx_block, (uint64_t) rows * row});
+            }
+            return true;
+        };
+        int n_states = 0;
+        if (why == nullptr) {
+            for (int64_t j = 0; j < ss.qsa_alloc && why == nullptr; ++j)
+                if (add_state(ss.qsa_states[ss.qsa_ord0 + j], true)) ++n_states;
+                else why = "it needs the INT8 K/V (--kv int8), whole in VRAM";
+            if (why == nullptr && !o.mtp.empty() && add_state(mtp.kv_state(), true)) ++n_states;
+        }
+        if (why != nullptr) {
+            kvl.regions.clear();
+            std::fprintf(stderr, "strata generate: STRATA_KV_LEND is off: %s\n", why);
+        } else {
+            if (const char* v = std::getenv("STRATA_KV_LEND_GUARD"); v != nullptr && std::atoll(v) > 0) kvl.guard = std::atoll(v);
+            if (const char* v = std::getenv("STRATA_KV_LEND_MIN"); v != nullptr && std::atoll(v) >= 0) kvl.min_cell = std::atoll(v);
+            if (const char* v = std::getenv("STRATA_KV_LEND_HYST"); v != nullptr && std::atoll(v) >= 0) kvl.hyst = std::atoll(v);
+            kvl.min_cell = std::max<int64_t>(kvl.min_cell, kvl.guard);
+            kvl.check = std::getenv("STRATA_KV_LEND_CHECK") != nullptr && std::getenv("STRATA_KV_LEND_CHECK")[0] == '1';
+            kvl.refill_all = std::getenv("STRATA_KV_LEND_REFILL") != nullptr && std::strcmp(std::getenv("STRATA_KV_LEND_REFILL"), "all") == 0;
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            const auto t0 = std::chrono::steady_clock::now();
+            uint64_t gbytes = 0;
+            // the profile's pairs after the arena's, hottest first, each at the highest cell any region still has room
+            // for it (a guest's lowest cell is its first unit's), 256-byte aligned as the arena's slots
+            for (size_t i = (size_t) prefilled; i < profile.size(); ++i) {
+                const int32_t l = profile[i].first, e = profile[i].second;
+                if (xcache.slot_of(l, e) != strata::core::kNotResident) continue;
+                const uint64_t b = (uint64_t) lay.blob_bytes(l);
+                int best = -1;
+                int64_t best_lo = -1;
+                uint8_t* best_ptr = nullptr;
+                for (size_t r = 0; r < kvl.regions.size(); ++r) {
+                    const KvLendRegion& rg = kvl.regions[r];
+                    if (rg.top < b) continue;
+                    uint8_t* ptr = (uint8_t*) (((uintptr_t) rg.base + rg.top - b) & ~(uintptr_t) 255);
+                    if (ptr < rg.base) continue;
+                    const int64_t lo = (int64_t) ((uint64_t) (ptr - rg.base) / rg.unit_bytes) * rg.unit_cells;
+                    if (lo > best_lo) { best = (int) r; best_lo = lo; best_ptr = ptr; }
+                }
+                if (best < 0 || best_lo < kvl.min_cell) break;
+                const uint8_t* src_b = srcp->blob_stable(l, e);
+                if (src_b == nullptr) continue;
+                const int32_t slot = xcache.add_guest(best_ptr, (int64_t) b);
+                if (slot == strata::core::kNotResident) continue;   // larger than every arena slot
+                if (!xcache.fill_slot_blocking(slot, src_b, err, (int64_t) b)) {
+                    std::fprintf(stderr, "strata generate: kv-lend: filling guest slot %d failed: %s\n", (int) slot, err.c_str());
+                    return 1;
+                }
+                xcache.set_resident(l, e, slot);
+                kvl.regions[(size_t) best].top = (uint64_t) (best_ptr - kvl.regions[(size_t) best].base);
+                kvl.guests.push_back(KvLendGuest{slot, best_lo, best, true});
+                kvl.floor = std::min(kvl.floor, best_lo);
+                gbytes += b;
+            }
+            if (!kvl.guests.empty()) {
+                // the first and the last guest read back and compared (as the arena's slot 0)
+                for (const KvLendGuest* gu : {&kvl.guests.front(), &kvl.guests.back()}) {
+                    int32_t li = -1;
+                    for (int64_t q = 0; q < g.n_layers * g.n_expert && li < 0; ++q)
+                        if (xcache.slot_of(q / g.n_expert, q % g.n_expert) == gu->slot) li = (int32_t) q;
+                    const int64_t l = li / g.n_expert, e = li % g.n_expert;
+                    if (li < 0 || !xcache.verify_slot(gu->slot, srcp->blob_stable(l, e), err, (int64_t) lay.blob_bytes(l))) {
+                        std::fprintf(stderr, "strata generate: kv-lend: %s\n", li < 0 ? "a guest slot has no expert" : err.c_str());
+                        return 1;
+                    }
+                }
+                kvl.on = true;
+                strata::core::qsa_set_zero_limit(kvl.floor);
+            }
+            std::fprintf(stderr, "strata generate: kv-lend: %zu guest slots (%.2f GiB) in the K/V tails of %d states (%zu regions), "
+                                 "cells %lld and up, filled in %.1f s; a guest is evicted %lld cells before the context reaches it "
+                                 "(STRATA_KV_LEND_GUARD)%s\n",
+                         kvl.guests.size(), (double) gbytes / 1073741824.0, n_states, kvl.regions.size(),
+                         (long long) (kvl.guests.empty() ? 0 : kvl.floor),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), (long long) kvl.guard,
+                         kvl.check ? "; STRATA_KV_LEND_CHECK=1: guard asserts and guest read-backs at every growth step" : "");
+        }
+    }
+
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -5876,7 +6007,7 @@ int main(int argc, char** argv) {
         drive.d.cache_stream = main_cs;
         drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
         drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-        drive.d.cache_slot_off = xcache.slot_offsets();
+        drive.d.cache_slot_off = xcache.device_slot_offsets();   // iq3b design A: the guests' offsets after the arena's
         drive.d.hit_scratch = hit_scratch;
         drive.d.parts_out = d_parts;
         drive.d.hit_out = d_hit_out;
@@ -6833,7 +6964,7 @@ int main(int argc, char** argv) {
                 for (size_t r = 0; r < profile.size(); ++r)
                     rank[(size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second] = (int32_t) r;
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= kvg.top) cold.emplace_back(heat((int32_t) i), (int32_t) i);
+                    if (host_res[i] >= kvg.top && host_res[i] < xcache.full_slots()) cold.emplace_back(heat((int32_t) i), (int32_t) i);
                 std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             }
             --kvg.lo;
@@ -6967,6 +7098,213 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata: K/V trimmed to %lld cells; %lld slots back to the expert cache, refilled from "
                              "the profile\n", (long long) kvg.cells, (long long) (kvg.lo - lo0));
         return true;
+    };
+    // ---- iq3b design A (STRATA_KV_LEND): the guest slots at run time.  `kvl_ensure` runs where the K/V grows (the
+    // same points as kvg_ensure: a snapshot or a parked conversation restored, a prompt's cells, every decode window's
+    // cells and the drafter's beyond them) and evicts every live guest within `guard` cells of them; `kvl_trim` (a new
+    // request, after its resume point is known) lends the guests far above it again and refills them.
+    if (kvl.on && (d_res == nullptr || host_res.empty())) {
+        std::fprintf(stderr, "strata generate: STRATA_KV_LEND needs the device residency table (the profiled hit path)\n");
+        return 1;
+    }
+    auto kvl_floor = [&]() {   // the lowest live guest's cell: qsa_state_zero stops there
+        kvl.floor = INT64_MAX;
+        for (const KvLendGuest& gu : kvl.guests)
+            if (gu.live) kvl.floor = std::min(kvl.floor, gu.lo);
+        strata::core::qsa_set_zero_limit(kvl.floor == INT64_MAX ? 0 : kvl.floor);
+    };
+    auto kvl_owners = [&]() {   // guest g -> the residency index it holds (-1: empty)
+        std::vector<int32_t> own((size_t) xcache.guests(), -1);
+        for (size_t i = 0; i < host_res.size(); ++i)
+            if (xcache.is_guest(host_res[i])) own[(size_t) (host_res[i] - xcache.full_slots())] = (int32_t) i;
+        return own;
+    };
+    auto kvl_live = [&]() {
+        int64_t n = 0;
+        for (const KvLendGuest& gu : kvl.guests) n += gu.live ? 1 : 0;
+        return n;
+    };
+    // STRATA_KV_LEND_CHECK=1: no live guest within `guard` cells of `cells`, and the `n_low` lowest live guests plus
+    // `n_rand` random ones read back and compared with their experts' bytes (a K/V write into a guest, or a guest
+    // write into the K/V that a later step reads back, shows here)
+    auto kvl_check = [&](const char* where, int64_t cells, int n_low, int n_rand) -> bool {
+        if (!kvl.on || !kvl.check) return true;
+        ++kvl.checks;
+        for (const KvLendGuest& gu : kvl.guests)
+            if (gu.live && gu.lo < cells + kvl.guard) {
+                std::fprintf(stderr, "strata: kv-lend CHECK FAILED (%s): live guest slot %d starts at cell %lld, within %lld "
+                                     "cells of the K/V's %lld\n", where, (int) gu.slot, (long long) gu.lo, (long long) kvl.guard,
+                             (long long) cells);
+                return false;
+            }
+        const auto own = kvl_owners();
+        std::vector<std::pair<int64_t, size_t>> filled;
+        for (size_t gi = 0; gi < kvl.guests.size(); ++gi)
+            if (kvl.guests[gi].live && own[gi] >= 0) filled.emplace_back(kvl.guests[gi].lo, gi);
+        if (filled.empty()) return true;
+        std::sort(filled.begin(), filled.end());
+        std::vector<size_t> pick;
+        for (int k = 0; k < n_low && k < (int) filled.size(); ++k) pick.push_back(filled[(size_t) k].second);
+        for (int k = 0; k < n_rand; ++k) {
+            kvl.rng ^= kvl.rng << 13; kvl.rng ^= kvl.rng >> 7; kvl.rng ^= kvl.rng << 17;
+            pick.push_back(filled[(size_t) (kvl.rng % filled.size())].second);
+        }
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        std::string ce;
+        for (const size_t gi : pick) {
+            const int32_t i = own[gi];
+            const int64_t l = i / g.n_expert, e = i % g.n_expert;
+            const uint8_t* b = srcp->blob_stable(l, e);
+            if (b == nullptr) continue;
+            if (!xcache.verify_slot(kvl.guests[gi].slot, b, ce, (int64_t) lay.blob_bytes(l))) {
+                std::fprintf(stderr, "strata: kv-lend CHECK FAILED (%s, K/V %lld cells): guest slot %d (layer %lld, expert %lld, "
+                                     "cell %lld): %s\n", where, (long long) cells, (int) kvl.guests[gi].slot, (long long) l,
+                             (long long) e, (long long) kvl.guests[gi].lo, ce.c_str());
+                return false;
+            }
+        }
+        return true;
+    };
+    // STRATA_KV_LEND_CHECK=1: a hash of the last MiB of every region's K/V below `keep` cells (what a request continues
+    // from), taken before and after a refill
+    auto kvl_hash = [&](int64_t keep) -> uint64_t {
+        uint64_t h = strata::core::fnv1a64(nullptr, 0);
+        if (keep <= 0) return h;
+        std::vector<uint8_t> buf;
+        for (const KvLendRegion& rg : kvl.regions) {
+            const uint64_t hi = std::min<uint64_t>(rg.bytes, (uint64_t) ((keep + rg.unit_cells - 1) / rg.unit_cells) * rg.unit_bytes);
+            const uint64_t lo = hi > (1ull << 20) ? hi - (1ull << 20) : 0;
+            buf.resize((size_t) (hi - lo));
+            if (!buf.empty() && cudaMemcpy(buf.data(), rg.base + lo, buf.size(), cudaMemcpyDeviceToHost) == cudaSuccess)
+                h = strata::core::fnv1a64(buf.data(), (uint64_t) buf.size(), h);
+        }
+        return h;
+    };
+    // the K/V is about to hold `cells` cells: every live guest below cells + guard leaves the cache (its expert becomes a
+    // CPU miss) and is zeroed (a read past the context must never meet expert bytes as codes).  `quiesce` lands the
+    // adaptive tier's swaps first (a copy in flight could still be writing a guest).
+    int64_t kvl_last_cells = 0;
+    auto kvl_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
+        if (!kvl.on) return true;
+        kvl_last_cells = std::max(kvl_last_cells, cells);
+        if (cells + kvl.guard <= kvl.floor) return true;
+        quiesce();
+        const int64_t need = cells + kvl.guard;
+        const auto own = kvl_owners();
+        int64_t n = 0;
+        for (size_t gi = 0; gi < kvl.guests.size(); ++gi) {
+            KvLendGuest& gu = kvl.guests[gi];
+            if (!gu.live || gu.lo >= need) continue;
+            if (own[gi] >= 0) {
+                host_res[(size_t) own[gi]] = strata::core::kNotResident;
+                srcp->prefetch(own[gi] / g.n_expert, own[gi] % g.n_expert);   // the CPU reads it from now on
+            }
+            if (cudaMemsetAsync(xcache.device_slot(gu.slot), 0, (size_t) xcache.slot_bytes(gu.slot), nullptr) != cudaSuccess) {
+                std::fprintf(stderr, "strata: kv-lend: zeroing a guest slot failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+            gu.live = false;
+            ++n;
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            std::fprintf(stderr, "strata: kv-lend: evicting guest slots failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+        if (n > 0 && res_put(d_res) != cudaSuccess) {
+            std::fprintf(stderr, "strata: kv-lend: the residency table upload failed\n");
+            return false;
+        }
+        kvl.evicted += n;
+        kvl.req_evicted += n;
+        kvl_floor();
+        std::fprintf(stderr, "strata: kv-lend: the K/V reaches %lld cells: %lld guest slots evicted, %lld of %zu live%s\n",
+                     (long long) cells, (long long) n, (long long) kvl_live(), kvl.guests.size(),
+                     kvl.floor == INT64_MAX ? "" : (" (from cell " + std::to_string(kvl.floor) + ")").c_str());
+        return kvl_check("ensure", cells, 8, 8);
+    };
+    // a new request that needs `cells` cells (and keeps `keep` of the session's): the evicted guests at least
+    // guard + hysteresis above it (and above `hold`, a parked conversation's cells) are lent again, and every live empty
+    // guest is filled with the hottest expert the GPU does not hold that fits (the decode's use, then the profile's rank),
+    // from the page cache only (STRATA_KV_LEND_REFILL=all: from the drive too).  Run on a quiet device.
+    auto kvl_trim = [&](int64_t cells, int64_t hold, int64_t keep) -> bool {
+        if (!kvl.on) return true;
+        kvl_last_cells = std::max(kvl_last_cells, cells);
+        const int64_t want = std::max(cells, hold) + kvl.guard + kvl.hyst;
+        const auto own = kvl_owners();
+        std::vector<size_t> todo;
+        int64_t relent = 0;
+        for (size_t gi = 0; gi < kvl.guests.size(); ++gi) {
+            KvLendGuest& gu = kvl.guests[gi];
+            if (!gu.live && gu.lo >= want) {
+                gu.live = true;
+                ++relent;
+                todo.push_back(gi);
+            } else if (gu.live && own[gi] < 0) {
+                todo.push_back(gi);
+            }
+        }
+        if (todo.empty()) return kvl_check("trim", cells, 4, 4);
+        kvl_floor();
+        const uint64_t h0 = kvl.check ? kvl_hash(keep) : 0;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        std::vector<int32_t> rank(host_res.size(), (int32_t) profile.size());
+        for (size_t r = 0; r < profile.size(); ++r)
+            rank[(size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second] = (int32_t) r;
+        std::vector<std::pair<float, int32_t>> cand;
+        for (size_t i = 0; i < host_res.size(); ++i)
+            if (host_res[i] < 0) {
+                const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[i];
+                cand.emplace_back(u * 1048576.0f - (float) rank[i], (int32_t) i);
+            }
+        std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::sort(todo.begin(), todo.end(), [&](size_t a, size_t b) { return kvl.guests[a].lo > kvl.guests[b].lo; });
+        std::vector<char> used(cand.size(), 0);
+        std::vector<std::pair<int32_t, int32_t>> filled;   // (residency index, slot): resident once the copies landed
+        size_t start = 0;
+        std::string fe;
+        for (const size_t gi : todo) {
+            const int32_t slot = kvl.guests[gi].slot;
+            const int64_t room = xcache.slot_bytes(slot);
+            while (start < cand.size() && used[start]) ++start;
+            for (size_t c = start; c < cand.size(); ++c) {
+                if (used[c]) continue;
+                const int32_t i = cand[c].second;
+                const int64_t l = i / g.n_expert, e = i % g.n_expert;
+                const int64_t nb = (int64_t) lay.blob_bytes(l);
+                if (nb > room) continue;
+                if (!kvl.refill_all && srcp == &src && !src.blob_cached(l, e)) { used[c] = 1; continue; }
+                const uint8_t* b = srcp->blob_stable(l, e);
+                if (b == nullptr) { used[c] = 1; continue; }
+                if (!xcache.fill_slot_queued(slot, b, fe, nb)) {
+                    std::fprintf(stderr, "strata: kv-lend: refilling guest slot %d failed: %s\n", (int) slot, fe.c_str());
+                    return false;
+                }
+                srcp->note_async_read(b, nullptr);
+                used[c] = 1;
+                filled.emplace_back(i, slot);
+                break;
+            }
+        }
+        if (!xcache.sync_queued(fe)) {
+            std::fprintf(stderr, "strata: kv-lend: %s\n", fe.c_str());
+            return false;
+        }
+        for (const auto& [i, slot] : filled) host_res[(size_t) i] = slot;
+        if (res_put(d_res) != cudaSuccess) {
+            std::fprintf(stderr, "strata: kv-lend: the residency table upload failed\n");
+            return false;
+        }
+        kvl.relent += relent;
+        kvl.refilled += (int64_t) filled.size();
+        std::fprintf(stderr, "strata serve: kv-lend: a request of %lld cells: %lld guest slots lent again, %zu of %zu empty ones "
+                             "filled (%s), %lld of %zu live\n", (long long) cells, (long long) relent, filled.size(), todo.size(),
+                     kvl.refill_all ? "from the page cache or the drive" : "from the page cache", (long long) kvl_live(),
+                     kvl.guests.size());
+        if (kvl.check && kvl_hash(keep) != h0) {
+            std::fprintf(stderr, "strata: kv-lend CHECK FAILED (trim): the refill changed the K/V below cell %lld\n", (long long) keep);
+            return false;
+        }
+        return kvl_check("trim", cells, 8, 8);
     };
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
     // hold are copied from experts.bin into RAM once, so no decode or prompt step reads the file (the plain mmap
@@ -7803,8 +8141,8 @@ int main(int argc, char** argv) {
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
-        vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
-        vh.n_slots = xcache.slots();
+        vh.slot_off = xcache.device_slot_offsets();   // E-6: the device plan's pointers (iq3b: and the guests')
+        vh.n_slots = xcache.total_slots();
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
@@ -9862,7 +10200,7 @@ int main(int argc, char** argv) {
                 if (!xcache.shrink(keep, e)) return false;
                 const int64_t live = xcache.slots();
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= live) {
+                    if (host_res[i] >= live && host_res[i] < xcache.full_slots()) {   // iq3b: not a guest
                         vram_evicted.emplace_back((int32_t) i, host_res[i]);
                         host_res[i] = strata::core::kNotResident;
                     }
@@ -10705,6 +11043,11 @@ int main(int argc, char** argv) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
                     }
+                    if (!kvl_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {   // iq3b: the guests below go
+                        std::printf("ERR kv-lend: evicting guest slots for the saved conversation failed\n");
+                        std::fflush(stdout);
+                        return 1;
+                    }
                     conversations.take_reuse();   // retained K/V described the outgoing session
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
@@ -10997,6 +11340,11 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+            if (!kvl_ensure(n + 256, kv_quiesce)) {   // iq3b design A: this prompt's cells (guests there go)
+                std::printf("ERR kv-lend: evicting guest slots for this prompt failed\n");
+                std::fflush(stdout);
+                return 1;
+            }
             nf_hit = false;
             // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
             // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
@@ -11175,6 +11523,10 @@ int main(int argc, char** argv) {
                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
                 return 1;
             }
+            if (incoming && !kvl_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {   // iq3b design A
+                std::printf("ERR kv-lend: evicting guest slots for the parked conversation failed\n");
+                return 1;
+            }
             if (incoming) {
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
@@ -11254,6 +11606,16 @@ int main(int argc, char** argv) {
                 static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_GROW_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
                 if (!kvg_trim(n + 256, hold_on ? conversations.longest_tokens() + 256 : 0)) {
                     std::printf("ERR the K/V could not give its VRAM back to the expert cache\n");
+                    std::fflush(stdout);
+                    return 1;
+                }
+            }
+            if (kvl.on) {   // iq3b design A: guests far above this request lent again and refilled (a quiet device)
+                // STRATA_KV_LEND_HOLD=1: not below the longest parked conversation (it would evict them again on its return)
+                static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_LEND_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
+                kv_quiesce();
+                if (!kvl_trim(n + 256, hold_on ? (int64_t) conversations.longest_tokens() + 256 : 0, resume)) {
+                    std::printf("ERR kv-lend: lending the guest slots again failed\n");
                     std::fflush(stdout);
                     return 1;
                 }
@@ -11668,7 +12030,7 @@ int main(int argc, char** argv) {
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t i = (size_t) (l * g.n_expert + ex);
-                            if (host_res[i] >= first) {
+                            if (host_res[i] >= first && host_res[i] < p.cache->full_slots()) {   // iq3b: not a guest
                                 p.lent.emplace_back((int32_t) i, host_res[i]);
                                 host_res[i] = strata::core::kNotResident;
                                 any = true;
@@ -12785,6 +13147,12 @@ int main(int argc, char** argv) {
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;
                 }
+                // iq3b design A: the same cells; STRATA_KV_LEND_CHECK=1 also reads the lowest live guests back each window
+                if (kvl.on && ((p + T + 64 + kvl.guard > kvl.floor && !kvl_ensure(p + T + 64, adapt_quiesce)) ||
+                               (kvl.check && !kvl_check("window", p + T + 64, 2, 1)))) {
+                    std::printf("ERR kv-lend: guest slots at the K/V's growth failed (see the engine log)\n");
+                    return 1;
+                }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
@@ -13189,6 +13557,22 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: exchange rotation: %llu blocks, %llu host memcpy bytes avoided (cumulative payload)\n",
                              (unsigned long long)src.rotated_exchanges(),
                              (unsigned long long)src.avoided_exchange_copy_bytes());
+            if (kvl.on) {   // iq3b design A, this request
+                uint64_t live_b = 0;
+                for (const KvLendGuest& gu : kvl.guests) live_b += gu.live ? (uint64_t) xcache.slot_bytes(gu.slot) : 0;
+                std::fprintf(stderr, "strata serve: kv-lend: %lld guest slots evicted this request (K/V up to %lld cells); %lld of "
+                                     "%zu live (%.2f GiB); since the start %lld evicted, %lld lent again, %lld refilled%s\n",
+                             (long long) kvl.req_evicted, (long long) kvl_last_cells, (long long) kvl_live(), kvl.guests.size(),
+                             (double) live_b / 1073741824.0, (long long) kvl.evicted, (long long) kvl.relent,
+                             (long long) kvl.refilled,
+                             kvl.check ? (", " + std::to_string(kvl.checks) + " checks passed").c_str() : "");
+                kvl.req_evicted = 0;
+                kvl_last_cells = 0;
+                if (!kvl_check("request end", 0, 8, 8)) {
+                    std::printf("ERR kv-lend: a guest slot check failed after the request (see the engine log)\n");
+                    return 1;
+                }
+            }
             // CS-T: the tiers, cumulative - GPU cache hits (the decode lookups above), RAM copy, files (SSD / OS cache)
             if (srcp == &src) {
                 std::fprintf(stderr, "strata serve: expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
@@ -13346,7 +13730,7 @@ int main(int argc, char** argv) {
                 kvg_start(first);
                 if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= first) {
+                    if (host_res[i] >= first && host_res[i] < xcache.full_slots()) {   // iq3b: not a guest
                         lent.emplace_back((int32_t) i, host_res[i]);
                         host_res[i] = strata::core::kNotResident;
                     }
@@ -13697,8 +14081,8 @@ int main(int argc, char** argv) {
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
-        vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
-        vh.n_slots = xcache.slots();
+        vh.slot_off = xcache.device_slot_offsets();   // E-6: the device plan's pointers (iq3b: and the guests')
+        vh.n_slots = xcache.total_slots();
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;

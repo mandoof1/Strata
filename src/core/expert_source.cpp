@@ -4028,8 +4028,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
                 if (slot >= 0) {
                     kd = 0;
-                    ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
-                                                                                 : (size_t) slot * (size_t) d.cache_blob));
+                    // unsigned 64-bit sums: an iq3b guest slot's offset wraps below the arena
+                    ptr = (unsigned long long) (uintptr_t) d.cache_base +
+                          (d.cache_slot_off ? (unsigned long long) d.cache_slot_off[slot]
+                                            : (unsigned long long) slot * (unsigned long long) d.cache_blob);
                 } else if (d.peer != nullptr && d.peer->has(d.layers, e)) {
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {

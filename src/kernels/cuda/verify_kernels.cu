@@ -1206,7 +1206,8 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
         }
         const int grp_idx = tot & 0xffff;
         const int ent_start = tot >> 16;
-        ptr[grp_idx] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+        // unsigned 64-bit sums: an iq3b guest slot's offset wraps below the arena (ExpertCache::device_slot_offsets)
+        ptr[grp_idx] = (unsigned long long) cache_base + (slot_off ? (unsigned long long) slot_off[slot] : (unsigned long long) slot * (unsigned long long) blob);
         start[grp_idx] = ent_start;
     }
     if (tid < n) {
@@ -1279,7 +1280,7 @@ __global__ void resident_plan_par_kernel(const int32_t* __restrict__ ids, int n,
             if (s_first[j] == j) { ++group; gstart += s_size[j]; }
         if (i == first) {
             const int32_t slot = res[e];
-            ptr[group] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+            ptr[group] = (unsigned long long) cache_base + (slot_off ? (unsigned long long) slot_off[slot] : (unsigned long long) slot * (unsigned long long) blob);
             start[group] = gstart;
         }
         dst[gstart + rank] = i;

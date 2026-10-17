@@ -335,6 +335,10 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
+/// iq3b design A (STRATA_KV_LEND): `qsa_state_zero` zeroes a mode-0 state's K/V codes and pooled keys only below `cells`
+/// (a multiple of the page and of idx_block; the expert cache's guest slots live above it).  0: every cell (default).
+/// The scales, tail and dead rows are zeroed whole as before.
+void qsa_set_zero_limit(int64_t cells);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //

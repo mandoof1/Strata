@@ -861,12 +861,25 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     return c.used;
 }
 
+namespace {
+int64_t g_zero_limit = 0;   // iq3b design A (qsa_set_zero_limit): 0 = every cell
+}  // namespace
+void qsa_set_zero_limit(int64_t cells) { g_zero_limit = cells > 0 ? cells : 0; }
+
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
     const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
+    // iq3b design A: the INT8 K/V codes and pooled keys past the limit hold the expert cache's guest slots (a mode-0
+    // state's cell c is at page c / page_size, row c / idx_block); nothing reads a cell there before it is written
+    int64_t code_slots = live_slots, pooled_rows = st.idx_pooled_rows;
+    if (g_zero_limit > 0 && st.kv_mode == 0 && st.kv_elastic < 0 && st.kv_int8 && !st.kv_hybrid && !st.kv_q4) {
+        code_slots = std::min<int64_t>(live_slots, g_zero_limit / s.page_size);
+        pooled_rows = std::min<int64_t>(pooled_rows, g_zero_limit / s.idx_block);
+    }
     const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
+    const size_t code_rows = (size_t) code_slots * s.n_head_kv * s.page_size;
     if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
@@ -875,8 +888,8 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
         cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
     } else if (st.kv_int8) {
-        cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
-        cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
+        cudaMemsetAsync(st.k_q, 0, code_rows * s.head_dim, cs);
+        cudaMemsetAsync(st.v_q, 0, code_rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
         cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
     } else {
@@ -889,7 +902,7 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
-    cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    cudaMemsetAsync(st.idx_pooled, 0, (size_t) pooled_rows * s.idx_dim * 4, cs);
 }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
