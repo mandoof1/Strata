@@ -14,6 +14,9 @@ namespace strata::kernels {
 
 /// ggml type ids handled here.
 bool iq_supported(int ggml_type) noexcept;
+/// Whether this build's routed-expert SwiGLU uses strata::kernels::sexp (-DSTRATA_SWIGLU_SEXP) instead of __expf:
+/// what STRATA_CPU_PARITY needs to compute the GPU's bits on the CPU.
+bool swiglu_sexp() noexcept;
 /// The token-embedding types iq_embed_rows and iq_dequant_f32 read: the i-quants above and BF16 (30).
 bool embed_type_supported(int ggml_type) noexcept;
 /// Bytes of one row of `n` values of `ggml_type` (n a multiple of the type's block).

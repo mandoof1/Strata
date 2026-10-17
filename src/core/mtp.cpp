@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -534,6 +535,43 @@ void MtpDrafter::record_top2(int j) {
         else if (b2 < 0 || v > lg_host_[(size_t) b2]) b2 = i;
     }
     top2_[(size_t) j] = b2 < 0 ? -1 : dhead_ != nullptr ? dvocab_host_[(size_t) b2] : (int32_t) b2;
+}
+
+bool MtpDrafter::feat_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SPEC_FEAT"); return v && v[0] == '1'; }();
+    return on;
+}
+
+// STRATA_SPEC_FEAT=1: draft j's distribution under the draft layer, from the head logits its step just wrote (row 0):
+// the runner-up's probability and the entropy.  The step's stream is drained first; slow, for logging runs only.
+void MtpDrafter::record_feat(int j, int32_t tok) {
+    if (j < 0 || j >= 8) return;
+    feat_p2[j] = -1.0f;
+    feat_h[j] = -1.0f;
+    const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
+    if ((int64_t) lg_host_.size() < nv) lg_host_.resize((size_t) nv);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess ||
+        cudaMemcpy(lg_host_.data(), head_logits_, (size_t) nv * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+    }
+    int64_t b1 = -1, b2 = -1;
+    for (int64_t i = 0; i < nv; ++i) {
+        const float v = lg_host_[(size_t) i];
+        if (b1 < 0 || v > lg_host_[(size_t) b1]) { b2 = b1; b1 = i; }
+        else if (b2 < 0 || v > lg_host_[(size_t) b2]) b2 = i;
+    }
+    const int32_t top = b1 < 0 ? -1 : dhead_ != nullptr ? dvocab_host_[(size_t) b1] : (int32_t) b1;
+    if (top != tok || b2 < 0) return;   // not this draft's row
+    const double m = lg_host_[(size_t) b1];
+    double z = 0, zl = 0;
+    for (int64_t i = 0; i < nv; ++i) {
+        const double e = std::exp((double) lg_host_[(size_t) i] - m);
+        z += e;
+        zl += e * ((double) lg_host_[(size_t) i] - m);
+    }
+    feat_p2[j] = (float) (std::exp((double) lg_host_[(size_t) b2] - m) / z);
+    feat_h[j] = (float) (std::log(z) - zl / z);
 }
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
@@ -1647,8 +1685,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
+        if (feat_env()) { for (int i = 0; i < 8; ++i) { feat_p2[i] = -1.0f; feat_h[i] = -1.0f; } record_feat(0, drafts[0]); }
         n = 1;
-        for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+        // STRATA_SPEC_CUM (see the serve loop): no further draft once the chance that every draft so far holds is below S
+        static const double spec_cum = [] { const char* e = std::getenv("STRATA_SPEC_CUM"); return e ? std::atof(e) : 0.0; }();
+        double cum = stop_q(0, drafts[0], pj);
+        for (int j = 1; j < max_steps && pj >= min_p && (spec_cum <= 0.0 || cum >= spec_cum); ++j) {
             if (dt) cudaEventRecord(g_dt.eb[j], cs_);
             tl = Clock::now();
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
@@ -1665,6 +1707,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;
+            if (feat_env()) record_feat(j, drafts[j]);
+            cum *= stop_q(j, drafts[j], pj);
             ++n;
         }
         prefetch_ple(drafts[n - 1]);

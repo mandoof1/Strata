@@ -41,6 +41,14 @@ bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
 
+/// STRATA_CPU_PARITY=1: the CPU computes its expert rows in the GPU's arithmetic (replica_avx512.cpp: q8_1
+/// activations, the GPU kernels' order, sexp SwiGLU), the same bits as the GPU gives the same expert, so the output
+/// no longer depends on which experts sit in VRAM.  Decided once, after expert_layout_load: on when asked and every
+/// native layer is a format pair the replica has, the CPU has AVX-512 and the GPU build's SwiGLU uses sexp
+/// (`gpu_sexp`); otherwise off with the reason in `why`.
+bool cpu_parity_init(bool gpu_sexp, std::string& why);
+bool cpu_parity() noexcept;
+
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes).

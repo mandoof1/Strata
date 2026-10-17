@@ -1,0 +1,333 @@
+GlobalParameters:
+  MinimumRequiredVersion: 4.4.0
+  PrintLevel: 1
+  ForceRedoBenchmarkProblems: True
+  ForceRedoLibraryLogic: True
+  ForceRedoLibraryClient: True
+  CMakeBuildType: Release
+  NumBenchmarks: 1
+  NumWarmups: 20
+  EnqueuesPerSync: 20
+  SyncsPerBenchmark: 3
+  NumElementsToValidate: 0
+  KernelTime: True
+  SleepPercent: 0
+  MergeFiles: True
+  ShortNames: False
+  ROCmPath: <your ROCm (e.g. the TheRock venv's _rocm_sdk_devel)>
+  CxxCompiler: <ROCm>/llvm/bin/clang++
+  Device: 0
+  CpuThreads: 16
+
+BenchmarkProblems:
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: h
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+    - # BenchmarkProblemSizeGroup TT[4, 4] WG[16, 16]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [4, 4]
+        - WorkGroup:
+          - [16, 16, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[4, 8] WG[16, 16]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [4, 8]
+        - WorkGroup:
+          - [16, 16, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[4, 16] WG[16, 8]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [4, 16]
+        - WorkGroup:
+          - [16, 8, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[4, 8] WG[16, 8]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [4, 8]
+        - WorkGroup:
+          - [16, 8, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[4, 16] WG[16, 16]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [4, 16]
+        - WorkGroup:
+          - [16, 16, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[8, 8] WG[8, 16]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [8, 8]
+        - WorkGroup:
+          - [8, 16, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[8, 8] WG[8, 32]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [8, 8]
+        - WorkGroup:
+          - [8, 32, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[8, 16] WG[8, 8]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [8, 16]
+        - WorkGroup:
+          - [8, 8, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[8, 16] WG[8, 16]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [8, 16]
+        - WorkGroup:
+          - [8, 16, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[8, 4] WG[8, 32]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [8, 4]
+        - WorkGroup:
+          - [8, 32, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[2, 8] WG[32, 8]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [2, 8]
+        - WorkGroup:
+          - [32, 8, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]
+    - # BenchmarkProblemSizeGroup TT[2, 16] WG[32, 8]
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - EdgeType: ["ShiftPtr"]
+        - LoopTail: [True]
+        - GlobalSplitU: [1]
+        - InnerUnroll: [1]
+        - StaggerU: [32]
+        - StaggerUStride: [256]
+        - StaggerUMapping: [0]
+        - VectorWidth: [-1]
+      ForkParameters:
+        - ThreadTile:
+          - [2, 16]
+        - WorkGroup:
+          - [32, 8, 1]
+        - WorkGroupMapping: [1, 8]
+        - DepthU: [8, 16, 32]
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1, 3]
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [1280, 128, 1, 2560]
+          - Exact: [1280, 512, 1, 2560]

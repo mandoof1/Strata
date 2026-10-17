@@ -725,6 +725,25 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
+bool Gemm::f16_on_rocblas(int64_t T, int64_t N, int64_t K) const {
+#if defined(__HIPCC__)
+    if (T <= 0 || N <= 0 || f16_io_) return false;
+    // the same switches f16() reads before hipBLASLt (STRATA_PF_GEMM, STRATA_WMMA_GEMM): either one may take the call
+    static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
+    static const bool pf_on = [] { const char* v = std::getenv("STRATA_PF_GEMM"); return v && v[0] == '1'; }();
+    if (wmma_on || pf_on) return false;
+#if defined(STRATA_HIPBLASLT_AVAILABLE)
+    if (hipblaslt_state_ &&
+        hipblaslt_solution_for(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16, T, N, K, N, 0.0f) >= 0)
+        return false;
+#endif
+    return true;
+#else
+    (void) T; (void) N; (void) K;
+    return false;
+#endif
+}
+
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
     if (T <= 0 || N <= 0) return;
