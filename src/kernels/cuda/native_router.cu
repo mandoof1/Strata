@@ -188,6 +188,76 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
+// iq3b STRATA_ROUTE_PUB_STORE: route_multi<F> and doorbell_publish_value (STRATA_DOORBELL_STORE's doorbell) in one
+// launch (n_tok <= 8, one block): route_multi's body verbatim (a warp per token), a block barrier, then the publish as
+// doorbell_publish_value_kernel does it - the MoE input rows (x null: the router GEMV copied them already), the ids and
+// the weights to the mapped buffers, a system fence, then the step number stored.
+template <bool F>
+__launch_bounds__(256, 1)
+__global__ void route_multi_publish_value(const float* __restrict__ logits_in, int32_t* __restrict__ ids_in,
+                                          float* __restrict__ weights_in, int n_tok, const float* __restrict__ x, int n_x,
+                                          float* x_out, int32_t* ids_out, float* w_out, uint32_t* seq, uint32_t value) {
+    const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
+    if (tk < n_tok) {
+    const float* __restrict__ logits = logits_in + (size_t) tk * 512;
+    int32_t* __restrict__ ids = ids_in + (size_t) tk * 10;
+    float* __restrict__ weights = weights_in + (size_t) tk * 10;
+    const int lane = threadIdx.x;
+    float values[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+    __syncwarp();
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+    maximum = warp_max_f<F>(maximum);
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] = expf(values[i] - maximum);
+        sum += values[i];
+    }
+    const float reciprocal = 1.0f / warp_sum_f<F>(sum);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] *= reciprocal;
+        if (__isnanf(values[i])) values[i] = -FLT_MAX;
+    }
+    float selected = 0.0f, selected_sum = 0.0f;
+    for (int rank = 0; rank < 10; ++rank) {
+        float best = values[0];
+        int expert = lane;
+#pragma unroll
+        for (int i = 1; i < 16; ++i) {
+            if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+        }
+        top1_exchange<F>(best, expert);
+        if ((expert & 31) == lane) {
+            values[expert / 32] = -INFINITY;
+            ids[rank] = expert;
+            selected_sum += best;
+        }
+        if (rank == lane) selected = best;
+    }
+    selected_sum = max(warp_sum_f<F>(selected_sum), 6.103515625e-5f);
+    const float inverse_selected_sum = 1.0f / selected_sum;
+    if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+    }
+    // ---- the publish (doorbell_publish_value_kernel with 256 threads)
+    __syncthreads();
+    const int tid = (int) threadIdx.y * 32 + (int) threadIdx.x;
+    const int k = n_tok * 10;
+    if (x != nullptr)
+        for (int i = tid; i < n_x; i += 256) x_out[i] = x[i];
+    if (tid < k) { ids_out[tid] = ids_in[tid]; w_out[tid] = weights_in[tid]; }
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence_system();
+        *(volatile uint32_t*) seq = value;
+        __threadfence_system();
+    }
+}
 // STRATA_ROUTE_PUB: route_multi and the verify window's doorbell_publish_res in one launch (n_tok <= 8, one block).
 // The routing is route_multi's body verbatim (a warp per token); after a block barrier the block publishes as
 // doorbell_publish_res_kernel does: the ids, the MoE input when an expert is not resident, then the sequence number.
@@ -482,6 +552,21 @@ void native_router_top10_multi_publish_res(const float* logits, int32_t* ids, fl
     else
         route_multi_publish_res<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok, x, d_res,
                                                                                          n_expert, (int) n_x, x_out, ids_out, d_seq);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_router_top10_multi_publish_value(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
+                                             int64_t n_x, float* x_out, int32_t* ids_out, float* weights_out,
+                                             uint32_t* d_seq, uint32_t seq_value, void* stream) {
+    if (!stream || n_tok < 1 || n_tok > 8 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
+        !valid(weights, (size_t) n_tok * 10 * 4) || (x != nullptr && !x_out) || !ids_out || !weights_out || !d_seq)
+        throw std::invalid_argument("native router (multi + publish value) requires 1-8 rows, a stream and the publish buffers");
+    if (route_fast())
+        route_multi_publish_value<true><<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, ids, weights, n_tok, x, (int) n_x, x_out, ids_out, weights_out, d_seq, seq_value);
+    else
+        route_multi_publish_value<false><<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, ids, weights, n_tok, x, (int) n_x, x_out, ids_out, weights_out, d_seq, seq_value);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

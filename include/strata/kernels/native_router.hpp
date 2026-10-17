@@ -26,6 +26,12 @@ void native_router_top10_multi_publish_res(const float* logits, int32_t* ids, fl
                                            const int32_t* d_res, int n_expert, int64_t n_x, float* x_out,
                                            int32_t* ids_out, uint32_t* d_seq, void* stream,
                                            uint32_t seq_value = 0);
+/// iq3b STRATA_ROUTE_PUB_STORE: native_router_top10_multi (1-8 rows) and doorbell_publish_value in one launch: the same
+/// ids and weights bit for bit, then the n_x floats of x (x null: already on the host), the ids and the weights to the
+/// mapped buffers and `seq_value` stored after a system fence.
+void native_router_top10_multi_publish_value(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
+                                             int64_t n_x, float* x_out, int32_t* ids_out, float* weights_out,
+                                             uint32_t* d_seq, uint32_t seq_value, void* stream);
 /// The same contract for a model family's (experts, top-k): 512 / 10 (Flash-Next: the two calls above, unchanged) and
 /// 256 / 8 (Qwen3.6-35B-A3B).  logits [n_tok, n_expert], ids / weights [n_tok, k].  CUDA / HIP.
 bool native_router_topk_supported(int n_expert, int k);

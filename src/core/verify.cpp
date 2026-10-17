@@ -225,6 +225,10 @@ const bool g_wait_combine = env_on("STRATA_WAIT_COMBINE");
 // in one launch (native_moe_wait_combine_heavy_multi_add_hits) and late_add's wait + light-row copy + add in one
 // (late_add_rows_after): the same rows, the same sums, four fewer dependent launches per layer on the critical path
 const bool g_defer_fuse = env_on("STRATA_DEFER_FUSE");
+// iq3b STRATA_ROUTE_PUB_STORE=1 (with STRATA_DOORBELL_STORE): the window's top-10 and its stored doorbell
+// (doorbell_publish_value) in one launch, the MoE input rows copied by the router GEMV under STRATA_ROUTE_FAST; the same
+// ids, weights and published words (native_router_top10_multi_publish_value)
+const bool g_route_pub_store = env_on("STRATA_ROUTE_PUB_STORE");
 // STRATA_PCIE_FORK=1: the PCIe pass (the wait for flag B and the PCIe groups' gate/up, SwiGLU and down) on a side
 // stream from the plan copy to the combine, beside the VRAM groups; it writes only its own entries' scratch and rows
 const bool g_pcie_fork = env_on("STRATA_PCIE_FORK");
@@ -1680,7 +1684,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                   !always_publish_ && !(route_resident_cfg().margin > 0.0f && hits_.d_res != nullptr);
                 // STRATA_ROUTE_FAST: the router GEMV's blocks copy the MoE input rows to the host (every row, fenced) and
                 // the top-10 launch only rings
-                float* const x_host = rpub && native_router_fast() ? m_x_ + tb * N : nullptr;
+#if defined(STRATA_USE_HIP)
+                static const bool no_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v == nullptr || std::atof(v) <= 0.0; }();
+                const bool rpubv = !rpub && g_route_pub_store && g_doorbell_store && n <= 8 && !ar_on() && !device_plan_ &&
+                                   !remote_opt_ && !always_publish_ && no_prior &&
+                                   !(route_resident_cfg().margin > 0.0f && hits_.d_res != nullptr);
+#else
+                const bool rpubv = false;
+#endif
+                float* const x_host = (rpub || rpubv) && native_router_fast() ? m_x_ + tb * N : nullptr;
                 bool x_on_host = false;
                 if (w_sgi != nullptr)
                     sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
@@ -1696,6 +1708,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                           hits_.d_res != nullptr ? hits_.d_res + l * g.n_expert : nullptr,
                                                           (int) g.n_expert, (int64_t) n * N, m_x_ + tb * N, m_ids_ + tb * K,
                                                           m_seq_, cs, (uint32_t) ((l - lb_) * G + grp + 1));
+                    route_published = true;
+                } else if (rpubv) {   // iq3b: the stored doorbell rides in the top-10 launch
+                    native_router_top10_multi_publish_value(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n,
+                                                            x_on_host ? nullptr : xm, (int64_t) n * N, m_x_ + tb * N,
+                                                            m_ids_ + tb * K, m_w_ + tb * K, m_seq_,
+                                                            (uint32_t) ((l - lb_) * G + grp + 1), cs);
                     route_published = true;
                 } else
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
@@ -1742,10 +1760,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                               (uint32_t) ((l - lb_) * G + grp + 1), cs);
 #if defined(STRATA_USE_HIP)
-            if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
+            if (g_doorbell_store) {   // #649 A/B: the step's ring stored, not incremented over PCIe
+                if (!route_published)   // (iq3b STRATA_ROUTE_PUB_STORE: it went out with the top-10)
                 doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                        m_ids_ + tb * K, m_w_ + tb * K, m_seq_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
-            else
+            } else
 #endif
             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
             // whatever the device's residency table says (pipelined windows)
