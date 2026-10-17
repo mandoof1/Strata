@@ -11,5 +11,10 @@ namespace strata::kernels {
 /// (softmax over the 512 unbiased logits) renormalised over the 10 picked, as the native router does.
 void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
                        int n_tok, void* stream);
+/// local (prior-v2): the same with an expert outside VRAM whose blob is in the page cache (`warm_layer[e] != 0`, a
+/// host-kept map readable by the device; null: none) getting `lambda_warm`, and the first `keep` ranks picked by the
+/// router's own logits (only ranks keep..9 use the biased scores).
+void route_prior2_top10(const float* logits, const int32_t* res_layer, const uint8_t* warm_layer, float lambda,
+                        float lambda_warm, int keep, int32_t* ids, float* weights, int n_tok, void* stream);
 
 }  // namespace strata::kernels

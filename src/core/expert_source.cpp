@@ -56,6 +56,7 @@
 #include <cerrno>
 #include <linux/aio_abi.h>   // the kernel's own asynchronous reads (io_submit): no library, allowed by Docker's seccomp
 #include <sys/syscall.h>
+#include <sys/resource.h>   // local (prior-warm): setpriority
 #endif
 
 // a 64-bit seek (as in pinned.cu): the 32-bit `fseek` wraps past 4 GiB, and the spelling differs per platform
@@ -839,6 +840,7 @@ void FileExpertSource::io_worker() {
             ~InFlight() {
                 // local (defer-cold): the demand read of this blob is done (its pages are in, or it needed none)
                 if (demand && s->io_done_) s->io_done_[index].fetch_add(1, std::memory_order_release);
+                s->warm_mark(index);   // local (prior-warm)
                 {
                     std::lock_guard<std::mutex> lk(s->io_mu_);
                     if (demand) --s->io_dem_busy_;
@@ -947,6 +949,7 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
             file_read_bytes_.fetch_add(total, std::memory_order_relaxed);
             // local (probe-trim): the pool reads every page of it through this mapping
             if (io_mapped_) io_mapped_[(size_t) key].store(1, std::memory_order_relaxed);
+            warm_mark((size_t) key);   // local (prior-warm)
         }
         return b;
     }
@@ -1189,6 +1192,12 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
+    if (warm_thr_.joinable()) {   // local (prior-warm): the sweeper first (it probes the mapping and writes the map)
+        { std::lock_guard<std::mutex> lk(warm_mu_); warm_quit_ = true; }
+        warm_cv_.notify_all();
+        warm_thr_.join();
+    }
+    if (warm_map_ != nullptr) { (void) cudaFreeHost((void*) warm_map_); warm_map_ = nullptr; }
     io_stop();
     inputs_.clear();
     if (complement_arena_ != nullptr) {
@@ -1655,6 +1664,44 @@ int FileExpertSource::probe_cold(int64_t layer, int64_t expert) const {
     if (!override_.empty() && override_[index] != nullptr) return 0;
     uint64_t total = 0;
     return cached_bytes(layer, expert, total, false) < total ? 1 : 0;
+}
+
+const uint8_t* FileExpertSource::start_warm_map(int period_ms) {
+    if (warm_map_ != nullptr || !(io_fill_ && io_pf_ && direct_.empty()) || n_layers_ <= 0 || n_expert_ <= 0) return nullptr;
+    void* h = nullptr;
+    void* dptr = nullptr;
+    const size_t n = (size_t) (n_layers_ * n_expert_);
+    if (cudaHostAlloc(&h, n, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostGetDevicePointer(&dptr, h, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (h != nullptr) (void) cudaFreeHost(h);
+        return nullptr;
+    }
+    std::memset(h, 0, n);
+    warm_map_ = (volatile uint8_t*) h;
+    warm_quit_ = false;
+    const int period = std::max(50, period_ms);
+    warm_thr_ = std::thread([this, n, period] {
+        strata::aux_cpus::pin_current_thread();
+#if defined(__linux__)
+        (void) setpriority(PRIO_PROCESS, (id_t) syscall(SYS_gettid), 19);   // behind every other thread of the engine
+#endif
+        for (;;) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < n; ++i) {
+                if ((i & 511u) == 0) {
+                    std::lock_guard<std::mutex> lk(warm_mu_);
+                    if (warm_quit_) return;
+                }
+                const int c = probe_cold((int64_t) (i / (size_t) n_expert_), (int64_t) (i % (size_t) n_expert_));
+                warm_map_[i] = c == 0 ? 1 : 0;
+            }
+            std::unique_lock<std::mutex> lk(warm_mu_);
+            warm_cv_.wait_until(lk, t0 + std::chrono::milliseconds(period), [&] { return warm_quit_; });
+            if (warm_quit_) return;
+        }
+    });
+    return (const uint8_t*) dptr;
 }
 
 bool FileExpertSource::read_landed(int64_t layer, int64_t expert) const {

@@ -68,7 +68,62 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
     if (lane < 10) w[lane] = sel_p / fmaxf(sel_sum, 1e-30f);
 }
 
+// local (prior-v2, STRATA_ROUTE_PRIOR_KEEP / STRATA_ROUTE_PRIOR_WARM): route_prior_k with two changes.  An expert not
+// in VRAM whose blob is in the page cache (warm[e] != 0, a host-kept map; null: none) gets `lambda_warm`; and the first
+// `keep` picks are the router's own (the unbiased logits), only the later ranks use the biased scores.  The weights as
+// route_prior_k: the router's probabilities of the 10 picked, renormalised over them.
+__global__ void route_prior2_k(const float* __restrict__ logits, const int32_t* __restrict__ res,
+                               const volatile uint8_t* warm, float lambda, float lambda_warm, int keep,
+                               int32_t* __restrict__ ids, float* __restrict__ weights) {
+    const float* lg = logits + (size_t) blockIdx.x * 512;
+    int32_t* id = ids + (size_t) blockIdx.x * 10;
+    float* w = weights + (size_t) blockIdx.x * 10;
+    const int lane = threadIdx.x;
+    float p[16], s[16], u[16];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) { p[i] = lg[lane + 32 * i]; mx = fmaxf(mx, p[i]); }
+    mx = wmax(mx);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int e = lane + 32 * i;
+        const float bonus = res[e] >= 0 ? lambda : (warm != nullptr && warm[e] != 0 ? lambda_warm : 0.0f);
+        s[i] = p[i] + bonus;                               // the selection score
+        u[i] = p[i];                                       // the router's own (the kept ranks)
+        p[i] = expf(p[i] - mx);
+    }
+    float sel_p = 0.0f, sel_sum = 0.0f;
+    for (int rank = 0; rank < 10; ++rank) {
+        const bool own = rank < keep;
+        float best = -FLT_MAX, bp = 0.0f;
+        int be = 1 << 30;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const float v = own ? u[i] : s[i];
+            if (v > best) { best = v; be = lane + 32 * i; bp = p[i]; }
+        }
+#pragma unroll
+        for (int m = 16; m; m >>= 1) {
+            const float ob = __shfl_xor_sync(0xffffffffu, best, m, 32);
+            const int oe = __shfl_xor_sync(0xffffffffu, be, m, 32);
+            const float op = __shfl_xor_sync(0xffffffffu, bp, m, 32);
+            if (ob > best || (ob == best && oe < be)) { best = ob; be = oe; bp = op; }
+        }
+        if ((be & 31) == lane) { s[be >> 5] = -FLT_MAX; u[be >> 5] = -FLT_MAX; }
+        if (lane == rank) { id[rank] = be; sel_p = bp; }
+        sel_sum += bp;
+    }
+    if (lane < 10) w[lane] = sel_p / fmaxf(sel_sum, 1e-30f);
+}
+
 }  // namespace
+
+void route_prior2_top10(const float* logits, const int32_t* res_layer, const uint8_t* warm_layer, float lambda,
+                        float lambda_warm, int keep, int32_t* ids, float* weights, int n_tok, void* stream) {
+    if (n_tok <= 0) return;
+    route_prior2_k<<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, warm_layer, lambda, lambda_warm, keep,
+                                                            ids, weights);
+}
 
 void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
                              int n_tok, void* stream) {
