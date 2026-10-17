@@ -135,6 +135,13 @@ inline bool stream_ahead_enabled() {
 // attention halves instead of waiting for each layer's routing.
 // #828: STRATA_TEST_PAGEABLE=1 makes every pinned host allocation with a pageable fallback in Prefill::init fail, so the
 // fallbacks (what an LXC container's memlock limit forces) run on a PC that can pin - for ASan / MALLOC_CHECK_=3 runs.
+// local (iq3d): STRATA_PROMPT_DIRECT_SMALL=1 - with prompt-direct on, a staged chunk (below stream_all_min(), its routed
+// experts only) reads unbuffered too.  Off by default: those blobs are the ones the decode reads next, so the page cache
+// is the better place for them.
+inline bool prompt_direct_small() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PROMPT_DIRECT_SMALL"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
 inline bool force_pageable() {
     static const bool v = [] { const char* e = std::getenv("STRATA_TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
     return v;
@@ -1154,15 +1161,26 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
             }
         }
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+        // local (iq3d): STRATA_PROMPT_DIRECT=1 on a pack's experts.bin through --mmap-experts - the streamed chunks' blobs
+        // are read by the source with O_DIRECT (copy_blobs): 8 threads, runs of 4 neighbouring blobs (one merged request
+        // each), a 128-deep pinned ring (~300 MB of host RAM: the read-ahead past the GPU's 96-slot ring, which costs no
+        // VRAM, and room for a second drive's later batches) - ~56 MB in flight, where 2 threads copying the mapping kept
+        // ~2 blobs in flight
+        const bool pdirect = !files && src != nullptr && src->prompt_direct();
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : pdirect ? 8 : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
+        if (pdirect && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = std::clamp(16 * threads, 16, 256);
         // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
         // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
         {
             const char* bv = std::getenv("STRATA_STAGER_BATCH");
-            const int want = bv ? std::atoi(bv) : files ? 8 : 1;
+            const int want = bv ? std::atoi(bv) : files ? 8 : pdirect ? 4 : 1;
             m.stager->batch = std::clamp(want, 1, Stager::kMaxBatch);
         }
+        if (pdirect)
+            std::fprintf(stderr, "prefill: prompt-direct (STRATA_PROMPT_DIRECT=1): streamed chunks read unbuffered by %d stager "
+                                 "threads, runs of %d blobs, a %d-blob pinned ring%s\n", threads, std::min(m.stager->batch, m.stager->kRing),
+                         m.stager->kRing, prompt_direct_small() ? "; staged chunks too (STRATA_PROMPT_DIRECT_SMALL=1)" : "");
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
         m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
     }
@@ -1870,6 +1888,32 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
 double Prefill::pinned_share() { return g_pinned_share; }
 int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 
+bool Prefill::stream_to_device(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, const int64_t* bytes,
+                               size_t n, void* stream, std::string& err) {
+    Impl& m = *impl_;
+    if (n == 0) return true;
+    if (!m.stager || m.src == nullptr || !m.src->prompt_direct() || n >= 0xffff) return false;
+    const cudaStream_t st = (cudaStream_t) stream;
+    // (at most 0xfffe jobs: the stager's claim word holds a 16-bit count; a loan is a few thousand slots)
+    std::vector<Stager::Job> js;
+    js.reserve(n);
+    for (size_t i = 0; i < n; ++i) js.push_back({nullptr, (size_t) bytes[i], m.src, layers[i], experts[i]});
+    m.stager->start(std::move(js));
+    struct Done {
+        Stager* s;
+        ~Done() { s->finish(); }
+    } done{m.stager.get()};
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t* hb = m.stager->wait((int) i);
+        if (cudaMemcpyAsync(dst[i], hb, (size_t) bytes[i], cudaMemcpyHostToDevice, st) != cudaSuccess) {
+            err = "prefill: a direct refill copy failed";
+            return false;
+        }
+        m.stager->issued_one((int) i, st);
+    }
+    return true;
+}
+
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
     return bytes_needed_impl(g, ss, chunk, false, src);
 }
@@ -2386,6 +2430,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (stream_all) {
             seq_start.assign((size_t) g.n_layers + 1, 0);
             std::vector<Stager::Job> js;
+            const bool pd_stream = m.src->prompt_direct();   // local (iq3d)
             if (ps_on) {
                 m.pp->pseq.clear();
                 m.pp->pseq_start.assign((size_t) g.n_layers + 1, 0);
@@ -2401,8 +2446,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
-                    if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
-                        job = (int) js.size();
+                    if (m.src->transient(l, e) || (pd_stream && !m.src->pinned(l, e))) {   // CS-T: copied by the source into the stager's buffer
+                        job = (int) js.size();   // (iq3d prompt-direct: the source reads it unbuffered)
                         js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
                     } else {
                         b = m.src->blob_stable(l, e);
@@ -3785,7 +3830,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
-                                if (m.src->transient(l, e)) {   // CS-T: copied by the source
+                                if (m.src->transient(l, e) || (prompt_direct_small() && m.src->prompt_direct())) {   // CS-T: copied by the source
                                     js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
                                     continue;
                                 }

@@ -1192,6 +1192,10 @@ void FileExpertSource::close() {
     direct_.clear();
     for (void* h : pdirect_) close_direct(h);
     pdirect_.clear();
+#if defined(__linux__)
+    if (pd2_fd_ >= 0) ::close(pd2_fd_);
+#endif
+    pd2_fd_ = -1;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         // the buffers' last copies end before they are freed (#1237)
@@ -1820,6 +1824,53 @@ bool FileExpertSource::open_prompt_direct(std::string& why) {
         }
         pdirect_.push_back((void*) (intptr_t) fd);
     }
+    // local (iq3d): the knobs of the mmap-pack prompt-direct reads (copy_blobs)
+    if (const char* v = std::getenv("STRATA_PROMPT_DIRECT_CACHED"); v != nullptr && v[0] != '\0')
+        pd_cached_min_ = std::clamp(std::atof(v), 0.0, 2.0);   // > 1: never from the page cache
+    // local (iq3d): STRATA_PROMPT_DIRECT2=1|<path> - a second, byte-identical copy of experts.bin on another drive.  The
+    // prompt path's streamed reads are a bandwidth-bound sequence (unlike the decode's latency-bound misses), so the second
+    // drive adds its bandwidth.  1: the pack's experts.bin when the descriptors above read the STRATA_EXPERTS_HEAD copy.
+    const char* d2 = std::getenv("STRATA_PROMPT_DIRECT2");
+    if (pd2_fd_ < 0 && d2 != nullptr && d2[0] != '\0' && std::strcmp(d2, "0") != 0 && paths_.size() == 1 && role_ptr_.empty()) {
+        const bool from_head = !head_path_.empty() && split_n_ >= mapped_bytes_;
+        const std::string path2 = std::strcmp(d2, "1") == 0 ? (from_head ? paths_[0] : std::string()) : std::string(d2);
+        if (const char* w = std::getenv("STRATA_PROMPT_DIRECT2_W"); w != nullptr && w[0] != '\0')
+            pd2_w_ = std::clamp(std::atof(w), 0.01, 100.0);
+        std::string note;
+        int fd2 = -1;
+        struct stat st2 {};
+        if (path2.empty())
+            note = "no second copy (STRATA_PROMPT_DIRECT2=1 needs the reads to come from the STRATA_EXPERTS_HEAD copy)";
+        else if ((fd2 = ::open(path2.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC)) < 0)
+            note = "cannot open " + path2 + " with O_DIRECT (" + std::strerror(errno) + ")";
+        else if (fstat(fd2, &st2) != 0 || (uint64_t) st2.st_size < mapped_bytes_)
+            note = path2 + " is smaller than experts.bin";
+        else {
+            // the same bytes at the same offsets: 8 spread 64 KiB blocks of both copies, read unbuffered, must match
+            constexpr size_t kBlk = 64u << 10;
+            void* a = nullptr;
+            void* b = nullptr;
+            const int fd1 = (int) (intptr_t) pdirect_[0];
+            if (posix_memalign(&a, 4096, kBlk) != 0 || posix_memalign(&b, 4096, kBlk) != 0) note = "no aligned buffer";
+            for (int k = 0; note.empty() && k < 8; ++k) {
+                const uint64_t span = mapped_bytes_ > kBlk ? mapped_bytes_ - kBlk : 0;
+                const uint64_t off = (span * (uint64_t) k / 7) / 4096 * 4096;
+                const ssize_t r1 = ::pread(fd1, a, kBlk, (off_t) off), r2 = ::pread(fd2, b, kBlk, (off_t) off);
+                if (r1 <= 0 || r1 != r2 || std::memcmp(a, b, (size_t) r1) != 0)
+                    note = path2 + " differs from the copy the prompt reads (at byte " + std::to_string(off) + ")";
+            }
+            std::free(a);
+            std::free(b);
+        }
+        if (note.empty()) {
+            pd2_fd_ = fd2;
+            std::fprintf(stderr, "FileExpertSource: prompt-direct second drive: %s (weight %.2f against the first; "
+                                 "batches go to the drive whose queue drains first)\n", path2.c_str(), pd2_w_);
+        } else {
+            if (fd2 >= 0) ::close(fd2);
+            std::fprintf(stderr, "FileExpertSource: prompt-direct second drive NOT used: %s\n", note.c_str());
+        }
+    }
     return true;
 #else
     why = "Linux only (NTFS serves unbuffered reads of a mapped file one at a time)";
@@ -2047,8 +2098,9 @@ bool FileExpertSource::map_view(std::string& why) {
 #endif
 }
 
-bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+bool FileExpertSource::read_direct(const Fill* fills, size_t n, int fd_override) const {
 #if defined(_WIN32)
+    (void) fd_override;
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
     // queue depth 48 make 10.4 GB/s on a file nobody maps and 3.4 GB/s on a mapped one, 8 MiB reads 8.6 GB/s.  So
@@ -2237,7 +2289,9 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(int) (intptr_t) (direct_.empty() ? pdirect_ : direct_)[(size_t) x.file], x.a0, x.size, total});
+        // local (iq3d): a prompt-direct batch may be sent to the second drive's byte-identical copy (one file only)
+        sc.req.push_back({fd_override >= 0 ? fd_override : (int) (intptr_t) (direct_.empty() ? pdirect_ : direct_)[(size_t) x.file],
+                          x.a0, x.size, total});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -2304,7 +2358,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     }
     return true;
 #else
-    (void) fills; (void) n;
+    (void) fills; (void) n; (void) fd_override;
     return false;
 #endif
 }
@@ -2696,10 +2750,14 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 // copy_blob made one ~2 MB request each - and NTFS serves the unbuffered reads of a mapped file one at a time, so the
 // request size is what sets the rate (see read_direct).  The blobs the RAM copy holds are copied as before.
 bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
-    if ((direct_.empty() && pdirect_.empty()) || n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
+    // local (iq3d): the mmap pack's prompt-direct reads take single blobs too (the stager's runs end at layer and
+    // resident-expert gaps)
+    const bool pd = prompt_direct();
+    if ((direct_.empty() && pdirect_.empty()) || (n <= 1 && !pd)) return ExpertSource::copy_blobs(layers, experts, dst, n);
     thread_local std::vector<Fill> fills;
     fills.clear();
     uint64_t bytes = 0;
+    const auto t0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < n; ++i) {
         const int64_t l = layers[i], e = experts[i];
         if (base_ == nullptr || dst[i] == nullptr || l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) return false;
@@ -2709,18 +2767,72 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
             if (!copy_blob(l, e, dst[i])) return false;
             continue;
         }
+#if defined(__linux__)
+        // local (iq3d): a blob the page cache (mostly) holds is not read from the drive again: the cached pages are copied
+        // and a buffered pread brings only the missing ones (it stays a decode-hot blob).  The same bytes either way.
+        if (pd && pd_cached_min_ <= 1.0 && !unmapped_) {
+            Span sp[3];
+            const int ns = spans(l, e, sp);
+            uint64_t tot = 0, res = 0;
+            for (int k = 0; k < ns; ++k) { tot += sp[k].n; res += resident_in(sp[k].p, sp[k].n); }
+            if (ns > 0 && tot > 0 && (double) res >= pd_cached_min_ * (double) tot) {
+                bool ok = true;
+                for (int k = 0; ok && k < ns; ++k) {
+                    if (resident_in(sp[k].p, sp[k].n) >= sp[k].n || sp[k].fd < 0) std::memcpy(dst[i] + sp[k].at, sp[k].p, (size_t) sp[k].n);
+                    else ok = pread_full(sp[k].fd, dst[i] + sp[k].at, sp[k].n, sp[k].off);
+                }
+                if (!ok && !copy_from_files(l, e, dst[i])) return false;
+                pd_cached_blobs_.fetch_add(1, std::memory_order_relaxed);
+                pd_cached_bytes_.fetch_add(tot, std::memory_order_relaxed);
+                file_read_bytes_.fetch_add(tot, std::memory_order_relaxed);
+                continue;
+            }
+        }
+#endif
         fills.push_back({0, l, e, dst[i]});
         bytes += layer_blob_bytes_[(size_t) l];
     }
     if (fills.empty()) return true;
-    const auto t0 = std::chrono::steady_clock::now();
-    if (!read_direct(fills.data(), fills.size()))
+    // local (iq3d): two drives - the batch goes where the queue (bytes in flight + this batch, over the drive's weight)
+    // drains first, so both stay busy and the batches finish about in the order the stream consumes them
+    int drive = 0;
+    if (pd && pd2_fd_ >= 0) {
+        const double q0 = (double) (pd_inflight_[0].load(std::memory_order_relaxed) + bytes);
+        const double q1 = (double) (pd_inflight_[1].load(std::memory_order_relaxed) + bytes) / pd2_w_;
+        drive = q1 < q0 ? 1 : 0;
+    }
+    if (pd) pd_inflight_[drive].fetch_add(bytes, std::memory_order_relaxed);
+    bool ok = read_direct(fills.data(), fills.size(), drive == 1 ? pd2_fd_ : -1);
+    if (pd) pd_inflight_[drive].fetch_sub(bytes, std::memory_order_relaxed);
+    if (!ok && pd) pd_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+    if (!ok && drive == 1) { ok = read_direct(fills.data(), fills.size()); drive = 0; }   // the first drive, unbuffered
+    if (!ok)
         for (const Fill& f : fills)   // a failed batch: each blob on its own (copy_from_files falls back to the mapping)
             if (!copy_from_files(f.layer, f.e, f.dst)) return false;
+    if (pd) {
+        pd_direct_blobs_.fetch_add(fills.size(), std::memory_order_relaxed);
+        pd_direct_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        pd_drive_bytes_[drive].fetch_add(bytes, std::memory_order_relaxed);
+        pd_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                         std::memory_order_relaxed);
+    }
     file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                        std::memory_order_relaxed);
     file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     return true;
+}
+
+FileExpertSource::PromptDirectCounters FileExpertSource::prompt_direct_counters() const {
+    PromptDirectCounters c;
+    c.direct_blobs = pd_direct_blobs_.load(std::memory_order_relaxed);
+    c.direct_bytes = pd_direct_bytes_.load(std::memory_order_relaxed);
+    c.cached_blobs = pd_cached_blobs_.load(std::memory_order_relaxed);
+    c.cached_bytes = pd_cached_bytes_.load(std::memory_order_relaxed);
+    c.drive_bytes[0] = pd_drive_bytes_[0].load(std::memory_order_relaxed);
+    c.drive_bytes[1] = pd_drive_bytes_[1].load(std::memory_order_relaxed);
+    c.fallbacks = pd_fallbacks_.load(std::memory_order_relaxed);
+    c.us = pd_us_.load(std::memory_order_relaxed);
+    return c;
 }
 
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {

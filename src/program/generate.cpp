@@ -11535,6 +11535,37 @@ int main(int argc, char** argv) {
                 };
                 // local (refill-cached): only what the page cache holds is refilled, so nothing is read ahead either
                 const bool cached_only = refill_cached_only && p.dev < 0;
+                // local (iq3d, STRATA_REFILL_DIRECT=1 with STRATA_PROMPT_DIRECT=1): the lent slots' experts are read by the
+                // prompt path's stager - unbuffered, both drives, many reads in flight - and DMA'd from its pinned ring on
+                // the stream the queued fills use, instead of a pageable copy out of the mapping per slot (which faults the
+                // blobs in one at a time and puts them in the page cache).  The same bytes into the same slots.
+                static const bool refill_direct = [] { const char* v = std::getenv("STRATA_REFILL_DIRECT"); return v != nullptr && v[0] == '1'; }();
+                if (refill_direct && !cached_only && !refill_blocking() && p.dev < 0 && p.sp != nullptr && srcp == &src &&
+                    src.prompt_direct() && !p.lent.empty()) {
+                    std::vector<int32_t> rl, re;
+                    std::vector<uint8_t*> rd;
+                    std::vector<int64_t> rb;
+                    rl.reserve(p.lent.size()); re.reserve(p.lent.size()); rd.reserve(p.lent.size()); rb.reserve(p.lent.size());
+                    bool all = true;
+                    for (const auto& [i, slot] : p.lent) {
+                        uint8_t* d = p.cache->device_slot(slot);
+                        if (d == nullptr) { all = false; break; }
+                        rl.push_back(i / (int32_t) g.n_expert);
+                        re.push_back(i % (int32_t) g.n_expert);
+                        rd.push_back(d);
+                        rb.push_back((int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert));
+                    }
+                    const auto t_rd = Clock::now();
+                    if (all && p.sp->stream_to_device(rl.data(), re.data(), rd.data(), rb.data(), rl.size(), (void*) 0, e)) {
+                        for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
+                        if (trace)
+                            std::fprintf(stderr, "strata trace: refill-direct: %zu slots queued in %.1f ms\n", p.lent.size(),
+                                         std::chrono::duration<double, std::milli>(Clock::now() - t_rd).count());
+                        return true;
+                    }
+                    if (!e.empty()) return false;   // a copy failed: the stream is in an unknown state
+                    // the stager could not take them (none queued): the copies below, as before
+                }
                 if (!cached_only)
                     for (size_t n = 0; n < kAhead; ++n) advise_lent(n);
                 size_t done_n = 0;
@@ -13229,6 +13260,22 @@ int main(int argc, char** argv) {
                     io_prev = io_now;
                     ic_prev = ic;
                     fb_prev = fb;
+                }
+                // local (iq3d): what the prompt path's unbuffered reads did this request
+                if (src.prompt_direct()) {
+                    static strata::core::FileExpertSource::PromptDirectCounters pd_prev;
+                    const strata::core::FileExpertSource::PromptDirectCounters pd = src.prompt_direct_counters();
+                    std::fprintf(stderr, "strata serve: prompt-direct this request: %llu blobs %.1f MB unbuffered (drive 1 %.1f MB, "
+                                         "drive 2 %.1f MB), %llu blobs %.1f MB from the page cache, %llu failed batches, "
+                                         "%.1f s of reader time\n",
+                                 (unsigned long long) (pd.direct_blobs - pd_prev.direct_blobs),
+                                 (double) (pd.direct_bytes - pd_prev.direct_bytes) / 1e6,
+                                 (double) (pd.drive_bytes[0] - pd_prev.drive_bytes[0]) / 1e6,
+                                 (double) (pd.drive_bytes[1] - pd_prev.drive_bytes[1]) / 1e6,
+                                 (unsigned long long) (pd.cached_blobs - pd_prev.cached_blobs),
+                                 (double) (pd.cached_bytes - pd_prev.cached_bytes) / 1e6,
+                                 (unsigned long long) (pd.fallbacks - pd_prev.fallbacks), (double) (pd.us - pd_prev.us) / 1e6);
+                    pd_prev = pd;
                 }
             }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
