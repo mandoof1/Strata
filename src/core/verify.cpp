@@ -1801,8 +1801,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
         // resident experts; the weights stay the router's (route_prior.cu)
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
-        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
-            route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+        // local (prior-v2): STRATA_ROUTE_PRIOR_KEEP=k - the router's own top k stay, only ranks k..9 are picked with the
+        // bonus; STRATA_ROUTE_PRIOR_WARM=lw - an expert outside VRAM whose blob is in the page cache gets lw (lw = the
+        // prior's lambda: only the experts that would be read from the drive lose their place).  Either: route_prior2.
+        static const int prior_keep = [] {
+            const char* v = std::getenv("STRATA_ROUTE_PRIOR_KEEP");
+            return v != nullptr ? std::max(0, std::min(9, std::atoi(v))) : 0;
+        }();
+        static const float prior_warm = [] {
+            const char* v = std::getenv("STRATA_ROUTE_PRIOR_WARM");
+            return v != nullptr ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
+        }();
+        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+            const uint8_t* warm = prior_warm > 0.0f && prior_warm_ != nullptr ? prior_warm_ + l * g.n_expert : nullptr;
+            if (prior_keep > 0 || warm != nullptr)
+                route_prior2_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, warm, route_prior, prior_warm, prior_keep,
+                                   ids_ + tb * K, w_ + tb * K, n, cs);
+            else
+                route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+        }
         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {

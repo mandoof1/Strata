@@ -8428,6 +8428,25 @@ int main(int argc, char** argv) {
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+        // local (prior-warm): STRATA_ROUTE_PRIOR_WARM=<lw> with STRATA_ROUTE_PRIOR: the page-cache residency map the
+        // window router reads (the file tier's sweeper; STRATA_ROUTE_PRIOR_WARM_MS, default 500, per full pass)
+        if (const char* pw = std::getenv("STRATA_ROUTE_PRIOR_WARM"); pw != nullptr && std::atof(pw) > 0.0 &&
+            std::getenv("STRATA_ROUTE_PRIOR") != nullptr && std::atof(std::getenv("STRATA_ROUTE_PRIOR")) > 0.0) {
+            const char* pm = std::getenv("STRATA_ROUTE_PRIOR_WARM_MS");
+            const uint8_t* wm = srcp == &src && n_stages == 1 ? src.start_warm_map(pm != nullptr ? std::atoi(pm) : 500) : nullptr;
+            if (wm != nullptr) {
+                ver.set_prior_warm_map(wm);
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_PRIOR_WARM=%s (changes the output): experts outside VRAM "
+                                     "whose blob is in the page cache get that bonus too (a %d ms residency sweep)\n", pw,
+                             pm != nullptr ? std::max(50, std::atoi(pm)) : 500);
+            } else {
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_PRIOR_WARM ignored: it needs one GPU and --mmap-experts with "
+                                     "STRATA_IO_PREFETCH=1\n");
+            }
+        }
+        if (const char* pk = std::getenv("STRATA_ROUTE_PRIOR_KEEP"); pk != nullptr && std::atoi(pk) > 0)
+            std::fprintf(stderr, "strata serve: STRATA_ROUTE_PRIOR_KEEP=%s (changes the output): the router's own top %s "
+                                 "stay, only the later ranks are picked with STRATA_ROUTE_PRIOR's bonus\n", pk, pk);
         // local (STRATA_NO_PCIE_WAIT=1): no miss can take the PCIe path (no pinned RAM copy, one GPU, no helper caches):
         // the window graphs leave out every layer's flag-B wait and empty PCIe group launch (see Verifier::set_no_pcie)
         if (const char* nv = std::getenv("STRATA_NO_PCIE_WAIT"); nv != nullptr && nv[0] == '1') {

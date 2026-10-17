@@ -826,6 +826,11 @@ public:
     bool cold(int64_t layer, int64_t expert) const override;
     int probe_cold(int64_t layer, int64_t expert) const override;
     bool read_landed(int64_t layer, int64_t expert) const override;
+    /// local (prior-warm, STRATA_ROUTE_PRIOR_WARM): a mapped (layer x expert) byte map, 1 where the blob's sampled pages
+    /// are in the page cache, kept by a low-priority thread that probes every blob once per `period_ms` (and set at once
+    /// when a read or the pool brings a blob in).  Returns its device address, nullptr without the io-prefetch page-cache
+    /// tier or when the mapped allocation fails.  Stopped and freed by close().
+    const uint8_t* start_warm_map(int period_ms);
     void prefetch_probed(int64_t layer, const int64_t* experts, int64_t n, const int8_t* known) override;
     bool warm_background(int64_t layer, int64_t expert) override;
     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
@@ -992,6 +997,13 @@ private:
     // local (defer-cold): per (layer, expert), demand reads finished by the workers and the count a queued one waits for
     std::unique_ptr<std::atomic<uint32_t>[]> io_done_;
     std::vector<uint32_t> io_want_;
+    // local (prior-warm): the mapped residency map (host side, written by the sweeper / the I/O path) and its thread
+    volatile uint8_t* warm_map_ = nullptr;
+    std::thread warm_thr_;
+    std::mutex warm_mu_;
+    std::condition_variable warm_cv_;
+    bool warm_quit_ = false;
+    void warm_mark(size_t index) { if (warm_map_ != nullptr) warm_map_[index] = 1; }
     bool io_prio_ = true;
     int io_ahead_max_ = 2;
     int io_dem_busy_ = 0, io_ahead_busy_ = 0;        ///< reads in flight (under io_mu_)

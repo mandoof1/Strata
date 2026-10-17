@@ -251,6 +251,9 @@ public:
     /// expert evicted on the host (the pool then computes it on the CPU) before the device table follows.  Also turns
     /// the device-planned layers (E-6) off.  Before `init`.
     void set_always_publish(bool on) { always_publish_ = on; }
+    /// local (prior-warm, STRATA_ROUTE_PRIOR_WARM): the device address of a (layer x expert) page-cache residency map
+    /// (FileExpertSource::start_warm_map); before the first capture.
+    void set_prior_warm_map(const uint8_t* m) { prior_warm_ = m; }
     /// 0.1.43: the adaptive tier's overlap gate (see AdaptGate).  Refused (false) with the device-planned layers (E-6),
     /// which never ask the host.  The pointer must outlive the verifier's windows.
     bool set_adapt_gate(AdaptGate* g) {
@@ -530,6 +533,7 @@ private:
     // one per deferred layer s (slot s % ring): the rows of its late cold experts (mapped, written by the pool), per row
     // the layer whose start adds it (mapped, -1 none), the rows joining per delay (mapped), and on the device the
     // layer's routing weights and inject kept by the start of s + 1 (defer_join_add) for the later layers' adds
+    const uint8_t* prior_warm_ = nullptr;   ///< local (prior-warm): set_prior_warm_map
     int defer_cold_k_ = 0, defer_cold_ring_ = 0;
     float* h_drows_ = nullptr; float* m_drows_ = nullptr;
     int32_t* h_djoin_ = nullptr; int32_t* m_djoin_ = nullptr;
