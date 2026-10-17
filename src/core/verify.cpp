@@ -546,7 +546,7 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, h_pflag_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, h_pflag_, h_drows_, h_djoin_, h_dcnt_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -697,6 +697,39 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_) &&
               (defer_heavy_ <= 0.0f || mapped(64, (void**) &h_pflag_, (void**) &m_pflag_));
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    if (strata::core::defer_cold_layers() > 0) {   // local (defer-cold): the ring of late cold rows
+        if (defer_ && !defer_check_ && defer_heavy_ > 0.0f) {
+            defer_cold_k_ = strata::core::defer_cold_layers();
+            defer_cold_ring_ = defer_cold_k_ + 1;
+            dslot_rows_ = (int64_t) (T * K);
+            const size_t R = (size_t) defer_cold_ring_;
+            if (!mapped(R * (size_t) dslot_rows_ * N * 4, (void**) &h_drows_, (void**) &m_drows_) ||
+                !mapped(R * (size_t) dslot_rows_ * 4, (void**) &h_djoin_, (void**) &m_djoin_) ||
+                !mapped(R * 4 * 4 + 64, (void**) &h_dcnt_, (void**) &m_dcnt_)) {
+                err = "verify: mapped defer-cold allocation failed";
+                return false;
+            }
+            std::memset(h_djoin_, 0xff, R * (size_t) dslot_rows_ * 4);
+            std::memset(h_dcnt_, 0, R * 4 * 4);
+            sink_.defer_k = defer_cold_k_;
+            sink_.defer_ring = defer_cold_ring_;
+            sink_.defer_last = le_ - 1;
+            for (size_t r = 0; r < R; ++r) {
+                sink_.defer_rows[r] = h_drows_ + r * (size_t) dslot_rows_ * N;
+                sink_.defer_join[r] = h_djoin_ + r * (size_t) dslot_rows_;
+                sink_.defer_cnt[r] = h_dcnt_ + r * 4;
+            }
+            if (lb_ == 0)
+                std::fprintf(stderr, "strata verify: STRATA_DEFER_COLD (changes the output): in decode windows the CPU experts "
+                                     "of a deferred layer whose blob had to be read from the drive leave the layer, whatever "
+                                     "their weight, and join the residual at the start of a later layer once computed, at most "
+                                     "%d layer%s later (STRATA_DEFER_COLD_LAYERS) and by the last layer\n", defer_cold_k_,
+                             defer_cold_k_ == 1 ? "" : "s");
+        } else if (lb_ == 0) {
+            std::fprintf(stderr, "strata verify: STRATA_DEFER_COLD ignored: it needs STRATA_VERIFY_DEFER_CPU=1 with the heavy "
+                                 "split (STRATA_VERIFY_DEFER_CPU_BELOW < 1)\n");
+        }
+    }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
@@ -762,6 +795,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
         // STRATA_VERIFY_DEFER_CPU (record_window), after everything else: the default layout is unchanged
         if (defer_) def_parts_ = b.take<float>(T * K * N);
+        if (defer_cold_k_ > 0) {   // local (defer-cold), after that: the layout without it is unchanged
+            dwsave_ = b.take<float>((uint64_t) defer_cold_ring_ * T * K);
+            disave_ = b.take<float>((uint64_t) defer_cold_ring_ * T * HC);
+        }
     };
     Bump count;
     carve(count);
@@ -1582,6 +1619,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // STRATA_VERIFY_DEFER_CPU=1: the previous layer's CPU rows join the residual here, before the FFN-side read (late_add;
         // the profile's "late rows", 15 to 16)
         if (!defer_check_ && l > lb_ && deferred(l - 1)) late_add(l - 1, grp);
+#if !defined(STRATA_GPU_METAL)
+        if (!defer_check_ && defer_cold_k_ > 0 && dfr && G == 1 && l > lb_) {   // local (defer-cold): earlier layers' cold rows
+            strata::kernels::DeferJoinSlots sl;
+            const int64_t R = defer_cold_ring_;
+            for (int64_t s = l - 1; s >= lb_ && s >= l - defer_cold_k_; --s) {
+                if (!deferred(s)) continue;
+                const size_t slot = (size_t) (s % R);
+                const int i = sl.n++;
+                sl.rows[i] = m_drows_ + slot * (size_t) dslot_rows_ * N;
+                sl.join[i] = m_djoin_ + slot * (size_t) dslot_rows_;
+                sl.cnt[i] = m_dcnt_ + slot * 4;
+                sl.delay[i] = (int) (l - s);
+                // the previous layer's weights and inject are still live here (its router and FFN-side read come after)
+                sl.w[i] = s == l - 1 ? w_ + tb_[grp] * K : dwsave_ + slot * (size_t) dslot_rows_;
+                sl.inj[i] = s == l - 1 ? inj2_ + tb_[grp] * HC : disave_ + slot * (size_t) (dslot_rows_ / K) * HC;
+            }
+            if (defer_cold_k_ > 1 && sl.n > 0 && deferred(l - 1)) {   // kept for the next layers' adds
+                const size_t slot = (size_t) ((l - 1) % R);
+                sl.w_save = dwsave_ + slot * (size_t) dslot_rows_;
+                sl.inj_save = disave_ + slot * (size_t) (dslot_rows_ / K) * HC;
+            }
+            if (sl.n > 0)
+                defer_join_add(sl, (int) l, Rt(tb_[grp]), N, (int) K, (int) HC, te_[grp] - tb_[grp], cs);
+        }
+#endif
         stamp(l, 16, grp);
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
@@ -2063,6 +2125,31 @@ bool Verifier::defer_ok(int T, std::string* why) const {
 bool Verifier::heavy_layer(int T, int64_t l) const {
     if (defer_heavy_ <= 0.0f || l + 1 >= le_ || (l == 0 && ss_->ple.ready() && ple_stage())) return false;
     return defer_ok(T, nullptr);
+}
+
+// local (cold-skip): record_window's doorbell choice - doorbell_publish_value (STRATA_DOORBELL_STORE, HIP) and
+// doorbell_publish write the weights, doorbell_publish_res does not
+bool Verifier::route_w_live(int T) const {
+#if defined(STRATA_USE_HIP)
+    if (g_doorbell_store) return true;
+#endif
+    return remote_opt_ != nullptr || always_publish_ || (defer_heavy_ > 0.0f && defer_ok(T, nullptr));
+}
+
+// local (defer-cold): the slot of layer l is free again here - its previous layer (l - ring) was added by the start of
+// l - 1 at the latest, which the GPU passed before it rang layer l - and the pool may now fill it
+// (the window's first layer clears every slot: no start of a layer of this window has read one yet - each waits for
+// a flag of this window - so no row of an earlier window can be added in this one, whichever layers it defers)
+void Verifier::defer_cold_layer(int T, int64_t l) {
+    if (l == lb_) {
+        std::memset(h_djoin_, 0xff, (size_t) defer_cold_ring_ * (size_t) dslot_rows_ * 4);
+        std::memset(h_dcnt_, 0, (size_t) defer_cold_ring_ * 4 * 4);
+    }
+    sink_.defer_layer = heavy_layer(T, l);
+    if (!sink_.defer_layer || l == lb_) return;
+    const size_t slot = (size_t) (l % defer_cold_ring_);
+    std::memset(h_djoin_ + slot * (size_t) dslot_rows_, 0xff, (size_t) dslot_rows_ * 4);
+    std::memset(h_dcnt_ + slot * 4, 0, 4 * 4);
 }
 
 bool Verifier::capture(int T, std::string& err) {
@@ -2568,6 +2655,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.weights = split ? h_w_ + (size_t) tb * ss.k : nullptr;
             sink_.partial = split ? &Verifier::raise_partial : nullptr;
         }
+        // local (cold-skip): the layer's routing weights for the pool, where the doorbell published them
+        sink_.route_w = strata::core::cold_skip_below() > 0.0f && route_w_live(T) ? h_w_ + (size_t) tb * ss.k : nullptr;
+        if (defer_cold_k_ > 0) defer_cold_layer(T, l);   // local (defer-cold)
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -3300,6 +3390,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
         sink_.weights = nullptr;   // (STRATA_VERIFY_DEFER_CPU_BELOW: a batch window never defers - one pass)
         sink_.partial = nullptr;
+        sink_.route_w = nullptr;   // (local cold-skip: not in batch windows)
+        sink_.defer_layer = false;   // (local defer-cold: nor deferral)
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
@@ -3457,6 +3549,8 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
         sink_.weights = nullptr;   // (as run_slot_rows)
         sink_.partial = nullptr;
+        sink_.route_w = nullptr;
+        sink_.defer_layer = false;
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
@@ -3744,6 +3838,8 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             sink_.weights = split ? h_w_ + (size_t) tb * ss.k : nullptr;
             sink_.partial = split ? &Verifier::raise_partial : nullptr;
         }
+        sink_.route_w = strata::core::cold_skip_below() > 0.0f && route_w_live(T) ? h_w_ + (size_t) tb * ss.k : nullptr;   // (as run)
+        if (defer_cold_k_ > 0) defer_cold_layer(T, l);   // (as run)
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);

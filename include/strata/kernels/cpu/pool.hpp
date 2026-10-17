@@ -296,6 +296,18 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
+    // local (one-phase, STRATA_POOL_ONEPHASE=1): run_split_multi_native in one batch (mode 7) - tasks [0, op_gu_tasks_)
+    // are the gate/up row ranges of mode 5, the rest the down row ranges of mode 6; per expert, the gate/up rows still
+    // to do (the thread that finishes them quantizes its h) and the batch epoch once h is ready (its down rows wait
+    // for that, not for every expert's gate/up rows)
+    int op_gu_tasks_ = 0, op_d_tasks_ = 0;
+    int64_t op_gu_rows_ = 0, op_d_rows_ = 0;
+    struct alignas(64) OnePhaseState {
+        std::atomic<int32_t> left{0};
+        std::atomic<uint32_t> ready{0};
+    };
+    std::unique_ptr<OnePhaseState[]> op_;
+    void onephase_task(uint32_t i, uint32_t epoch);
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
 };

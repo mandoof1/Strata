@@ -93,6 +93,28 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
 /// Graph-capturable.
 void defer_add_rows(const float* parts, const float* w, const float* inject, float* R, int64_t n_embd, int k, int hc,
                     int n_tok, void* stream);
+/// local (defer-cold, STRATA_DEFER_COLD / STRATA_DEFER_COLD_LAYERS): the CPU rows of cold experts that earlier layers
+/// left for later, added at the start of layer m.  Slot s: `rows` (mapped, tokens * k rows of n_embd), `join` (mapped,
+/// per row the layer whose start adds it, -1: none), `cnt` (mapped, cnt[delay[s]] > 0 when any row of the slot joins
+/// at m), and the source layer's routing weights `w` and inject `inj` (tokens * hc).  For token t and column d:
+/// a = sum over the slot's rows j with join == m of w[t*k + j] * row (the first product, then one FMA each, in j
+/// order), R[(t*hc + c)*n_embd + d] += 2*sigmoid(inj[t*hc + c] / hc) * a for every stream c (defer_add_rows' write).
+/// `w_save` / `inj_save` non-null: slot 0's w and inj (the previous layer's, live) are also copied there.
+/// Graph-capturable.
+inline constexpr int kDeferJoinMaxSlots = 3;
+struct DeferJoinSlots {
+    int n = 0;
+    const float* rows[kDeferJoinMaxSlots] = {};
+    const int32_t* join[kDeferJoinMaxSlots] = {};
+    const int32_t* cnt[kDeferJoinMaxSlots] = {};
+    const float* w[kDeferJoinMaxSlots] = {};
+    const float* inj[kDeferJoinMaxSlots] = {};
+    int delay[kDeferJoinMaxSlots] = {};
+    float* w_save = nullptr;
+    float* inj_save = nullptr;
+};
+void defer_join_add(const DeferJoinSlots& slots, int m, float* R, int64_t n_embd, int k, int hc, int n_tok,
+                    void* stream);
 /// n floats of +0.0 (n a multiple of 4, 16-byte aligned): a kernel node where a memset node would break the window's
 /// kernel-to-kernel chain (pdl.hpp).  Graph-capturable.
 void fill_zero(float* dst, long long n, void* stream);
