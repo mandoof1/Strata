@@ -11466,11 +11466,23 @@ int main(int argc, char** argv) {
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
+                // local (drift harness, only with STRATA_LOGPOS): STRATA_LOGPOS_DECODE=1 - these teacher-forced windows
+                // count as decode windows for the switches that act only there (STRATA_COLD_SKIP_BELOW,
+                // STRATA_DEFER_COLD); STRATA_LOGPOS_WINDOW=T - windows of at most T tokens (1..--spec)
+                static const bool logpos_decode = [] {
+                    const char* v = std::getenv("STRATA_LOGPOS_DECODE");
+                    return std::getenv("STRATA_LOGPOS") != nullptr && v != nullptr && std::atoi(v) != 0;
+                }();
+                static const int logpos_window = [] {
+                    const char* v = std::getenv("STRATA_LOGPOS_WINDOW");
+                    return std::getenv("STRATA_LOGPOS") != nullptr && v != nullptr ? std::max(0, std::atoi(v)) : 0;
+                }();
+                const int S_read = logpos_window > 0 ? std::min(logpos_window, S) : S;
                 pp_exact = true;   // between windows the session is exactly at `a`
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     pp_exact = false;   // until this window and the drafter's rows are in
-                    const int T = (int) std::min<int64_t>(S, b - q);
+                    const int T = (int) std::min<int64_t>(S_read, b - q);
                     for (int t = 0; t < T; ++t) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
                         nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
@@ -11478,7 +11490,10 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
-                    if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
+                    drive.d.cold_skip_window = logpos_decode;   // (local drift harness, see above)
+                    const bool ran = ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e);
+                    drive.d.cold_skip_window = false;
+                    if (!ran || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
