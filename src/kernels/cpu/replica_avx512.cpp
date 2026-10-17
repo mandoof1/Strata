@@ -30,12 +30,16 @@ inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); retur
 // IQ3_S: the 16 grid entries of a chunk by one vpgatherdd instead of 16 scalar loads - the same table values, so the
 // same integer sums; the scalar loads bound this kernel (Zen 5, 8 threads: 49 -> 60 GB/s of weights in a scratch
 // benchmark).  STRATA_REPLICA_GATHER=0 keeps the scalar loads.
-const bool g_iq3s_gather = [] { const char* e = std::getenv("STRATA_REPLICA_GATHER"); return !(e != nullptr && e[0] == '0'); }();
+// iq3b: read on first use, not in a static initializer of this -mavx512* file (see k_idx below)
+bool g_iq3s_gather_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_REPLICA_GATHER"); return !(e != nullptr && e[0] == '0'); }();
+    return on;
+}
 template <int TY> struct Dec;
 template <> struct Dec<21> {   // IQ3_S
     static constexpr int bytes = 110;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m) {
-        if (g_iq3s_gather) {
+        if (g_iq3s_gather_on()) {
             const __m512i idx = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) (b + 2 + 16 * j)));
             const __mmask16 hi = (__mmask16) (b[66 + 2 * j] | (b[66 + 2 * j + 1] << 8));   // bit k: index k's 9th bit
             g = _mm512_i32gather_epi32(_mm512_mask_add_epi32(idx, hi, idx, _mm512_set1_epi32(256)), (const void*) iq3s_grid, 4);
@@ -135,7 +139,13 @@ Idx make_idx() {
     }
     return {_mm512_load_si512(a), _mm512_load_si512(b)};
 }
-const Idx kIdx = make_idx();
+// iq3b: a function-local static, built on first use - a namespace-scope one ran AVX-512 instructions in the static
+// initializer at program start and killed the engine with SIGILL on CPUs without AVX-512 (this file is built with
+// -mavx512*; only STRATA_CPU_PARITY on an AVX-512 CPU calls into it)
+const Idx& k_idx() {
+    static const Idx v = make_idx();
+    return v;
+}
 
 inline __m512i reduce4(__m512i a0, __m512i a1, __m512i a2, __m512i a3) {
     const __m512i t0 = _mm512_add_epi32(_mm512_unpacklo_epi32(a0, a1), _mm512_unpackhi_epi32(a0, a1));
@@ -197,8 +207,8 @@ inline void row80(const uint8_t* row, const ActX* const* y, float* res) {
     for (int t = 0; t < NT; ++t) {
         __m512 D[5], S[5];
         for (int q = 0; q < 5; ++q) {
-            const __m512i h0 = _mm512_permutex2var_epi32(H[t][2 * q], kIdx.h0, H[t][2 * q + 1]);
-            const __m512i h1 = _mm512_permutex2var_epi32(H[t][2 * q], kIdx.h1, H[t][2 * q + 1]);
+            const __m512i h0 = _mm512_permutex2var_epi32(H[t][2 * q], k_idx().h0, H[t][2 * q + 1]);
+            const __m512i h1 = _mm512_permutex2var_epi32(H[t][2 * q], k_idx().h1, H[t][2 * q + 1]);
             __m512i si;
             if constexpr (TY == 22) {   // (s0 * ls0 + s1 * ls1 + (s0 + s1) / 2) / 4
                 si = div4(_mm512_add_epi32(_mm512_add_epi32(_mm512_mullo_epi32(h0, LA[q]), _mm512_mullo_epi32(h1, LB[q])),
