@@ -2570,6 +2570,126 @@ __global__ void __launch_bounds__(THREADS) gr_fused_q8_kernel(GrMulti m, float* 
     if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
 }
 
+// iq3b STRATA_HC_TSUM=1: gr_up_q8_q32_kernel with each row's T per-token warp sums as one transposed butterfly, as
+// gr_up_q8_fast_kernel does them (STRATA_TSUM's s26_tsum.cuh: bitwise the same sums); the rest verbatim.
+template <int T>
+__global__ void __launch_bounds__(Q32_THREADS) gr_up_q8_q32_ts_kernel(GrMulti m, const float* __restrict__ part,
+                                                           const float* __restrict__ ssg) {
+    __shared__ __align__(16) float lo[T][LR];
+    __shared__ float rsS[T][HC];
+    __shared__ float g[T][HC][Q32_COLS];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int d0 = blockIdx.x * Q32_COLS;
+    constexpr int P = s26ts::pow2_ceil(T);
+    const int tk = s26ts::tsum_token<P>(lane);
+    const bool owner = lane == s26ts::tsum_lane<P>(tk) && tk < T;
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+        const float r = rsqrtf(ss / (float) N + m.a[k].eps);
+        rsS[k][c] = r;
+        if (blockIdx.x == 0) m.a[k].rs[c] = r;
+    }
+    __syncthreads();
+    for (int i = t; i < T * PR; i += Q32_THREADS) {
+        const int k = i / PR, r = i - k * PR;
+        if (r >= LR && (blockIdx.x != 0 || m.a[k].w_inject == nullptr)) continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r];
+            sum = fmaf(rsS[k][c], p, sum);
+        }
+        if (r < LR) {
+            const float x = sum / (float) HC;
+            lo[k][r] = x / (1.0f + __expf(-x));
+        } else {
+            m.a[k].inject_out[r - LR] = sum;
+        }
+    }
+    __syncthreads();
+    constexpr int RPW8 = HC * Q32_COLS / Q32_WARPS;     // 8 rows per warp
+#pragma unroll 1
+    for (int qq = 0; qq < RPW8; ++qq) {
+        const int r = warp + qq * Q32_WARPS;
+        const int c = r / Q32_COLS, dd = r - c * Q32_COLS, i = c * N + d0 + dd;
+        const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+        float4 w[3];
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {   // lane: values 4 lane + 128 s (the third step: lanes 0-15)
+            const int v = 4 * lane + 128 * s;
+            if (v < LR) {
+                const uint8_t* blk = row + (v >> 5) * Q8B;
+                w[s] = q8_four(q8_ld16(blk + 2 + (v & 31)) | q8_ld16(blk + 4 + (v & 31)) << 16, q8_half(q8_ld16(blk)));
+            } else {
+                w[s] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (owner) {   // (gr_up_q8_fast_kernel's owner lanes: token tk's sum lands on lane tsum_lane(tk))
+            const FusedGrArgs& a = m.a[tk];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float acc[P];
+#pragma unroll
+        for (int k = 0; k < P; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const float4 x = *reinterpret_cast<const float4*>(&lo[k][v]);
+                    acc[k] = fmaf(w[s].x, x.x, acc[k]); acc[k] = fmaf(w[s].y, x.y, acc[k]);
+                    acc[k] = fmaf(w[s].z, x.z, acc[k]); acc[k] = fmaf(w[s].w, x.w, acc[k]);
+                }
+            }
+        }
+        const float mine = s26ts::tsum<P>(acc, lane);   // the T warp sums as one transposed butterfly (bitwise)
+        if (owner) {
+            if (apply) {
+                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                m.a[tk].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsS[tk][c];
+            g[tk][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * Q32_COLS; i += Q32_THREADS) {
+        const int k = i / Q32_COLS, col = i - k * Q32_COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[k][c][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+    __syncthreads();
+    // the block owns the whole q8_1 group (32 columns): quantize it here (gr_up_q32_kernel's tail), no counter, no fence
+    if (m.a[0].q8_mixed != nullptr && warp < T) {
+        const float xi = m.a[warp].mixed[d0 + lane];
+        float amax = fabsf(xi), sum = xi;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        const float d = q8_1_finite(amax / 127.0f);
+        const int8_t q = q8_1_quant(xi, d, amax);
+        GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + d0 / 32;
+        y->qs[lane] = q;
+        if (lane == 0) y->ds = q8_1_ds(d, sum);
+    }
+}
+
+
+
 template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cudaStream_t st, unsigned long long* stamp_buf,
                                   int stamp_i0) {
     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
@@ -2583,15 +2703,19 @@ template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cud
     }
     // iq3b STRATA_HC_Q8_LDS=1 (not with STRATA_TSUM): the down / 32-column up kernels with their weights staged through LDS
     static const bool lds = [] { const char* v = std::getenv("STRATA_HC_Q8_LDS"); return v && v[0] == '1'; }();
+    // iq3b STRATA_HC_TSUM=1: the transposed-butterfly down (STRATA_TSUM's) and 32-column up kernels for the HC read only
+    // (STRATA_TSUM=1 also switches the dense GEMVs, and STRATA_MMVQ_ROWS=4 off)
+    static const bool hts = [] { const char* v = std::getenv("STRATA_HC_TSUM"); return v && v[0] == '1'; }();
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
-    if (ts) gr_down_q8_fast_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+    if (ts || hts) gr_down_q8_fast_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     else if (lds) gr_down_q8_lds_kernel<T><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     else gr_down_q8_kernel<T><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
 #if !STRATA_GR_FAST_BUILD
     // not with q8_il (STRATA_MMVQ_IL_PLAIN): the 32-column kernel does not write the interleaved copy (see launch_multi)
     if (m.a[0].q8_mixed != nullptr && m.a[0].q8_il == nullptr && qfuse_hc_local()) {   // HIP (not gfx906): the block owns a q8_1 group
-        if (lds && !ts) gr_up_q8_q32_lds_kernel<T><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+        if (hts) gr_up_q8_q32_ts_kernel<T><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+        else if (lds && !ts) gr_up_q8_q32_lds_kernel<T><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
         else gr_up_q8_q32_kernel<T><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
         return;
     }

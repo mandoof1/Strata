@@ -234,7 +234,13 @@ int check_tables() {
             for (int n_out : {512, 2560, 6144, 10240, 12288, 248320}) {
                 const int a = native_mmvq_il_rows_for(86, type, nc, n_out);
                 // sm_89 has no table of its own: it must answer exactly what the measured Ampere table says
-                if (native_mmvq_il_rows_for(89, type, nc, n_out) != a || native_mmvq_il_rows_for(120, type, nc, n_out) != a) {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__) || defined(STRATA_USE_HIP)
+                const bool chk120 = false;   // iq3b: on HIP, 120 is gfx1200 with its own table (kIlRows_120)
+#else
+                const bool chk120 = true;
+#endif
+                if (native_mmvq_il_rows_for(89, type, nc, n_out) != a ||
+                    (chk120 && native_mmvq_il_rows_for(120, type, nc, n_out) != a)) {
                     ++bad;
                     std::printf("FAIL table: sm_89/sm_120 differ from sm_86 at type %d ncols %d n_out %d\n", type, nc, n_out);
                 }
