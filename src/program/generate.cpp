@@ -12035,7 +12035,7 @@ int main(int argc, char** argv) {
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 // local (drift harness, only with STRATA_LOGPOS): STRATA_LOGPOS_DECODE=1 - these teacher-forced windows
                 // count as decode windows for the switches that act only there (STRATA_COLD_SKIP_BELOW,
-                // STRATA_DEFER_COLD); STRATA_LOGPOS_WINDOW=T - windows of at most T tokens (1..--spec)
+                // STRATA_DEFER_COLD, iq3all: STRATA_ALT_EXPERTS); STRATA_LOGPOS_WINDOW=T - windows of at most T tokens (1..--spec)
                 static const bool logpos_decode = [] {
                     const char* v = std::getenv("STRATA_LOGPOS_DECODE");
                     return std::getenv("STRATA_LOGPOS") != nullptr && v != nullptr && std::atoi(v) != 0;
@@ -12062,8 +12062,10 @@ int main(int argc, char** argv) {
                     drive.d.experts = 0;
                     drive.d.failed = false;
                     drive.d.cold_skip_window = logpos_decode;   // (local drift harness, see above)
+                    drive.d.alt_on = logpos_decode && drive.d.alt != nullptr;   // iq3all: STRATA_ALT_EXPERTS there too
                     const bool ran = ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e);
                     drive.d.cold_skip_window = false;
+                    drive.d.alt_on = false;
                     if (!ran || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -12601,7 +12603,7 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
-            drive.d.alt_on = drive.d.alt != nullptr;   // local (STRATA_ALT_EXPERTS): the decode's windows
+            // (iq3all: STRATA_ALT_EXPERTS's alt_on is set around each decode window's run, with cold_skip_window)
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
             struct DecSnap {
@@ -13457,8 +13459,10 @@ int main(int argc, char** argv) {
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
                 drive.d.cold_skip_window = true;   // local (cold-skip): a decode window (the prompt's never set it)
+                drive.d.alt_on = drive.d.alt != nullptr;   // iq3all: STRATA_ALT_EXPERTS in the same windows
                 const bool ran = ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err);
                 drive.d.cold_skip_window = false;
+                drive.d.alt_on = false;
                 if (!ran || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -14737,8 +14741,10 @@ int main(int argc, char** argv) {
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
             drive.d.cold_skip_window = true;   // local (cold-skip): a decode window
+            drive.d.alt_on = drive.d.alt != nullptr;   // iq3all: STRATA_ALT_EXPERTS in the same windows
             const bool ran = ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err);
             drive.d.cold_skip_window = false;
+            drive.d.alt_on = false;
             if (!ran) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
