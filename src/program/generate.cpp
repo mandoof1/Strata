@@ -12044,12 +12044,14 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_LOGPOS_WINDOW");
                     return std::getenv("STRATA_LOGPOS") != nullptr && v != nullptr ? std::max(0, std::atoi(v)) : 0;
                 }();
-                const int S_read = logpos_window > 0 ? std::min(logpos_window, S) : S;
                 pp_exact = true;   // between windows the session is exactly at `a`
                 // STRATA_READ_WINDOW=N (debug): read through windows of at most N tokens (1 = one token a window, the
                 // reference for checks that a window's tokens come out as they would alone)
                 static const int read_window = [] { const char* v = std::getenv("STRATA_READ_WINDOW"); return v ? std::atoi(v) : 0; }();
-                const int S_read = read_window > 0 ? std::min(read_window, S) : S;
+                // iq3all: STRATA_LOGPOS_WINDOW (iq3a) and STRATA_READ_WINDOW (iq3b, the fork's) together - the smaller wins
+                int S_read = S;
+                if (logpos_window > 0) S_read = std::min(S_read, logpos_window);
+                if (read_window > 0) S_read = std::min(S_read, read_window);
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     pp_exact = false;   // until this window and the drafter's rows are in
