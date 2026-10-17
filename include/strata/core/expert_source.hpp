@@ -242,6 +242,9 @@ public:
     /// local (cold-skip): reads the blob into the page cache in the background - behind every demand read, never
     /// dropped as stale - for a later window.  The bytes are the same.  False when this source has no such queue.
     virtual bool warm_background(int64_t layer, int64_t expert) { (void) layer; (void) expert; return false; }
+    /// local (defer-cold): whether the demand read the last `prefetch` of `layer` queued for this expert (cold) has
+    /// landed; true when none was queued or this source does not read on its own threads.
+    virtual bool read_landed(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return true; }
     /// CS-T: the experts of `layer` a predictor expects next - a source that reads a file may start reading their
     /// pages now, in the background.  Only warms: what `blob` returns is unchanged.  Default: nothing.
     virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -356,11 +359,25 @@ struct GpuPlanSink {
     /// local (cold-skip, STRATA_COLD_SKIP_BELOW): the group's routing weights (entry token * k + j) when the doorbell
     /// published them for this layer - set by the verifier per layer only while cold-skip is on; null otherwise.
     const float* route_w = nullptr;
+    /// local (defer-cold, STRATA_DEFER_COLD=1 / STRATA_DEFER_COLD_LAYERS=k): set by the verifier per layer.  On a layer of
+    /// a deferred window (defer_layer, with the heavy split) a decode window's cold CPU experts leave the layer's two
+    /// passes: their rows in the mapped rows are zeros, they are computed later into defer_rows[layer % defer_ring] and
+    /// join the residual at the start of a later layer m <= min(layer + defer_k, defer_last) (defer_join[row] = m,
+    /// defer_cnt[m - layer] += rows), which the GPU adds there (defer_join_add).  defer_k 0: off.
+    int defer_k = 0;
+    int defer_ring = 0;
+    bool defer_layer = false;
+    int64_t defer_last = -1;
+    float* defer_rows[4] = {};
+    int32_t* defer_join[4] = {};
+    int32_t* defer_cnt[4] = {};
 };
 
 /// local (cold-skip): STRATA_COLD_SKIP_BELOW=<w> (read once; 0 = off): the routing weight below which a cold missed
 /// expert of a decode window is skipped (expert_pool_dispatch_multi).
 float cold_skip_below();
+/// local (defer-cold): STRATA_DEFER_COLD_LAYERS=k (1..3), else 1 with STRATA_DEFER_COLD=1, else 0 (read once).
+int defer_cold_layers();
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ForesightSwap;
@@ -499,6 +516,21 @@ struct ExpertDispatch {
     /// computed because the per-token cap was reached, and the background reads queued for the skipped blobs.
     bool cold_skip_window = false;
     int64_t cold_skip_experts = 0, cold_skip_entries = 0, cold_skip_capped = 0, cold_skip_warm = 0;
+    /// local (defer-cold): the cold CPU experts a decode window's deferred layers left for later (GpuPlanSink::defer_k),
+    /// each with its source layer, deadline (the last layer whose start may add it) and job (activations copied into
+    /// defer_act / defer_nact of the source layer's ring slot, rows into the slot's defer_rows); the stats - cold rows of
+    /// decode windows by the layers they joined late (0: in their own layer), experts deferred, and of them computed
+    /// at their deadline with the read not landed yet
+    struct DeferredJob {
+        int64_t layer = 0, expert = 0, deadline = 0;
+        strata::kernels::cpu::ExpertJobMulti job;
+        int32_t entry[strata::kernels::cpu::MAXT] = {};
+    };
+    std::vector<DeferredJob> defer_q;
+    std::vector<strata::kernels::cpu::ActQ> defer_act;   ///< ring slots x MAXT
+    std::vector<uint8_t> defer_nact;                     ///< ring slots x MAXT x kNativeActBytes
+    int64_t defer_rows_by[4] = {};
+    int64_t defer_experts = 0, defer_waited = 0;
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
@@ -750,6 +782,7 @@ public:
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
     bool cold(int64_t layer, int64_t expert) const override;
     int probe_cold(int64_t layer, int64_t expert) const override;
+    bool read_landed(int64_t layer, int64_t expert) const override;
     void prefetch_probed(int64_t layer, const int64_t* experts, int64_t n, const int8_t* known) override;
     bool warm_background(int64_t layer, int64_t expert) override;
     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
@@ -905,6 +938,9 @@ private:
     // second probe of a demand blob the layer just probed cold dropped, and one lock per layer for its demand reads
     bool probe_trim_ = false;
     std::unique_ptr<std::atomic<uint8_t>[]> io_mapped_;
+    // local (defer-cold): per (layer, expert), demand reads finished by the workers and the count a queued one waits for
+    std::unique_ptr<std::atomic<uint32_t>[]> io_done_;
+    std::vector<uint32_t> io_want_;
     bool io_prio_ = true;
     int io_ahead_max_ = 2;
     int io_dem_busy_ = 0, io_ahead_busy_ = 0;        ///< reads in flight (under io_mu_)

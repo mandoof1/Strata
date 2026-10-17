@@ -1424,6 +1424,67 @@ void defer_add_rows(const float* parts, const float* w, const float* inject, flo
 }
 
 namespace {
+// local (defer-cold): blockIdx.y = the token, one thread per column, as defer_add_rows_kernel.  Per source slot: the
+// token's rows whose join layer is `m` (the host wrote join and cnt before the flag this kernel's stream waited for),
+// summed as the combine sums (the first product, then one FMA each, in j order) and added to every stream with the
+// slot's own inject gate.  Block (0, 0) also keeps slot 0's live weights and inject for the later layers.
+__global__ void defer_join_add_kernel(DeferJoinSlots sl, int m, float* __restrict__ R, int64_t n_embd, int k, int hc,
+                                      int n_tok) {
+    const int t = blockIdx.y;
+    __shared__ int jn[kDeferJoinMaxSlots][16];
+    __shared__ int any[kDeferJoinMaxSlots];
+    if (blockIdx.x == 0 && t == 0 && sl.w_save != nullptr) {
+        for (int i = threadIdx.x; i < n_tok * k; i += blockDim.x) sl.w_save[i] = sl.w[0][i];
+        for (int i = threadIdx.x; i < n_tok * hc; i += blockDim.x) sl.inj_save[i] = sl.inj[0][i];
+    }
+    if (threadIdx.x < (unsigned) sl.n) {
+        const int s = threadIdx.x;
+        int a = 0;
+        if (((const volatile int32_t*) sl.cnt[s])[sl.delay[s]] > 0)
+            for (int j = 0; j < k && j < 16; ++j) {
+                const int v = ((const volatile int32_t*) sl.join[s])[t * k + j];
+                jn[s][j] = v;
+                a |= v == m;
+            }
+        any[s] = a;
+    }
+    __syncthreads();
+    const int64_t d = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= n_embd) return;
+    for (int s = 0; s < sl.n; ++s) {
+        if (!any[s]) continue;
+        const volatile float* rows = (const volatile float*) sl.rows[s] + (int64_t) t * k * n_embd + d;
+        const float* wt = sl.w[s] + t * k;
+        float acc = 0.0f;
+        bool first = true;
+        for (int j = 0; j < k && j < 16; ++j) {
+            if (jn[s][j] != m) continue;
+            const float p = rows[(int64_t) j * n_embd];
+            acc = first ? p * wt[j] : fmaf(p, wt[j], acc);
+            first = false;
+        }
+        const float* inj = sl.inj[s] + t * hc;
+        float* r = R + (int64_t) t * hc * n_embd + d;
+        for (int c = 0; c < hc; ++c) {
+            const float gw = 2.0f * (1.0f / (1.0f + __expf(-(inj[c] / (float) hc))));
+            r[(int64_t) c * n_embd] = fmaf(acc, gw, r[(int64_t) c * n_embd]);
+        }
+    }
+}
+}  // namespace
+void defer_join_add(const DeferJoinSlots& slots, int m, float* R, int64_t n_embd, int k, int hc, int n_tok,
+                    void* stream) {
+    if (n_tok <= 0 || n_embd <= 0 || (slots.n <= 0 && slots.w_save == nullptr)) return;
+    if (k > 16 || slots.n > kDeferJoinMaxSlots) {
+        std::fprintf(stderr, "defer_join_add: at most 16 routed experts and %d slots\n", kDeferJoinMaxSlots);
+        std::exit(1);
+    }
+    defer_join_add_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, (cudaStream_t) stream>>>(
+        slots, m, R, n_embd, k, hc, n_tok);
+    check("defer_join_add");
+}
+
+namespace {
 __global__ void wait_copy_i32_kernel(const volatile uint32_t* flag, uint32_t value, int32_t* __restrict__ dst,
                                      const volatile int32_t* src, int n) {
     if (threadIdx.x == 0) {

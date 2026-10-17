@@ -13183,6 +13183,18 @@ int main(int argc, char** argv) {
                 cs_e = drive.d.cold_skip_experts; cs_n = drive.d.cold_skip_entries; cs_c = drive.d.cold_skip_capped;
                 cs_w = drive.d.cold_skip_warm; cs_r = cic.warm_read; cs_k = cic.warm_cached; cs_d = cic.warm_dropped;
             }
+            if (strata::core::defer_cold_layers() > 0) {   // local (defer-cold, STRATA_DEFER_COLD / _LAYERS), this request
+                static int64_t dc_r[4] = {}, dc_e = 0, dc_w = 0;
+                const auto& dd = drive.d;
+                std::fprintf(stderr, "strata serve: defer-cold: cold CPU rows joined 0/1/2/3 layers late: %lld %lld %lld %lld "
+                                     "(%lld experts deferred, %lld computed at their deadline before their read landed) this "
+                                     "request\n",
+                             (long long) (dd.defer_rows_by[0] - dc_r[0]), (long long) (dd.defer_rows_by[1] - dc_r[1]),
+                             (long long) (dd.defer_rows_by[2] - dc_r[2]), (long long) (dd.defer_rows_by[3] - dc_r[3]),
+                             (long long) (dd.defer_experts - dc_e), (long long) (dd.defer_waited - dc_w));
+                for (int i = 0; i < 4; ++i) dc_r[i] = dd.defer_rows_by[i];
+                dc_e = dd.defer_experts; dc_w = dd.defer_waited;
+            }
             // the resident RAM mode, cumulative: experts read from experts.bin since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
             if (src.complement_ready())

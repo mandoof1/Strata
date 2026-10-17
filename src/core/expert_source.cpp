@@ -712,6 +712,10 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     }
     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     if (const char* v = std::getenv("STRATA_PROBE_TRIM")) probe_trim_ = std::atoi(v) != 0;
+    if (defer_cold_layers() > 0 && !io_done_) {   // local (defer-cold): which demand reads have landed
+        io_done_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
+        io_want_.assign((size_t) (n_layers_ * n_expert_), 0u);
+    }
     if (probe_trim_ && !io_mapped_) {
         io_mapped_.reset(new std::atomic<uint8_t>[(size_t) (n_layers_ * n_expert_)]());
         std::fprintf(stderr, "strata: STRATA_PROBE_TRIM=1: page-cache probes in two calls for mapped blobs, one lock per "
@@ -827,10 +831,14 @@ void FileExpertSource::io_worker() {
             }
         }
         // whatever path this iteration takes, the in-flight count goes back down and the waiting workers re-check
+        const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
         struct InFlight {
             FileExpertSource* s;
             bool demand;
+            size_t index;
             ~InFlight() {
+                // local (defer-cold): the demand read of this blob is done (its pages are in, or it needed none)
+                if (demand && s->io_done_) s->io_done_[index].fetch_add(1, std::memory_order_release);
                 {
                     std::lock_guard<std::mutex> lk(s->io_mu_);
                     if (demand) --s->io_dem_busy_;
@@ -838,9 +846,8 @@ void FileExpertSource::io_worker() {
                 }
                 s->io_cv_.notify_all();
             }
-        } in_flight{this, demand};
+        } in_flight{this, demand, index};
         io_pf_jobs_.fetch_add(1, std::memory_order_relaxed);
-        const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
         if (complement_ready_ && resident_blob(index) != nullptr) continue;
         if (!override_.empty() && override_[index] != nullptr) continue;
         if (io_fill_) {   // read what is not cached into a scratch buffer: the pages stay in the page cache for the kernels
@@ -1650,6 +1657,12 @@ int FileExpertSource::probe_cold(int64_t layer, int64_t expert) const {
     return cached_bytes(layer, expert, total, false) < total ? 1 : 0;
 }
 
+bool FileExpertSource::read_landed(int64_t layer, int64_t expert) const {
+    if (!io_done_ || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return true;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    return io_done_[index].load(std::memory_order_acquire) >= io_want_[index];
+}
+
 bool FileExpertSource::warm_background(int64_t layer, int64_t expert) {
     if (!(io_fill_ && io_pf_ && direct_.empty()) || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_)
         return false;
@@ -1691,6 +1704,7 @@ void FileExpertSource::prefetch_probed(int64_t layer, const int64_t* experts, in
             } else if (cached_bytes(layer, e, total, false) >= total) continue;
             io_pf_demand_.fetch_add(1, std::memory_order_relaxed);
             if (!io_cold_stamp_.empty()) io_cold_stamp_[index] = io_cold_epoch_;
+            if (io_done_) io_want_[index] = io_done_[index].load(std::memory_order_relaxed) + 1;   // local (defer-cold)
             if (batch) { cold_q.emplace_back((int32_t) layer, (int32_t) e); continue; }
             io_enqueue(layer, e, /*demand=*/true);
         }
@@ -4039,6 +4053,66 @@ const ColdSkipCfg& cold_skip_cfg() {
 }  // namespace
 float cold_skip_below() { return cold_skip_cfg().below; }
 
+int defer_cold_layers() {
+    static const int k = [] {
+        int r = 0;
+        if (const char* v = std::getenv("STRATA_DEFER_COLD_LAYERS")) {
+            r = std::atoi(v);
+            if (r < 0 || r > 3) {
+                std::fprintf(stderr, "strata verify: STRATA_DEFER_COLD_LAYERS=%s is not 0..3: 1\n", v);
+                r = 1;
+            }
+        } else if (const char* c = std::getenv("STRATA_DEFER_COLD")) {
+            r = std::atoi(c) != 0 ? 1 : 0;
+        }
+        return r;
+    }();
+    return k;
+}
+
+namespace {
+// local (defer-cold): at the end of layer l's pool call, the queued jobs whose read has landed and those that must
+// join at the start of l + 1 (their deadline) run, grouped by their source layer (its format), into their slots; then
+// each of their rows is marked to join at l + 1.  The verifier raises flag l after this returns, and the GPU's start
+// of l + 1 waits for that flag before it reads the marks.
+void defer_cold_service(ExpertDispatch& d, const GpuPlanSink& ps, bool native) {
+    using namespace strata::kernels::cpu;
+    const int64_t join = d.layers + 1;
+    const ExpertLayout& lay = expert_layout();
+    static thread_local std::vector<ExpertJobMulti> run;
+    static thread_local std::vector<size_t> picked;
+    std::vector<ExpertDispatch::DeferredJob>& q = d.defer_q;
+    static thread_local std::vector<char> take;
+    take.assign(q.size(), 0);
+    for (size_t i = 0; i < q.size(); ++i) {
+        const bool due = q[i].deadline <= join;
+        const bool landed = d.src->read_landed(q[i].layer, q[i].expert);
+        take[i] = due || landed;
+        if (due && !landed) ++d.defer_waited;
+    }
+    for (size_t a = 0; a < q.size(); ++a) {   // per source layer, in queue order (the oldest first)
+        if (!take[a]) continue;
+        const int64_t src = q[a].layer;
+        run.clear();
+        picked.clear();
+        for (size_t i = a; i < q.size(); ++i)
+            if (take[i] && q[i].layer == src) { run.push_back(q[i].job); picked.push_back(i); }
+        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) src], run.data(), (int) run.size());
+        else d.pool->run_split_multi(run.data(), (int) run.size());
+        const int slot = (int) (src % ps.defer_ring);
+        const int64_t delay = join - src;
+        for (size_t i : picked) {
+            for (int t = 0; t < q[i].job.nt; ++t) ps.defer_join[slot][q[i].entry[t]] = (int32_t) join;
+            ps.defer_cnt[slot][delay] += q[i].job.nt;
+            d.defer_rows_by[delay < 4 ? delay : 3] += q[i].job.nt;
+            take[i] = 0;
+            q[i].expert = -1;   // done
+        }
+    }
+    q.erase(std::remove_if(q.begin(), q.end(), [](const ExpertDispatch::DeferredJob& j) { return j.expert < 0; }), q.end());
+}
+}  // namespace
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -4063,6 +4137,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
+    // local (defer-cold): every deferred job joins by the stage's last layer of its window; one still queued at a layer
+    // not after its own is a window that ended early (an error) - its rows are dropped, not carried into this window
+    if (!d.defer_q.empty() && d.defer_q.front().layer >= d.layers) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "strata verify: STRATA_DEFER_COLD: %zu deferred CPU experts of an unfinished window dropped "
+                                 "(said once)\n", d.defer_q.size());
+        d.defer_q.clear();
+    }
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
     if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
@@ -4433,6 +4516,53 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                  "for all of them (said once)\n", no_split);
     }
     int nfirst = njobs;
+    // local (defer-cold, STRATA_DEFER_COLD=1 / STRATA_DEFER_COLD_LAYERS=k, opt-in, changes the output): on a deferred
+    // layer of a decode window (the verifier sets ps->defer_layer where post(l) takes only the heavy rows), the CPU
+    // experts prefetch had to send to the drive leave both passes, whatever their weight: their rows here are zeros (so
+    // neither post(l) nor the late copy at the start of l + 1 waits for or takes them), and they are computed later
+    // (defer_cold_service, at the end of this and the next layers' pool calls) into the layer's ring slot, with this
+    // layer's activations saved there, and added at the start of the first layer m whose flag finds them done, at most
+    // min(l + k, the stage's last layer) - there they are computed whether their read has landed or not.
+    bool gone[kMaxWindowEntries] = {};
+    const bool defer_on = ps != nullptr && ps->defer_k > 0 && d.cold_skip_window;
+    if (defer_on && njobs > 0) {
+        const bool here = split && ps->defer_layer && ps->defer_ring > ps->defer_k;
+        const int slot = here ? (int) (d.layers % ps->defer_ring) : 0;
+        bool saved = false;
+        for (int j = 0; j < njobs; ++j) {
+            if (!d.src->cold(d.layers, job_e[(size_t) j])) continue;
+            ExpertJobMulti& jb = d.jobs_multi[(size_t) j];
+            if (!here) { d.defer_rows_by[0] += jb.nt; continue; }   // waited for in its own layer
+            if (!saved) {   // the layer's activations, for whenever the job runs
+                if (d.defer_act.size() < (size_t) ps->defer_ring * MAXT) d.defer_act.resize((size_t) ps->defer_ring * MAXT);
+                if (native && d.defer_nact.size() < (size_t) ps->defer_ring * MAXT * kNativeActBytes)
+                    d.defer_nact.resize((size_t) ps->defer_ring * MAXT * kNativeActBytes);
+                if (!native || q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // the kernels that read act
+                    for (int64_t t = 0; t < n_tok; ++t) d.defer_act[(size_t) slot * MAXT + (size_t) t] = d.act_multi[(size_t) t];
+                if (native)
+                    std::memcpy(d.defer_nact.data() + (size_t) slot * MAXT * kNativeActBytes, d.nact_multi.data(),
+                                (size_t) n_tok * kNativeActBytes);
+                saved = true;
+            }
+            ExpertDispatch::DeferredJob dj;
+            dj.layer = d.layers;
+            dj.expert = job_e[(size_t) j];
+            dj.deadline = std::min<int64_t>(d.layers + ps->defer_k, ps->defer_last);
+            dj.job = jb;
+            for (int t = 0; t < jb.nt; ++t) {
+                const int64_t i = (int64_t) (jb.out[t] - out) / H;   // the entry (token * k + j) of this row
+                const int64_t tok = i / k;
+                dj.entry[t] = (int32_t) i;
+                std::memset(jb.out[t], 0, (size_t) H * sizeof(float));
+                dj.job.out[t] = ps->defer_rows[slot] + (size_t) i * H;
+                dj.job.act[t] = &d.defer_act[(size_t) slot * MAXT + (size_t) tok];
+                dj.job.nact[t] = native ? d.defer_nact.data() + ((size_t) slot * MAXT + (size_t) tok) * kNativeActBytes : nullptr;
+            }
+            d.defer_q.push_back(dj);
+            ++d.defer_experts;
+            gone[j] = true;
+        }
+    }
     if (split && njobs > 0) {
         bool heavy_job[kMaxWindowEntries] = {};
         for (int64_t i = 0; i < n; ++i)
@@ -4457,7 +4587,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 int n_cold = 0, n_pass = 0;
                 for (int c = 0; c < 2; ++c)   // the pass's cached jobs, then its cold ones, each in routing order
                     for (int j = 0; j < njobs; ++j)
-                        if (heavy_job[j] == (pass == 0) && cold_job[j] == (c == 1)) {
+                        if (!gone[j] && heavy_job[j] == (pass == 0) && cold_job[j] == (c == 1)) {
                             order.push_back(d.jobs_multi[(size_t) j]);
                             ++n_pass;
                             n_cold += c;
@@ -4467,10 +4597,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         } else
         for (int pass = 0; pass < 2; ++pass)
             for (int j = 0; j < njobs; ++j)
-                if (heavy_job[j] == (pass == 0)) order.push_back(d.jobs_multi[(size_t) j]);
+                if (!gone[j] && heavy_job[j] == (pass == 0)) order.push_back(d.jobs_multi[(size_t) j]);
         nfirst = 0;
-        for (int j = 0; j < njobs; ++j) nfirst += heavy_job[j] ? 1 : 0;
+        for (int j = 0; j < njobs; ++j) nfirst += !gone[j] && heavy_job[j] ? 1 : 0;
         std::copy(order.begin(), order.end(), d.jobs_multi.begin());
+        njobs = (int) order.size();   // (local defer-cold: without the deferred ones)
     } else {   // local: without the heavy split, the io-prio cold-last order
     // local (io-prio): the experts prefetch had to send to the drive go last, so the pool computes the cached ones while
     // their reads land instead of a worker (and, with the row split, every worker) waiting on a cold blob first.  Each
@@ -4500,6 +4631,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     run_jobs(d.jobs_multi.data(), nfirst);
     if (split) ps->partial(ps->ctx);
     run_jobs(d.jobs_multi.data() + nfirst, njobs - nfirst);
+    if (!d.defer_q.empty() && ps != nullptr && ps->defer_k > 0) defer_cold_service(d, *ps, native);   // local (defer-cold)
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)

@@ -517,6 +517,18 @@ private:
     bool heavy_layer(int T, int64_t l) const;       ///< STRATA_VERIFY_DEFER_CPU_BELOW: post(l) waits for the partial flag
     /// local (cold-skip): whether the T-token window's doorbells publish the routing weights to the host (h_w_)
     bool route_w_live(int T) const;
+    // local (defer-cold, STRATA_DEFER_COLD=1 / STRATA_DEFER_COLD_LAYERS=k, with the heavy split): a ring of k + 1 slots,
+    // one per deferred layer s (slot s % ring): the rows of its late cold experts (mapped, written by the pool), per row
+    // the layer whose start adds it (mapped, -1 none), the rows joining per delay (mapped), and on the device the
+    // layer's routing weights and inject kept by the start of s + 1 (defer_join_add) for the later layers' adds
+    int defer_cold_k_ = 0, defer_cold_ring_ = 0;
+    float* h_drows_ = nullptr; float* m_drows_ = nullptr;
+    int32_t* h_djoin_ = nullptr; int32_t* m_djoin_ = nullptr;
+    int32_t* h_dcnt_ = nullptr; int32_t* m_dcnt_ = nullptr;
+    float* dwsave_ = nullptr; float* disave_ = nullptr;
+    int64_t dslot_rows_ = 0;   ///< entries per slot (the init's T * k)
+    /// The host loop, before layer l's pool call: whether its cold experts may be deferred, and its slot cleared if so.
+    void defer_cold_layer(int T, int64_t l);
 
     // device
     void* arena_ = nullptr;
