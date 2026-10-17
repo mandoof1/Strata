@@ -2847,6 +2847,16 @@ constexpr IlRows6 kIlRows_110[] = {
     {13, {{0, 0, 0, 1, 1, 1}, {0, 0, 0, 1, 1, 1}, {0, 0, 1, 1, 1, 1}}},   // Q5_K
     {14, {{0, 0, 2, 1, 2, 1}, {0, 0, 2, 1, 2, 2}, {0, 0, 2, 1, 1, 2}}},   // Q6_K
 };
+// iq3b: gfx1200 (RX 9060 XT; HIP reports 12.0), from mmvq_il_parity --bench on the card (2026-10-17, ROCm 7.2.4,
+// L2-cold, against native_mmvq's 2-row blocks): per cell the rows count with the smallest time when it takes >= 3% off,
+// else 0; the 2560-row outputs (class 1) stay on native_mmvq - their gain (<= 6%) does not pay the interleave launch
+// their own inputs (ssm_out, o-proj) would need.  Every choice gives the same bits (mmvq_il_parity: OK on this card).
+constexpr IlRows6 kIlRows_120[] = {
+    {23, {{0, 0, 2, 4, 2, 2}, {1, 0, 4, 4, 4, 4}, {1, 0, 1, 4, 4, 4}}},   // IQ4_XS (qkv 10240 / q 12288: -17..-20% at 3-4)
+    {12, {{1, 0, 2, 1, 1, 1}, {1, 0, 1, 1, 1, 1}, {1, 0, 1, 2, 4, 4}}},   // Q4_K
+    {13, {{1, 0, 2, 1, 1, 2}, {1, 0, 1, 1, 1, 4}, {1, 0, 1, 2, 2, 4}}},   // Q5_K (the head: -19% / -35% / -39% at 2 / 3 / 4)
+    {14, {{1, 0, 0, 0, 0, 0}, {1, 0, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 2}}},   // Q6_K
+};
 // in the engine the plain columns never beat native_mmvq (the out projections, the only ones left without a copy)
 constexpr IlRows6 kIlpRows_110[] = {
     {23, {{0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}}},   // IQ4_XS
@@ -2867,6 +2877,13 @@ int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
             if (t.type == type) return t.r[ncols - 2][cls6];
         return 0;
     }
+#if defined(__HIPCC__)
+    if (cc == 120) {   // iq3b: gfx1200 (a CUDA build's 120 is sm_120, which keeps the shared table)
+        for (const IlRows6& t : kIlRows_120)
+            if (t.type == type) return t.r[ncols - 2][cls6];
+        return 0;
+    }
+#endif
     const IlRows* t = kIlRowsShared;
     size_t n = sizeof(kIlRowsShared) / sizeof(IlRows);
     for (const IlArch& a : kIlArch)
