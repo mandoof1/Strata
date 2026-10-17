@@ -43,6 +43,13 @@ void native_moe_wait_combine_multi_add_hits(const uint32_t* flag, uint32_t value
                                             const int32_t* dst, const int32_t* count, const float* weights,
                                             const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
                                             void* stream);
+/// iq3b STRATA_DEFER_FUSE: a deferred layer's wait for the heavy CPU rows (`flag` >= `value`), their copy
+/// (copy_rows_by_weight with take_heavy: the CPU rows of weight >= `heavy`, the others zero) and
+/// native_moe_combine_multi_add_hits in one launch: the same output bit for bit.  `cpu_rows` is the mapped rows.
+void native_moe_wait_combine_heavy_multi_add_hits(const uint32_t* flag, uint32_t value, const float* cpu_rows,
+                                                  const float* hit, const int32_t* dst, const int32_t* count,
+                                                  const float* weights, float heavy, const float* shared, float* output,
+                                                  int64_t n_embd, int64_t k, int n_tok, void* stream);
 /// S26 STRATA_LFUSE: the same with `shared` unscaled and shared_gate[t] the shared expert's raw gate logit: the
 /// row is scaled by sigmoid(shared_gate[t]) here, bitwise what shared_expert_multi's sigmoid + scale gave.
 void native_moe_combine_multi_hits_gated(const float* hits, const float* weights, const float* shared,

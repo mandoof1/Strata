@@ -221,6 +221,10 @@ const bool g_route_pub = env_on("STRATA_ROUTE_PUB");
 // STRATA_WAIT_COMBINE=1: the CPU rows' wait and copy (wait_copy_rows_from_mapped) ride in the add-hits combine
 // (native_moe_wait_combine_multi_add_hits): the same rows, the same sums
 const bool g_wait_combine = env_on("STRATA_WAIT_COMBINE");
+// iq3b STRATA_DEFER_FUSE=1 (with STRATA_VERIFY_DEFER_CPU and _BELOW): a deferred layer's heavy-row wait + copy + combine
+// in one launch (native_moe_wait_combine_heavy_multi_add_hits) and late_add's wait + light-row copy + add in one
+// (late_add_rows_after): the same rows, the same sums, four fewer dependent launches per layer on the critical path
+const bool g_defer_fuse = env_on("STRATA_DEFER_FUSE");
 // STRATA_PCIE_FORK=1: the PCIe pass (the wait for flag B and the PCIe groups' gate/up, SwiGLU and down) on a side
 // stream from the plan copy to the combine, beside the VRAM groups; it writes only its own entries' scratch and rows
 const bool g_pcie_fork = env_on("STRATA_PCIE_FORK");
@@ -1048,6 +1052,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             wait_flag_ge_or(m_flag_, ring_d, skip_ + grp, cs);
             copy_or_zero_from_mapped(def_parts_, ym, (long long) n * K * N, skip_ + grp, ring_d, cs);
         } else {
+#if !defined(STRATA_GPU_METAL)
+            if (heavy && g_defer_fuse && !prof_on_) {   // iq3b: the wait, the light rows' copy and the add in one launch
+                late_add_rows_after(m_flag_, ring_d, ym, pl + 4 + MT * K + 1, pl + 1, w_ + tb * K, defer_heavy_,
+                                    inj2_ + tb * HC, Rt(tb), N, (int) K, (int) HC, n, cs);
+                return;
+            }
+#endif
             wait_flag_ge(m_flag_, ring_d, cs);
 #if !defined(STRATA_GPU_METAL)
             if (heavy)   // the light rows (the heavy ones are in layer dl's combine already)
@@ -1820,6 +1831,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         float* parts_out = parts_ + (size_t) tb * K * N;
         bool hits_pending = false;   // STRATA_COMBINE_HITS: moe_hit_add left to the combine
         bool wc_fused = false;       // STRATA_WAIT_COMBINE: the CPU rows' wait and copy left to the combine
+        bool dfused = false;         // iq3b STRATA_DEFER_FUSE: the heavy rows' wait and copy left to the combine
         const auto& lay = strata::kernels::cpu::expert_layout();
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.
         // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
@@ -1890,7 +1902,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!no_pcie_ && !pcie_fork) grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, cs);
             stamp(l, 22, grp);
             // STRATA_VERIFY_DEFER_CPU: no wait, no CPU rows now (late_add adds them later): zeros, plus the hits
-            if (deferred(l)) {
+            // iq3b STRATA_DEFER_FUSE: where the combine below is the add-hits one, it waits for the heavy rows and reads them
+            dfused = deferred(l) && heavy && g_defer_fuse && !prof_on_ && !remote_opt_ && !pcie_fork && dec_batch &&
+                     n > 1 && n <= 8 && (g_combine_hits() || fuse_hits_on()) && native_moe_combine_enabled() &&
+                     !sg_gated_[grp] && K == 10 &&
+                     native_moe_wait_combine_ok(m_ymiss_ + (size_t) tb * K * N, hit_out, shared_ + tb * N, bo_ + tb * N, N,
+                                                K, n);
+            if (dfused) {
+                stamp(l, 23, grp);
+            } else if (deferred(l)) {
                 if (heavy) wait_flag_ge(m_pflag_, ring, cs);   // STRATA_VERIFY_DEFER_CPU_BELOW: the heavy rows (waitCPU)
                 stamp(l, 23, grp);   // (no split, no wait: the zeroing counts as copy+combine, as the copy it replaces)
 #if !defined(STRATA_GPU_METAL)   // (as late_add's defer_add_rows)
@@ -1957,6 +1977,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     native_moe_wait_combine_multi_add_hits(m_flag_, ring, m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst,
                                                            p_counts + 1, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K,
                                                            n, cs);   // (hits_pending stays: no other combine)
+                } else if (dfused) {   // iq3b: hits_pending is set under the same conditions (no other combine)
+                    native_moe_wait_combine_heavy_multi_add_hits(m_pflag_, ring, m_ymiss_ + (size_t) tb * K * N, hit_out,
+                                                                 p_dst, p_counts + 1, w_ + tb * K, defer_heavy_,
+                                                                 shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
                 } else
                 if (hits_pending && !native_moe_combine_multi_add_hits(parts_out, hit_out, p_dst, p_counts + 1, w_ + tb * K,
                                                                         shared_ + tb * N, bo_ + tb * N, N, K, n, cs)) {

@@ -96,6 +96,11 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
 /// Graph-capturable.
 void defer_add_rows(const float* parts, const float* w, const float* inject, float* R, int64_t n_embd, int k, int hc,
                     int n_tok, void* stream);
+/// iq3b STRATA_DEFER_FUSE: wait_flag_ge(flag, value) + copy_rows_by_weight(take_heavy = false: the light CPU rows of the
+/// mapped `src`) + defer_add_rows in one launch, bit for bit the three (k <= 32).
+void late_add_rows_after(const uint32_t* flag, uint32_t value, const float* src, const int32_t* hit_rows,
+                         const int32_t* count, const float* w, float heavy, const float* inject, float* R, int64_t n_embd,
+                         int k, int hc, int n_tok, void* stream);
 /// n floats of +0.0 (n a multiple of 4, 16-byte aligned): a kernel node where a memset node would break the window's
 /// kernel-to-kernel chain (pdl.hpp).  Graph-capturable.
 void fill_zero(float* dst, long long n, void* stream);

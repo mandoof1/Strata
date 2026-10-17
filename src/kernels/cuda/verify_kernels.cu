@@ -1528,6 +1528,61 @@ void copy_rows_by_weight(float* dst, const float* src, int64_t rows, int64_t wid
         (float4*) dst, (const volatile float4*) src, width / 4, hit_rows, count, w, heavy, take_heavy ? 1 : 0);
     check("copy_rows_by_weight");
 }
+namespace {
+// iq3b STRATA_DEFER_FUSE: late_add's wait_flag_ge + copy_rows_by_weight (the light rows: take_heavy 0) +
+// defer_add_rows in one launch.  Thread 0 of every block spins on the flag as block_wait_flag_ge does; a row the copy
+// would take is read from the mapped rows, any other is 0 (the copy's zeros); then defer_add_rows_kernel's arithmetic.
+__global__ void late_add_rows_kernel(const volatile uint32_t* flag, uint32_t value, const float* src,
+                                     const int32_t* __restrict__ hit_rows, const int32_t* __restrict__ count,
+                                     const float* __restrict__ w, float heavy, const float* __restrict__ inject,
+                                     float* __restrict__ R, int64_t n_embd, int k, int hc) {
+    if (threadIdx.x == 0) {
+        while (*flag < value) strata_spin_pause();
+        __threadfence_system();
+    }
+    __syncthreads();
+    __threadfence_system();
+    const int64_t t = blockIdx.y;
+    __shared__ unsigned take_mask;
+    if (threadIdx.x == 0) {   // copy_rows_by_weight's per-row test for this token's k rows
+        unsigned m = 0;
+        const int c = *count;
+        for (int j = 0; j < k; ++j) {
+            const int row = (int) t * k + j;
+            int h = 0;
+            for (int i = 0; i < c; ++i) h |= hit_rows[i] == row;
+            if (!h && ((w[row] >= heavy ? 1 : 0) == 0)) m |= 1u << j;
+        }
+        take_mask = m;
+    }
+    __syncthreads();
+    const int64_t d = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= n_embd) return;
+    const unsigned m = take_mask;
+    const float* p = src + t * k * n_embd + d;
+    const float* wt = w + t * k;
+    float s = ((m & 1u) ? p[0] : 0.0f) * wt[0];
+    for (int j = 1; j < k; ++j) s = fmaf(((m >> j) & 1u) ? p[(int64_t) j * n_embd] : 0.0f, wt[j], s);
+    const float* inj = inject + t * hc;
+    float* r = R + t * hc * n_embd + d;
+    for (int c = 0; c < hc; ++c) {
+        const float gw = 2.0f * (1.0f / (1.0f + __expf(-(inj[c] / (float) hc))));
+        r[(int64_t) c * n_embd] = fmaf(s, gw, r[(int64_t) c * n_embd]);
+    }
+}
+}  // namespace
+void late_add_rows_after(const uint32_t* flag, uint32_t value, const float* src, const int32_t* hit_rows,
+                         const int32_t* count, const float* w, float heavy, const float* inject, float* R, int64_t n_embd,
+                         int k, int hc, int n_tok, void* stream) {
+    if (n_tok <= 0 || n_embd <= 0) return;
+    if (k < 1 || k > 32) {
+        std::fprintf(stderr, "late_add_rows_after: 1 <= k <= 32\n");
+        std::exit(1);
+    }
+    late_add_rows_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, (cudaStream_t) stream>>>(
+        (const volatile uint32_t*) flag, value, src, hit_rows, count, w, heavy, inject, R, n_embd, k, hc);
+    check("late_add_rows_after");
+}
 void defer_add_rows(const float* parts, const float* w, const float* inject, float* R, int64_t n_embd, int k, int hc,
                     int n_tok, void* stream) {
     if (n_tok <= 0 || n_embd <= 0) return;

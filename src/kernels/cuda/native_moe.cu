@@ -254,6 +254,71 @@ __global__ void wait_combine_k10_vec4_add_hits(const volatile uint32_t* flag, ui
     sum.w += sh.w;
     output4[c4] = sum;
 }
+// iq3b STRATA_DEFER_FUSE: a deferred layer's post(l) - wait_flag_ge(pflag) + copy_rows_by_weight(the heavy CPU rows,
+// take_heavy) + combine_k10_vec4_add_hits - in one launch.  A GPU row is 0 + its hit row (the copy zeroed it, the combine
+// added the hit), a CPU row of weight >= heavy is read from the mapped rows (the copy's value), any other row is 0 (the
+// copy's zeros); then combine_k10_vec4_add_hits's sum expression for expression.
+__global__ void wait_combine_heavy_k10_vec4_add_hits(const volatile uint32_t* flag, uint32_t value,
+                                                     const float4* cpu4, const float4* __restrict__ hit4,
+                                                     const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
+                                                     const float* __restrict__ weights, float heavy,
+                                                     const float4* __restrict__ shared4, float4* __restrict__ output4,
+                                                     int64_t n4) {
+    if (threadIdx.x == 0) {
+        while (*flag < value) strata_spin_pause();
+        __threadfence_system();
+    }
+    __syncthreads();
+    __threadfence_system();
+    const int64_t tk = blockIdx.y;
+    __shared__ unsigned hit_mask;
+    if (threadIdx.x == 0) {   // which of this token's ten rows the GPU computed (at most 8 tokens x 10 rows listed)
+        unsigned m = 0;
+        const int c = *count;
+        for (int h = 0; h < c; ++h) {
+            const int r = dst[h] - int(tk) * 10;
+            if (r >= 0 && r < 10) m |= 1u << r;
+        }
+        hit_mask = m;
+    }
+    __syncthreads();
+    const unsigned m = hit_mask;
+    cpu4 += tk * 10 * n4;
+    hit4 += tk * 10 * n4;
+    weights += tk * 10;
+    shared4 += tk * n4;
+    output4 += tk * n4;
+    const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c4 >= n4) return;
+    auto part = [&](int e) {
+        if ((m >> e) & 1u) {
+            float4 p = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const float4 h = hit4[int64_t(e) * n4 + c4];
+            p.x += h.x; p.y += h.y; p.z += h.z; p.w += h.w;
+            return p;
+        }
+        if (weights[e] >= heavy) return cpu4[int64_t(e) * n4 + c4];   // copy_rows_by_weight's take (take_heavy)
+        return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    };
+    const float w0 = __ldg(weights + 0);
+    const float4 p0 = part(0);
+    float4 sum = make_float4(p0.x * w0, p0.y * w0, p0.z * w0, p0.w * w0);
+#pragma unroll
+    for (int expert = 1; expert < 10; ++expert) {
+        const float w = __ldg(weights + expert);
+        const float4 p = part(expert);
+        sum.x = fmaf(p.x, w, sum.x);   // as combine_k10_vec4: the first product rounded, then one FMA per expert
+        sum.y = fmaf(p.y, w, sum.y);
+        sum.z = fmaf(p.z, w, sum.z);
+        sum.w = fmaf(p.w, w, sum.w);
+    }
+    const float4 sh = shared4[c4];
+    sum.x += sh.x;
+    sum.y += sh.y;
+    sum.z += sh.z;
+    sum.w += sh.w;
+    output4[c4] = sum;
+}
 bool valid_span(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % alignof(float) == 0 && bytes <= UINTPTR_MAX - address;
@@ -336,6 +401,21 @@ void native_moe_wait_combine_multi_add_hits(const uint32_t* flag, uint32_t value
                                      static_cast<cudaStream_t>(stream)>>>(
         (const volatile uint32_t*) flag, value, reinterpret_cast<const float4*>(cpu_rows),
         reinterpret_cast<const float4*>(hit), dst, count, weights, reinterpret_cast<const float4*>(shared),
+        reinterpret_cast<float4*>(output), n4);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_wait_combine_heavy_multi_add_hits(const uint32_t* flag, uint32_t value, const float* cpu_rows,
+                                                  const float* hit, const int32_t* dst, const int32_t* count,
+                                                  const float* weights, float heavy, const float* shared, float* output,
+                                                  int64_t n_embd, int64_t k, int n_tok, void* stream) {
+    if (!stream || !flag || !dst || !count || !native_moe_wait_combine_ok(cpu_rows, hit, shared, output, n_embd, k, n_tok))
+        throw std::invalid_argument("native MoE wait+combine (heavy rows) requires k 10, 1-8 rows, 16-byte aligned rows and a flag");
+    const int64_t n4 = n_embd >> 2;
+    wait_combine_heavy_k10_vec4_add_hits<<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0,
+                                           static_cast<cudaStream_t>(stream)>>>(
+        (const volatile uint32_t*) flag, value, reinterpret_cast<const float4*>(cpu_rows),
+        reinterpret_cast<const float4*>(hit), dst, count, weights, heavy, reinterpret_cast<const float4*>(shared),
         reinterpret_cast<float4*>(output), n4);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
