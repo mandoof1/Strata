@@ -380,6 +380,8 @@ bool native_fmt(int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err 
 void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
 int native_gu_mt_min(int) { return 2; }
+bool cpu_parity_init(bool, std::string& why) { why = "built without native experts"; return false; }
+bool cpu_parity() noexcept { return false; }
 void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif

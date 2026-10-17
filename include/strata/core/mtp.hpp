@@ -63,6 +63,8 @@ public:
     /// copies made at load/bind - fewer bytes per draft step; drafts only, the verify window decides every token.
     /// (The prompt path's batched K/V pass keeps the Q8_0 originals.)
     void set_q4(bool proj, bool head) { q4_ = proj; q4_head_ = head; }
+    /// iq3b S2: false keeps a copy of the draft head's rows (a main head that is unloaded later, --prefill-head-alias)
+    void set_head_shared(bool on) { head_shared_ok_ = on; }
     /// --mtp-draft-vocab FILE (opt-in; before bind): the draft head's token subset from FILE instead of
     /// rt/draft_vocab.bin (e.g. data/draft_vocab_en.bin, 40K tokens)
     void set_draft_vocab(const std::string& path) { dvocab_path_ = path; }
@@ -78,7 +80,8 @@ public:
     void kv_restore(int64_t upto);
     /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
     /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
-    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
+    /// head_type / head_dev (the main head's; -1 unknown): whether the draft head's rows are read in place (iq3b S2)
+    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, int head_type = -1, int head_dev = -1) const;
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
               const MtpDrafter* shared = nullptr);
@@ -145,6 +148,25 @@ public:
     const int32_t* chain_tok() const { return chain_tok_; }
     const float* chain_prob() const { return chain_prob_; }
 
+    /// STRATA_SPEC_FEAT=1 (measurement; slow): per draft of the last draft() - the runner-up's probability and the entropy
+    /// (nats) of the draft layer's distribution, from its logits copied to the host after each step (-1: not captured)
+    float feat_p2[8] = {}, feat_h[8] = {};
+    static bool feat_env();
+    /// STRATA_SPEC_CUM with STRATA_SPEC_LOOKUP_Q / STRATA_SPEC_DEPTH_DECAY: the next draft() stops where the serve loop's
+    /// window rule will - a draft that equals the suffix lookup's proposal at its place counts `q_agree`, any other
+    /// `p * decay^j`; drafting ends once the product falls below STRATA_SPEC_CUM.  n = 0: the plain product of p.
+    void set_stop_hint(const int32_t* lookup, int n, double q_agree, double decay) {
+        hint_n_ = n < 0 ? 0 : n > 8 ? 8 : n;
+        for (int i = 0; i < hint_n_; ++i) hint_tok_[i] = lookup[i];
+        hint_q_ = q_agree;
+        hint_decay_ = decay;
+    }
+    double stop_q(int j, int32_t tok, float p) const {
+        if (hint_q_ > 0.0 && j < hint_n_ && hint_tok_[j] == tok) return hint_q_;
+        double q = p;
+        for (int i = 0; i < j; ++i) q *= hint_decay_;
+        return q;
+    }
     double ms_draft = 0, ms_prefill = 0;
     double ms_src = 0;      ///< the host time spent staging the source rows (a cross-card copy when the drafter is on another card)
     int64_t n_src = 0;
@@ -214,6 +236,7 @@ private:
     bool make_q4_dense(const std::vector<uint8_t>& blob, std::string& err);
     bool make_q4_head(std::string& err);
     void record_top2(int j);
+    void record_feat(int j, int32_t tok);
     std::vector<int32_t> top2_, dvocab_host_;
     std::vector<float> lg_host_;
     // --pipeline-windows 2 (chain_launch)
@@ -224,6 +247,9 @@ private:
     cudaEvent_t ev_chain_ = nullptr;
     cudaEvent_t ev_step_[8] = {};                       ///< after each of the first n_early outputs
     int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
+    int32_t hint_tok_[8] = {};
+    int hint_n_ = 0;
+    double hint_q_ = 0.0, hint_decay_ = 1.0;
     int32_t chain_tok_[8] = {};
     float chain_prob_[8] = {};
     int64_t n_vocab_ = 0;
@@ -257,6 +283,11 @@ private:
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
+    /// iq3b S2 (STRATA_DRAFT_HEAD_SHARED, default on): dhead_ is the main head's own weights and the subset's rows
+    /// are read through dvocab_ (native_mmvq_rows) - no copy of them
+    bool dhead_in_place_ = false;
+    bool head_shared_ok_ = true;
+    bool head_in_place(int head_type, int head_dev) const;
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;

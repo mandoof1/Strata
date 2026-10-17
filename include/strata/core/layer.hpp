@@ -276,7 +276,10 @@ struct QsaState {
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+/// `indexer = false` (iq3b S3): the state's indexer is never read (the MTP drafter's dense attention), so its pooled
+/// keys keep 2 rows instead of max_cells / idx_block + 2.  qsa_state_init must be given the same.
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
+                         bool indexer = true);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
@@ -324,7 +327,7 @@ inline int qsa_kv_format(const QsaState& st) {
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0, bool indexer = true);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
@@ -332,6 +335,10 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
+/// iq3b design A (STRATA_KV_LEND): `qsa_state_zero` zeroes a mode-0 state's K/V codes and pooled keys only below `cells`
+/// (a multiple of the page and of idx_block; the expert cache's guest slots live above it).  0: every cell (default).
+/// The scales, tail and dead rows are zeroed whole as before.
+void qsa_set_zero_limit(int64_t cells);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //

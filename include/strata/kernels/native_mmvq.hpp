@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -129,6 +130,11 @@ bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
+/// iq3b S2: native_mmvq over a row subset, in place: y[r] = weights row rows[r] . x, bitwise native_mmvq on the
+/// gathered rows (the same kernel and launch geometry).  One column; Q5_K and IQ4_XS (native_mmvq_rows_supported).
+bool native_mmvq_rows_supported(int ggml_type) noexcept;
+void native_mmvq_rows(int ggml_type, const void* weights, const int32_t* rows, const void* x_q8_1, float* y,
+                      int n_in, int n_rows, int ncols, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
@@ -153,5 +159,19 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
 int native_mmvq_il_rows_for(int cc, int ggml_type, int ncols, int n_out);
 // Tests and benchmarks: every native_mmvq_il call takes `rows` a warp (0: the table).
 void native_mmvq_il_tune(int rows);
+// Plain columns: native_mmvq_il with x_il null reads the plain q8_1 columns (x_q8_1) - no native_q8_1_interleave first,
+// bitwise the same output - where the plain-column table (native_mmvq_ilp_rows_for) has a rows count, else native_mmvq.
+bool native_mmvq_ilp_supported(int ggml_type, int ncols, int n_out);
+int native_mmvq_ilp_rows_for(int cc, int ggml_type, int ncols, int n_out);
+// STRATA_MMVQ_IL_PLAIN=1: the verifier interleaves no copy itself - the interleaved copy where the hyper-connection
+// read wrote one (and the head), else the plain columns.
+bool native_mmvq_il_plain();
+// Tests: -1 the call decides (x_il null: the plain columns), 0 / 1 force the interleaved copy / the plain columns.
+void native_mmvq_il_tune_plain(int plain);
+// Debug (STRATA_MMVQ_IL_CHECK=1): check_init (outside any capture) allocates; check compares a producer's interleaved copy
+// with native_q8_1_interleave's of the same q8_1 columns on the stream (capture-safe); report prints the counts.
+bool native_q8_1_il_check_init(int max_in);
+void native_q8_1_il_check(const void* x_q8_1, const void* x_il, int n_in, int ncols, void* stream);
+void native_q8_1_il_check_report();
 
 } // namespace strata::kernels

@@ -10,6 +10,7 @@
 #include "strata/kernels/cpu/nvfp4_avx2.hpp"
 #include "strata/kernels/cpu/nvfp4_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/replica_avx512.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -109,13 +110,43 @@ bool q8k_avx1(int type) {
 }
 }  // namespace
 
+namespace {
+bool g_parity = false;
+}
+
+bool cpu_parity() noexcept { return g_parity; }
+
+bool cpu_parity_init(bool gpu_sexp, std::string& why) {
+    g_parity = false;
+    const char* e = std::getenv("STRATA_CPU_PARITY");
+    if (e == nullptr || e[0] != '1') { why = "off"; return false; }
+    if (!gpu_sexp) { why = "the GPU build's SwiGLU uses __expf (build with -DSTRATA_SWIGLU_SEXP in CMAKE_HIP_FLAGS / CMAKE_CUDA_FLAGS)"; return false; }
+    if (!cpu_avx512_ok()) { why = "the replica needs AVX-512 (VNNI, VBMI)"; return false; }
+    const auto& lay = expert_layout();
+    if (!lay.native) { why = "not a native pack"; return false; }
+    for (size_t l = 0; l < lay.fmt.size(); ++l) {
+        const auto& f = lay.fmt[l];
+        if (!replica::gu_supported(f.gu_type) || !replica::down_supported(f.d_type) || f.n_embd != 2560 || f.n_ff != 640) {
+            why = "layer " + std::to_string(l) + "'s formats (ggml types " + std::to_string(f.gu_type) + "/" +
+                  std::to_string(f.d_type) + ") are not in the replica";
+            return false;
+        }
+    }
+    static_assert(sizeof(replica::ActX) <= kNativeActBytes && sizeof(replica::ActH) <= kNativeHBytes, "replica activations");
+    g_parity = true;
+    why = "on";
+    return true;
+}
+
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (g_parity) { replica::quant_x(x, (int) f.n_embd, *static_cast<replica::ActX*>(dst)); return; }
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     if (q8k_avx1(f.gu_act)) { q8k_quant_avx1(x, dst, f.n_embd); return; }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (g_parity) { replica::quant_h(h, (int) f.n_ff, f.d_type, *static_cast<replica::ActH*>(dst)); return; }
     if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
     if (q8k_avx1(f.d_act)) { q8k_quant_avx1(h, dst, f.n_ff); return; }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
@@ -142,6 +173,10 @@ int native_gu_mt_min(int gu_type) {
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (g_parity) {
+        replica::gu_rows(f.gu_type, nt, blob, f.gu_row, f.up_off, reinterpret_cast<const replica::ActX* const*>(act), ff, r0, r1);
+        return;
+    }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
@@ -232,6 +267,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (g_parity) {
+        replica::down_rows(f.d_type, nt, blob + f.down_off, f.d_row, reinterpret_cast<const replica::ActH* const*>(hq), out, r0, r1);
+        return;
+    }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;

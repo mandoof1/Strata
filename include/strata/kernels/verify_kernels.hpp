@@ -55,11 +55,14 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
-/// wait_flag_ge and copy_i32_from_mapped in ONE launch (143-amdk): thread 0 spins on *flag >= value, the block then
-/// copies dst[0, n) = src[0, n) (mapped host memory, volatile reads).  One kernel node fewer per layer: a dependent
-/// kernel costs ~2.4 us on a gfx1201 graph whatever it does.  n <= 128 * k for any k (a strided loop).
-void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, int64_t n,
+/// STRATA_WAIT_FUSE=1: wait_flag_ge(flag, value) folded into the copy that follows it (one launch, same bytes):
+/// copy_i32_from_mapped, copy_rows_from_mapped and fetch_blobs after the flag.
+void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, long long n,
                                void* stream);
+void wait_copy_rows_from_mapped(const uint32_t* flag, uint32_t value, float* dst, const float* src, int64_t rows,
+                                int64_t width, const int32_t* hit_rows, const int32_t* count, void* stream);
+void wait_fetch_blobs(const uint32_t* flag, uint32_t value, const unsigned long long* src, const int32_t* n, uint8_t* dst,
+                      int64_t blob_bytes, int cap, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
@@ -115,6 +118,11 @@ struct DeferJoinSlots {
 };
 void defer_join_add(const DeferJoinSlots& slots, int m, float* R, int64_t n_embd, int k, int hc, int n_tok,
                     void* stream);
+/// iq3b STRATA_DEFER_FUSE: wait_flag_ge(flag, value) + copy_rows_by_weight(take_heavy = false: the light CPU rows of the
+/// mapped `src`) + defer_add_rows in one launch, bit for bit the three (k <= 32).
+void late_add_rows_after(const uint32_t* flag, uint32_t value, const float* src, const int32_t* hit_rows,
+                         const int32_t* count, const float* w, float heavy, const float* inject, float* R, int64_t n_embd,
+                         int k, int hc, int n_tok, void* stream);
 /// n floats of +0.0 (n a multiple of 4, 16-byte aligned): a kernel node where a memset node would break the window's
 /// kernel-to-kernel chain (pdl.hpp).  Graph-capturable.
 void fill_zero(float* dst, long long n, void* stream);

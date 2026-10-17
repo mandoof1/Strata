@@ -591,6 +591,25 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     return true;
 }
 
+int32_t ExpertCache::add_guest(uint8_t* ptr, int64_t bytes) {
+    if (base_ == nullptr || off_.empty() || ptr == nullptr || bytes <= 0 || bytes > blob_ || segmented() || vmm_) return kNotResident;
+    if (guests_.empty()) dev_off_.assign(off_.begin(), off_.begin() + slots_);
+    guests_.push_back(Guest{ptr, bytes});
+    dev_off_.push_back((uint64_t) ((uintptr_t) ptr - (uintptr_t) base_));
+    return (int32_t) (slots_ + (int64_t) guests_.size() - 1);
+}
+
+int64_t ExpertCache::slot_bytes(int32_t slot) const {
+    if (slot >= 0 && slot < slots_) return off_.empty() ? blob_ : (int64_t) (off_[(size_t) slot + 1] - off_[(size_t) slot]);
+    if (is_guest(slot)) return guests_[(size_t) (slot - slots_)].bytes;
+    return 0;
+}
+
+void ExpertCache::set_resident(int64_t layer, int64_t expert, int32_t slot) {
+    if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return;
+    residency_[(size_t) (layer * n_expert_ + expert)] = slot;
+}
+
 void ExpertCache::close() {
 #if defined(STRATA_USE_HIP)
     if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
@@ -598,6 +617,8 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
+    guests_.clear();
+    dev_off_.clear();
     if (!segs_.empty()) {
         release_segmented();
     } else if (vmm_) {
@@ -656,12 +677,14 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
+    if (is_guest(slot)) return guests_[(size_t) (slot - slots_)].ptr;
     if (slot < 0 || slot >= slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
+    if (is_guest(slot)) return guests_[(size_t) (slot - slots_)].ptr;
     if (slot < 0 || slot >= slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
@@ -669,6 +692,7 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    if (is_guest(slot) && (int64_t) n > slot_bytes(slot)) { err = "ExpertCache::fill_slot: the blob is larger than the guest slot"; return false; }
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
@@ -691,6 +715,7 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    if (is_guest(slot) && (int64_t) n > slot_bytes(slot)) { err = "ExpertCache::fill_slot_blocking: the blob is larger than the guest slot"; return false; }
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
@@ -722,6 +747,7 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    if (is_guest(slot) && (int64_t) n > slot_bytes(slot)) { err = "ExpertCache::fill_slot_queued: the blob is larger than the guest slot"; return false; }
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
@@ -747,7 +773,8 @@ bool ExpertCache::sync_queued(std::string& err) {
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
+    int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
+    if (is_guest(slot) && nb > slot_bytes(slot)) nb = slot_bytes(slot);
     const uint8_t* src = device_slot(slot);
     if (src == nullptr) {
         err = "ExpertCache::verify_slot: slot outside the arena";
