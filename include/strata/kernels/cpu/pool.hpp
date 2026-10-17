@@ -61,6 +61,9 @@ struct ExpertJobMulti {
     float* out[MAXT] = {};
     /// Plan v0.3 P6: a native pack's activations (the layer's `vec_dot_type`), one per token.
     const void* nact[MAXT] = {};
+    /// local (STRATA_ALT_EXPERTS): this job's own format when its blob comes from another pack of the same model
+    /// (run_split_multi_native's `f` otherwise).  Same n_embd / n_ff as `f`; its activations must be of its own types.
+    const NativeFmt* fmt = nullptr;
 };
 
 /// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has

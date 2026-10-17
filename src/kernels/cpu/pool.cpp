@@ -691,13 +691,14 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int code = forder_[i], e = code >> 8, part = code & 127;
             SplitBufMulti& sb = split_multi_[(size_t) e];
             const ExpertJobMulti& jb = mjobs_[e];
+            const NativeFmt& jf = jb.fmt != nullptr ? *jb.fmt : *nfmt_;   // local: STRATA_ALT_EXPERTS
             if ((code & 128) == 0) {
                 const int nf = (int) nfmt_->n_ff, r0 = nf * part / fparts_gu_, r1 = nf * (part + 1) / fparts_gu_;
                 float* ff[MAXT];
                 for (int t = 0; t < jb.nt; ++t) ff[t] = sb.ff[t];
-                native_gu_rows(*nfmt_, jb.blob, jb.nact, jb.nt, ff, r0, r1);
+                native_gu_rows(jf, jb.blob, jb.nact, jb.nt, ff, r0, r1);
                 if (fgu_left_[(size_t) e].fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    for (int t = 0; t < jb.nt; ++t) native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
+                    for (int t = 0; t < jb.nt; ++t) native_quant_h(jf, sb.ff[t], sb.hq[t]);
                     fready_[(size_t) e].store(fbatch_, std::memory_order_release);
                 }
             } else {
@@ -706,7 +707,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int nh = (int) nfmt_->n_embd, r0 = nh * part / fparts_d_, r1 = nh * (part + 1) / fparts_d_;
                 const void* hq[MAXT];
                 for (int t = 0; t < jb.nt; ++t) hq[t] = sb.hq[t];
-                native_down_rows(*nfmt_, jb.blob, hq, jb.nt, jb.out, r0, r1);
+                native_down_rows(jf, jb.blob, hq, jb.nt, jb.out, r0, r1);
             }
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows (the layer's own n_ff / n_embd: Flash-Next's
@@ -717,32 +718,33 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5 && q2_native_kernels(nfmt_->gu_type)) {
+                const NativeFmt& jf = mjobs_[e].fmt != nullptr ? *mjobs_[e].fmt : *nfmt_;   // local: STRATA_ALT_EXPERTS
+                if (mode_ == 5 && q2_native_kernels(jf.gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
                     float* gp[MAXT];
                     float* up[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-                    const int nbk = (int) (nfmt_->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
+                    const int nbk = (int) (jf.n_embd / 64);
+                    q2_rows_any(mjobs_[e].blob, jf.gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
+                    q2_rows_any(mjobs_[e].blob + jf.up_off, jf.gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
                     for (int t = 0; t < mjobs_[e].nt; ++t)
                         for (int r = r0; r < r1; ++r)
                             sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                } else if (q2_native_kernels(nfmt_->d_type)) {
+                    native_gu_rows(jf, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                } else if (q2_native_kernels(jf.d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
+                    q2_rows_any(mjobs_[e].blob + jf.down_off, jf.d_row, (int) (jf.n_ff / 64), a2,
                                 mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 } else {
                     const void* hq[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    native_down_rows(jf, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 }
                 r += r1 - r0;
             }
@@ -862,7 +864,16 @@ static int pool_fused_lag() {
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
     const auto t0 = std::chrono::steady_clock::now();
-    if (pool_fused() && n_ > 1 && !q2_native_kernels(f.gu_type) && !q2_native_kernels(f.d_type)) {
+    // local (STRATA_ALT_EXPERTS): jobs of another pack carry their own format (ExpertJobMulti::fmt)
+    auto job_fmt = [&](int j) -> const NativeFmt& { return jobs[j].fmt != nullptr ? *jobs[j].fmt : f; };
+    bool any_q2 = q2_native_kernels(f.gu_type) || q2_native_kernels(f.d_type);
+    int64_t job_bytes = 0;
+    for (int j = 0; j < n; ++j) {
+        const NativeFmt& jf = job_fmt(j);
+        job_bytes += (int64_t) jf.bytes;
+        if (jobs[j].fmt != nullptr) any_q2 = any_q2 || q2_native_kernels(jf.gu_type) || q2_native_kernels(jf.d_type);
+    }
+    if (pool_fused() && n_ > 1 && !any_q2) {
         for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
             const int nb = (std::min)(kMaxSplitMulti, n - b0);
             mjobs_ = jobs + b0;
@@ -892,7 +903,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ms_multi_gu += ms;
-        multi_bytes += (int64_t) n * (int64_t) f.bytes;
+        multi_bytes += job_bytes;
         ++multi_fused;
         mode_ = 0;
         ms_drain_ += ms;
@@ -908,10 +919,12 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
-        for (int e = 0; e < nb; ++e)
+        for (int e = 0; e < nb; ++e) {
+            const NativeFmt& jf = job_fmt(b0 + e);   // local: STRATA_ALT_EXPERTS
             for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+                if (q2_native_kernels(jf.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                else native_quant_h(jf, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        }
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = phase_tasks(mrows_);
@@ -921,7 +934,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
         ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
     }
-    multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    multi_bytes += job_bytes;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }

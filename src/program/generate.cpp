@@ -4747,6 +4747,10 @@ int main(int argc, char** argv) {
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
+    // local (STRATA_ALT_EXPERTS): a second pack of the same model for the decode's CPU experts (set up below)
+    strata::kernels::cpu::ExpertLayout alt_lay;
+    strata::core::FileExpertSource alt_src;
+    int alt_mode = 0;
     {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
         int dev = 0;
@@ -4905,6 +4909,66 @@ int main(int argc, char** argv) {
             src.set_io_stats(true);
         }
         srcp = &src;
+        // local (STRATA_ALT_EXPERTS=<pack dir>, opt-in, CHANGES THE OUTPUT): a second pack of the SAME model (its own
+        // experts.bin and native_experts.txt, e.g. the IQ2_XS pack beside the IQ3_XXS one; the dense weights are the
+        // primary's).  In the decode's verify windows an expert the CPU computes takes that pack's blob, in that pack's
+        // format: STRATA_ALT_EXPERTS_MODE=cold (default) when the primary blob is not in the page cache, =all always.
+        // STRATA_ALT_EXPERTS_HEAD=<file>: that pack's experts.bin copy on a faster drive (as STRATA_EXPERTS_HEAD).  VRAM
+        // slots, the PCIe share, the adaptive tier, the prompt path and the drafter keep the primary pack.
+        if (const char* ap = std::getenv("STRATA_ALT_EXPERTS"); ap != nullptr && ap[0] != '\0') {
+            const auto& pl = strata::kernels::cpu::expert_layout();
+            const char* mv = std::getenv("STRATA_ALT_EXPERTS_MODE");
+            const int mode = (mv == nullptr || mv[0] == '\0' || std::strcmp(mv, "cold") == 0) ? 1
+                           : std::strcmp(mv, "all") == 0 ? 2 : -1;
+            std::string aerr;
+            bool ok = true;
+            if (mode < 0) { ok = false; aerr = "STRATA_ALT_EXPERTS_MODE is cold or all"; }
+            else if (!pl.native || src.gguf_mode()) { ok = false; aerr = "the primary pack is not a native pack with experts.bin"; }
+            else if (!std::filesystem::exists(std::string(ap) + "/experts.bin")) { ok = false; aerr = "it has no experts.bin"; }
+            else if (!strata::kernels::cpu::expert_layout_read(ap, g.n_layers, g.n_expert, alt_lay, aerr)) ok = false;
+            else if (!alt_lay.native || alt_lay.n_expert != pl.n_expert || alt_lay.fmt.size() != pl.fmt.size()) {
+                ok = false;
+                aerr = "its native_experts.txt is not the model's geometry";
+            }
+            int same = 0;
+            uint64_t pb = 0, ab = 0;
+            for (size_t l = 0; ok && l < pl.fmt.size(); ++l) {
+                if (alt_lay.fmt[l].n_embd != pl.fmt[l].n_embd || alt_lay.fmt[l].n_ff != pl.fmt[l].n_ff) {
+                    ok = false;
+                    aerr = "layer " + std::to_string(l) + "'s expert dimensions differ";
+                }
+                same += alt_lay.fmt[l].gu_type == pl.fmt[l].gu_type && alt_lay.fmt[l].d_type == pl.fmt[l].d_type;
+                pb += pl.bytes[l];
+                ab += alt_lay.bytes[l];
+            }
+            if (ok) {
+                alt_src.set_layout(&alt_lay);
+                const char* ah = std::getenv("STRATA_ALT_EXPERTS_HEAD");
+                alt_src.set_head_path(ah != nullptr ? ah : "");
+                if (const char* v = std::getenv("STRATA_FETCH_THREADS"); v != nullptr && std::atoi(v) > 0)
+                    alt_src.set_fetch_threads(std::atoi(v));
+                ok = alt_src.open(ap, g.n_layers, g.n_expert, aerr);
+            }
+            if (!ok) {
+                std::fprintf(stderr, "strata generate: STRATA_ALT_EXPERTS=%s refused: %s\n", ap, aerr.c_str());
+                return 1;
+            }
+            if (src.io_prefetch()) {
+                const char* th = std::getenv("STRATA_IO_PF_THREADS");
+                alt_src.set_io_prefetch(true, th != nullptr ? std::atoi(th) : 0);
+            } else if (src.io_stats()) {
+                alt_src.set_io_stats(true);
+            }
+            src.set_release_peer(&alt_src);   // a VRAM-held expert's blob in the second pack is dead weight too
+            alt_mode = mode;
+            std::fprintf(stderr, "strata generate: STRATA_ALT_EXPERTS=%s (mode %s, changes the output): the decode's CPU "
+                                 "experts %s from it (%d of %d layers of the same formats; its blobs %.1f%% of the "
+                                 "primary's bytes), io prefetch %s; VRAM, PCIe, the adaptive tier, the prompt and the "
+                                 "drafter keep %s\n", ap, mode == 2 ? "all" : "cold",
+                         mode == 2 ? "all" : "whose primary blob is not in the page cache", same, (int) pl.fmt.size(),
+                         pb > 0 ? 100.0 * (double) ab / (double) pb : 0.0, alt_src.io_prefetch() ? "on" : "off",
+                         o.pack.c_str());
+        }
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
         // Under WDDM (Windows, WSL2), a multi-GPU run (a layer split, or remote experts) starts with at most 8 GiB of
@@ -5807,6 +5871,12 @@ int main(int argc, char** argv) {
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
     drive.d.src = srcp;
+    drive.d.src_file = srcp == &src ? &src : nullptr;
+    if (alt_mode > 0 && srcp == &src) {   // local: STRATA_ALT_EXPERTS (alt_on: the decode's windows only)
+        drive.d.alt = &alt_src;
+        drive.d.alt_lay = &alt_lay;
+        drive.d.alt_mode = alt_mode;
+    }
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
@@ -11338,6 +11408,7 @@ int main(int argc, char** argv) {
                         if (sp.embd_rows[i] != nullptr) return false;
                 return true;
             };
+            drive.d.alt_on = false;   // local (STRATA_ALT_EXPERTS): the prompt's windows keep the primary pack
             // --pipeline-windows, testing: STRATA_PIPELINE_SWITCH=<file> is read at every request, "pw=<0|1|2>
             // theta=<f> force_miss=<k> short_read=<n>" - an A/B of the pipelined and the serial loops (and forced
             // rollbacks) on one server, with the same expert placement
@@ -12014,6 +12085,7 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
+            drive.d.alt_on = drive.d.alt != nullptr;   // local (STRATA_ALT_EXPERTS): the decode's windows
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
             struct DecSnap {
@@ -13281,6 +13353,25 @@ int main(int argc, char** argv) {
                     ic_prev = ic;
                     fb_prev = fb;
                 }
+            }
+            if (drive.d.alt != nullptr) {   // local (STRATA_ALT_EXPERTS): where this request's CPU experts came from
+                drive.d.alt_on = false;
+                static int64_t pj0 = 0, pb0 = 0, aj0 = 0, ab0 = 0;
+                static strata::core::FileExpertSource::IoCounters aic_prev;
+                const strata::core::FileExpertSource::IoCounters aic = alt_src.io_counters();
+                const int64_t pj = drive.d.primary_cpu_jobs - pj0, aj = drive.d.alt_cpu_jobs - aj0;
+                std::fprintf(stderr, "strata serve: alt experts (STRATA_ALT_EXPERTS, mode %s): this request's decode CPU "
+                                     "experts %lld from the primary pack (%.1f MB), %lld from the second pack (%.1f MB, %.1f%% "
+                                     "of them); second pack io: %llu demand reads, %.1f MB read from storage\n",
+                             drive.d.alt_mode == 2 ? "all" : "cold", (long long) pj,
+                             (double) (drive.d.primary_cpu_bytes - pb0) / 1e6, (long long) aj,
+                             (double) (drive.d.alt_cpu_bytes - ab0) / 1e6,
+                             pj + aj > 0 ? 100.0 * (double) aj / (double) (pj + aj) : 0.0,
+                             (unsigned long long) (aic.pf_demand - aic_prev.pf_demand),
+                             (double) (aic.pread_bytes - aic_prev.pread_bytes) / 1e6);
+                pj0 = drive.d.primary_cpu_jobs; pb0 = drive.d.primary_cpu_bytes;
+                aj0 = drive.d.alt_cpu_jobs; ab0 = drive.d.alt_cpu_bytes;
+                aic_prev = aic;
             }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
