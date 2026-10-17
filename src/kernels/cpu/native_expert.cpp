@@ -16,6 +16,7 @@
 #include "ggml-cpu.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -107,6 +108,32 @@ bool q8k_avx2(int type) {
 bool q8k_avx1(int type) {
     static const bool on = !cpu_avx2_ok() && cpu_avx1_ok() && std::getenv("STRATA_NO_Q8K_AVX1") == nullptr;
     return on && type == (int) GGML_TYPE_Q8_K;
+}
+// One token on an AVX-2 CPU without AVX-512 runs ggml-cpu's vec_dot below (the #152 rule).  For IQ3_XXS, IQ3_S and
+// IQ2_S gate/up rows, iq256_gu_single_exact computes that dot's bits with the AVX-2 rows' decode (iq_single_parity:
+// every row, bit for bit), so the output does not change, only the time.  Only where ggml-cpu itself was built for
+// AVX2 and not AVX-512 (ggml_cpu_has_*: a STRATA_ISA_FLOOR build's ggml-cpu runs its AVX1/SSE dots, which round
+// differently) and the CPU has no AVX-512.  Measured on a Ryzen 7 3800X (Zen 2) only;
+// STRATA_CPU_SINGLE_EXACT=0 keeps ggml's vec_dot.
+bool single_exact() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_CPU_SINGLE_EXACT");
+        return (e == nullptr || std::atoi(e) != 0) && cpu_avx2_ok() && !cpu_avx512_ok() && ggml_cpu_has_avx2() &&
+               !ggml_cpu_has_avx512();
+    }();
+    return on;
+}
+// #1415 / #1544, opt-in (STRATA_CPU_IQ_ALL_EXACT1=1): the same for IQ2_XXS and IQ2_XS gate/up rows
+// (iq256_gu_rows_exact_one: ggml's float order, so ggml's bits; iq_single_parity / iq_avx2_parity check every row).
+// With STRATA_CPU_SINGLE_EXACT=0 it also takes IQ3_XXS, IQ3_S and IQ2_S (#1544's kernels instead of #2215's).
+// The same CPU and ggml-build conditions as single_exact.  Measured upstream on an i7-12700KF (IQ3_XXS pack) only.
+bool all_exact1() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_CPU_IQ_ALL_EXACT1");
+        return v != nullptr && v[0] == '1' && v[1] == '\0' && cpu_avx2_ok() && !cpu_avx512_ok() &&
+               ggml_cpu_has_avx2() && !ggml_cpu_has_avx512();
+    }();
+    return on;
 }
 }  // namespace
 
@@ -224,6 +251,21 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     }
     if (avx1 && nt >= mt_min && iq128_supported(f.gu_type)) {
         iq128_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
+    // ggml's own bits for a lone token, faster (single_exact above); STRATA_NO_IQ256 keeps ggml's dot as before
+    if (nt == 1 && avx2 && single_exact() && (f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22)) {
+        iq256_gu_single_exact(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);
+        return;
+    }
+    // #1415 / #1544 (all_exact1 above): only where ggml's dot runs (below the #152 rule, which returned above), so a
+    // token's rows still do not depend on how many tokens share its expert
+    if (nt == 1 && avx2 && all_exact1() &&
+        (f.gu_type == 16 || f.gu_type == 17 ||
+         (!single_exact() && (f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22)))) {
+        static std::once_flag announced;
+        std::call_once(announced, [] { std::fprintf(stderr, "strata ab: GATE=STRATA_CPU_IQ_ALL_EXACT1 active=1\n"); });
+        iq256_gu_rows_exact_one(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);
         return;
     }
     const int n = (int) f.n_embd;

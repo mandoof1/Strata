@@ -47,6 +47,7 @@ struct ExpertLayout;
 namespace strata::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
+class FileExpertSource;
 class RemoteExperts;
 struct LoadStats;
 
@@ -535,6 +536,19 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// local (STRATA_ALT_EXPERTS=<pack>, output-changing): a second pack of the same model.  While `alt_on` (the decode's
+    /// verify windows, not the prompt's), a CPU expert's blob comes from `alt` in its own format (`alt_lay`):
+    /// alt_mode 1 (cold) when the primary blob is not resident in the page cache, 2 (all) always.  VRAM slots, the
+    /// PCIe share, the adaptive tier, the prompt path and the drafter keep the primary pack.
+    FileExpertSource* alt = nullptr;
+    FileExpertSource* src_file = nullptr;                 ///< `src` itself (the mmap tier), for the residency probe
+    const strata::kernels::cpu::ExpertLayout* alt_lay = nullptr;
+    int alt_mode = 0;
+    bool alt_on = false;
+    std::vector<uint8_t> nact_alt;                        ///< MAXT x kNativeActBytes, when the alt format's acts differ
+    std::vector<strata::kernels::cpu::ActQ> act_alt;
+    int64_t alt_cpu_jobs = 0, alt_cpu_bytes = 0;          ///< CPU experts (distinct per layer-window) from `alt`
+    int64_t primary_cpu_jobs = 0, primary_cpu_bytes = 0;  ///< ... and from the primary pack (while alt_on)
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).
@@ -611,6 +625,15 @@ public:
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
     /// CS-T: the --native shard (native_experts.txt names the other files beside it); see `open`.
     void set_gguf(const std::string& native) { gguf_ = native; }
+    /// local (STRATA_ALT_EXPERTS): open() takes this layout (a second pack of the same model) instead of the loaded
+    /// expert_layout(), and this head copy instead of STRATA_EXPERTS_HEAD's ("" = none).  Before open().
+    void set_layout(const strata::kernels::cpu::ExpertLayout* lay) { lay_override_ = lay; }
+    void set_head_path(const std::string& path) { head_override_ = path; head_override_set_ = true; }
+    /// local (STRATA_ALT_EXPERTS): release() trims the same expert's pages in this source too (its other pack's blob)
+    void set_release_peer(FileExpertSource* peer) { release_peer_ = peer; }
+    /// local (STRATA_ALT_EXPERTS): whether the expert's blob is resident in the page cache, the io prefetch's sampled
+    /// probe (first, last and two inner pages); true where a RAM copy or exchange buffer holds it
+    bool blob_resident(int64_t layer, int64_t expert) const;
     /// Whether the experts are read from the GGUF shards in place (no experts.bin).
     bool gguf_mode() const { return !role_ptr_.empty(); }
     /// Pin a compact host mirror of experts absent from a fully filled static GPU cache. The mmap remains open
@@ -1011,6 +1034,10 @@ private:
     int head_fd_ = -1, io_head_fd_ = -1;
     std::string head_path_;
 #endif
+    const strata::kernels::cpu::ExpertLayout* lay_override_ = nullptr;   ///< local: STRATA_ALT_EXPERTS
+    std::string head_override_;
+    bool head_override_set_ = false;
+    FileExpertSource* release_peer_ = nullptr;
     bool unmapped_ = false;   ///< pp-opt: drop_mapping closed the view (base_ stays as the "opened" mark only)
     bool startup_ub_ = false;                 ///< begin_startup_unbuffered: until end_startup_unbuffered
     uint64_t startup_blob_bytes_ = 0, startup_us_ = 0;   ///< the staged reads' counters at its begin (put back at the end)

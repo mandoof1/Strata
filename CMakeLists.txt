@@ -1375,11 +1375,17 @@ if(STRATA_NATIVE_EXPERTS)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
   add_executable(router_dot_parity src/kernels/cpu/router_dot_parity.cpp)
   target_link_libraries(router_dot_parity PRIVATE strata_kernels_cpu)
+  # local (STRATA_ALT_EXPERTS): jobs of two packs' formats in one native pool call, bitwise against separate calls
+  add_executable(pool_mixed_fmt_test src/kernels/cpu/pool_mixed_fmt_test.cpp)
+  target_link_libraries(pool_mixed_fmt_test PRIVATE strata_kernels_cpu)
   if(STRATA_BUILD_TESTS)
     add_executable(pool_tasks_test src/kernels/cpu/pool_tasks_test.cpp)
     target_link_libraries(pool_tasks_test PRIVATE strata_kernels_cpu)
     add_test(NAME pool_tasks_test COMMAND pool_tasks_test)
     set_tests_properties(pool_tasks_test PROPERTIES TIMEOUT 180)
+    add_test(NAME pool_mixed_fmt_test COMMAND pool_mixed_fmt_test)
+    add_test(NAME pool_mixed_fmt_test_fused COMMAND ${CMAKE_COMMAND} -E env STRATA_POOL_FUSED=1 $<TARGET_FILE:pool_mixed_fmt_test>)
+    set_tests_properties(pool_mixed_fmt_test pool_mixed_fmt_test_fused PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME router_dot_parity COMMAND router_dot_parity)
     add_test(NAME router_dot_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:router_dot_parity>)
   endif()
@@ -1390,9 +1396,25 @@ if(STRATA_NATIVE_EXPERTS)
   # MODEL-UPDATE: the pool's expert rows per format on T threads against the RAM bandwidth (a benchmark, no test)
   add_executable(kq_cpu_bench src/kernels/cpu/kq_cpu_bench.cpp)
   target_link_libraries(kq_cpu_bench PRIVATE strata_kernels_cpu)
+  # the real ExpertPool at decode's batch size (one layer's CPU experts a call), with an output hash: its batching
+  # against kq_cpu_bench, and STRATA_POOL_FUSED against the phases
+  add_executable(pool_layer_bench src/kernels/cpu/pool_layer_bench.cpp)
+  target_link_libraries(pool_layer_bench PRIVATE strata_kernels_cpu)
   if(STRATA_BUILD_TESTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
+  endif()
+  # one token's gate/up rows on an AVX-2 CPU without AVX-512 (iq256_gu_single_exact and native_gu_rows at nt = 1)
+  # bit for bit against ggml-cpu's AVX2 vec_dot; exit 77 (skipped) on other CPUs or builds
+  add_executable(iq_single_parity src/kernels/cpu/iq_single_parity.cpp)
+  target_link_libraries(iq_single_parity PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME iq_single_parity COMMAND iq_single_parity)
+    add_test(NAME iq_single_parity_off COMMAND ${CMAKE_COMMAND} -E env STRATA_CPU_SINGLE_EXACT=0 $<TARGET_FILE:iq_single_parity>)
+    # #1415 / #1544: IQ2_XXS / IQ2_XS through the dispatch, and all five with #2215's kernel off
+    add_test(NAME iq_single_parity_all1 COMMAND ${CMAKE_COMMAND} -E env STRATA_CPU_IQ_ALL_EXACT1=1 $<TARGET_FILE:iq_single_parity>)
+    add_test(NAME iq_single_parity_all1_off COMMAND ${CMAKE_COMMAND} -E env STRATA_CPU_IQ_ALL_EXACT1=1 STRATA_CPU_SINGLE_EXACT=0 $<TARGET_FILE:iq_single_parity>)
+    set_tests_properties(iq_single_parity iq_single_parity_off iq_single_parity_all1 iq_single_parity_all1_off PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # the older CPUs' AVX1 expert rows (iq_avx1.cpp) against ggml-cpu's dots and against their own one-token
   # rows at every width; --bench: ms per expert, the weights streamed from DRAM.  Runs on any AVX CPU:

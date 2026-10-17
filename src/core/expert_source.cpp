@@ -971,7 +971,7 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
-    const auto& layout = strata::kernels::cpu::expert_layout();
+    const auto& layout = lay_override_ != nullptr ? *lay_override_ : strata::kernels::cpu::expert_layout();
     if (layout.n_layers != n_layers || layout.n_expert != n_expert) {
         err = "FileExpertSource: the requested geometry does not match the loaded expert layout";
         return false;
@@ -1130,7 +1130,9 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     // (from offset N) over the rest, so every blob pointer, mincore and madvise works as before; the I/O threads read
     // a blob's bytes from whichever file backs them (spans).  16 pages spread over the head are compared with
     // experts.bin first: a stale or foreign copy is refused and everything is read from experts.bin.
-    if (const char* hp = std::getenv("STRATA_EXPERTS_HEAD"); hp != nullptr && hp[0] != '\0') {
+    // local (STRATA_ALT_EXPERTS): a second pack names its own head copy (set_head_path), never the primary's
+    const char* head_env = head_override_set_ ? head_override_.c_str() : std::getenv("STRATA_EXPERTS_HEAD");
+    if (const char* hp = head_env; hp != nullptr && hp[0] != '\0') {
         const int hfd = ::open(hp, O_RDONLY);
         struct stat hs{};
         std::string why;
@@ -1640,6 +1642,15 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
     const bool ok = fill_stage(v, layer, expert, dst);
     crit();
     return ok ? dst : nullptr;
+}
+
+bool FileExpertSource::blob_resident(int64_t layer, int64_t expert) const {
+    if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return false;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (complement_ready_ && resident_blob(index) != nullptr) return true;
+    if (!override_.empty() && override_[index] != nullptr) return true;
+    uint64_t total = 0;
+    return cached_bytes(layer, expert, total, false) >= total && total > 0;
 }
 
 bool FileExpertSource::cold(int64_t layer, int64_t expert) const {
@@ -2848,6 +2859,8 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
 }
 
 uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
+    // local (STRATA_ALT_EXPERTS): the expert's blob in the other pack is just as dead while the GPU holds it
+    if (release_peer_ != nullptr) (void) release_peer_->release(layer, expert);
 #if defined(_WIN32)
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_FILE_RELEASE");
@@ -4086,7 +4099,9 @@ void defer_cold_service(ExpertDispatch& d, const GpuPlanSink& ps, bool native) {
     take.assign(q.size(), 0);
     for (size_t i = 0; i < q.size(); ++i) {
         const bool due = q[i].deadline <= join;
-        const bool landed = d.src->read_landed(q[i].layer, q[i].expert);
+        // iq3all (STRATA_ALT_EXPERTS): a second-pack job's read is that source's
+        const bool landed = (q[i].job.fmt != nullptr && d.alt != nullptr ? (const ExpertSource*) d.alt : d.src)
+                                ->read_landed(q[i].layer, q[i].expert);
         take[i] = due || landed;
         if (due && !landed) ++d.defer_waited;
     }
@@ -4179,6 +4194,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
     if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
+    // local (STRATA_ALT_EXPERTS): this layer's CPU experts may come from the second pack, in its own format
+    const bool alt_active = native && d.alt != nullptr && d.src_file != nullptr && d.alt_lay != nullptr && d.alt_on && d.alt_mode > 0 &&
+                            d.layers >= 0 && (size_t) d.layers < d.alt_lay->fmt.size();
+    const NativeFmt* afmt = alt_active ? &d.alt_lay->fmt[(size_t) d.layers] : nullptr;
+    static thread_local std::vector<char> alt_pick;   // per expert of this layer: its CPU job reads the second pack
+    if (alt_active && alt_pick.size() < (size_t) d.n_expert) alt_pick.assign((size_t) d.n_expert, 0);
+    bool alt_any = false, alt_own_act = false;
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
@@ -4188,6 +4210,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c0 = std::chrono::steady_clock::now();
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
+    if (alt_active) d.alt->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
@@ -4303,7 +4326,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                         if (qof[i] == q && per_tok[i / k] >= csk.max) fits = false;
                     if (!fits) { ++d.cold_skip_capped; continue; }
                     const int32_t e = ids[distinct[q]];
-                    const int pc = d.src->probe_cold(d.layers, e);
+                    // iq3all (STRATA_ALT_EXPERTS): cold where the expert would be read from - the second pack in mode
+                    // all, and in mode cold the second pack once the primary blob is cold
+                    int pc = alt_active && d.alt_mode == 2 ? d.alt->probe_cold(d.layers, e) : d.src->probe_cold(d.layers, e);
+                    if (alt_active && d.alt_mode == 1 && pc == 1) pc = d.alt->probe_cold(d.layers, e);
                     if (pc < 0) {
                         static std::atomic<bool> said{false};
                         if (!said.exchange(true))
@@ -4469,7 +4495,37 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
-        if (npr > 0) {   // local (cold-skip): the misses probe_cold already answered for are not probed again
+        if (alt_active) {
+            // local (STRATA_ALT_EXPERTS): mode 2 (all) takes every CPU expert from the second pack, mode 1 (cold) the
+            // ones whose primary blob the page cache does not hold (the io prefetch's own sampled probe), BEFORE either
+            // source sends a read to the drive
+            static thread_local std::vector<int64_t> miss_a;
+            miss_a.clear();
+            size_t w = 0;
+            for (const int64_t e : miss) {
+                const bool a = d.alt_mode == 2 || !d.src_file->blob_resident(d.layers, e);
+                alt_pick[(size_t) e] = a ? 1 : 0;
+                if (a) miss_a.push_back(e);
+                else miss[w++] = e;
+            }
+            miss.resize(w);
+            alt_any = !miss_a.empty();
+            if (alt_any) d.alt->prefetch(d.layers, miss_a.data(), (int64_t) miss_a.size());
+            if (alt_any) {   // the second pack's activations, where its gate/up format takes other ones
+                const NativeFmt& pf = lay.fmt[(size_t) d.layers];
+                const bool p_q2 = q2_native_kernels(pf.gu_type), a_q2 = q2_native_kernels(afmt->gu_type);
+                alt_own_act = p_q2 != a_q2 || (!p_q2 && pf.gu_act != afmt->gu_act);
+                if (alt_own_act) {
+                    if (d.nact_alt.size() < (size_t) MAXT * kNativeActBytes) d.nact_alt.resize((size_t) MAXT * kNativeActBytes);
+                    if (d.act_alt.size() < (size_t) MAXT) d.act_alt.resize((size_t) MAXT);
+                    for (int64_t t = 0; t < n_tok; ++t) {
+                        if (a_q2) act_quant_any(x_f + (size_t) t * H, H, d.act_alt[(size_t) t]);
+                        else native_quant_act(*afmt, x_f + (size_t) t * H, d.nact_alt.data() + (size_t) t * kNativeActBytes);
+                    }
+                }
+            }
+        }
+        if (npr > 0 && !alt_active) {   // local (cold-skip; iq3all: not with STRATA_ALT_EXPERTS, whose probes differ): the misses probe_cold already answered for are not probed again
             static thread_local std::vector<int8_t> known;
             known.assign(miss.size(), (int8_t) -1);
             for (size_t m = 0; m < miss.size(); ++m)
@@ -4477,12 +4533,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     if (pr_e[r] == miss[m]) { known[m] = pr_c[r]; break; }
             d.src->prefetch_probed(d.layers, miss.data(), (int64_t) miss.size(), known.data());
         } else
-        d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+            d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
     // local (cold-skip): the skipped cold blobs into the page cache in the background, queued after this layer's demand
     // reads so they never go before them
-    for (int w = 0; w < nwarm; ++w)
-        if (d.src->warm_background(d.layers, warm_e[w])) ++d.cold_skip_warm;
+    for (int w = 0; w < nwarm; ++w)   // (iq3all: with STRATA_ALT_EXPERTS the second pack's blob, where it would be read)
+        if ((alt_active ? (ExpertSource*) d.alt : d.src)->warm_background(d.layers, warm_e[w])) ++d.cold_skip_warm;
     int njobs = 0;
     static thread_local std::vector<int64_t> job_e;   // local (io-prio): each job's expert, for the cold-last order
     if (job_e.size() < (size_t) d.n_expert) job_e.resize((size_t) d.n_expert);
@@ -4516,8 +4572,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
+            const bool use_alt = alt_any && alt_pick[(size_t) e] != 0;   // local: STRATA_ALT_EXPERTS
             if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
+                const uint8_t* b = use_alt ? d.alt->blob(d.layers, e) : d.src->blob(d.layers, e);
                 if (b == nullptr) {
                     d.failed = true;
                     d.fail = "the expert source could not produce a blob";
@@ -4531,10 +4588,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
+                nj.fmt = use_alt ? afmt : nullptr;   // the jobs are reused: always set
+                if (alt_active) {
+                    if (use_alt) { ++d.alt_cpu_jobs; d.alt_cpu_bytes += (int64_t) afmt->bytes; }
+                    else { ++d.primary_cpu_jobs; d.primary_cpu_bytes += (int64_t) lay.blob_bytes(d.layers); }
+                }
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-            jb.act[jb.nt] = &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+            const bool own_act = use_alt && alt_own_act;
+            jb.act[jb.nt] = own_act ? &d.act_alt[(size_t) t] : &d.act_multi[(size_t) t];
+            jb.nact[jb.nt] = !native ? nullptr
+                           : own_act ? d.nact_alt.data() + (size_t) t * kNativeActBytes
+                                     : d.nact_multi.data() + (size_t) t * kNativeActBytes;
             jb.out[jb.nt] = row;
             ++jb.nt;
             ++d.multi_entries;
@@ -4575,8 +4640,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int slot = here ? (int) (d.layers % ps->defer_ring) : 0;
         bool saved = false;
         for (int j = 0; j < njobs; ++j) {
-            if (!d.src->cold(d.layers, job_e[(size_t) j])) continue;
             ExpertJobMulti& jb = d.jobs_multi[(size_t) j];
+            // iq3all (STRATA_ALT_EXPERTS): the job's own source; a second-pack job whose activations are its own (not
+            // saved in the ring) stays in its layer
+            if (!(jb.fmt != nullptr ? (const ExpertSource*) d.alt : d.src)->cold(d.layers, job_e[(size_t) j])) continue;
+            if (jb.fmt != nullptr && alt_own_act) continue;
             if (!here) { d.defer_rows_by[0] += jb.nt; continue; }   // waited for in its own layer
             if (!saved) {   // the layer's activations, for whenever the job runs
                 if (d.defer_act.size() < (size_t) ps->defer_ring * MAXT) d.defer_act.resize((size_t) ps->defer_ring * MAXT);
@@ -4627,7 +4695,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }();
         if (defer_cold_last) {
             bool cold_job[kMaxWindowEntries];
-            for (int j = 0; j < njobs; ++j) cold_job[j] = d.src->cold(d.layers, job_e[(size_t) j]);
+            for (int j = 0; j < njobs; ++j)   // (iq3all: each job's own source, STRATA_ALT_EXPERTS)
+                cold_job[j] = (d.jobs_multi[(size_t) j].fmt != nullptr ? (const ExpertSource*) d.alt : d.src)->cold(d.layers, job_e[(size_t) j]);
             for (int pass = 0; pass < 2; ++pass) {
                 int n_cold = 0, n_pass = 0;
                 for (int c = 0; c < 2; ++c)   // the pass's cached jobs, then its cold ones, each in routing order
@@ -4653,15 +4722,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // job writes only its own rows, so the order changes no bit.  STRATA_COLD_LAST=0 keeps the routing order.
     static const bool cold_last = [] { const char* v = std::getenv("STRATA_COLD_LAST"); return v == nullptr || std::atoi(v) != 0; }();
     if (cold_last && njobs > 1) {
+        // local (STRATA_ALT_EXPERTS): a job of the second pack asks that source whether its read went to the drive
+        static thread_local std::vector<char> jcold;
+        jcold.assign((size_t) njobs, 0);
         int n_cold = 0;
-        for (int j = 0; j < njobs; ++j) n_cold += d.src->cold(d.layers, job_e[(size_t) j]) ? 1 : 0;
+        for (int j = 0; j < njobs; ++j) {
+            const ExpertSource* js = d.jobs_multi[(size_t) j].fmt != nullptr ? (const ExpertSource*) d.alt : d.src;
+            jcold[(size_t) j] = js->cold(d.layers, job_e[(size_t) j]) ? 1 : 0;
+            n_cold += jcold[(size_t) j];
+        }
         if (n_cold > 0 && n_cold < njobs) {
             static thread_local std::vector<ExpertJobMulti> tmp;
             tmp.assign(d.jobs_multi.begin(), d.jobs_multi.begin() + njobs);
             int w = 0;
             for (int pass = 0; pass < 2; ++pass)
                 for (int j = 0; j < njobs; ++j)
-                    if (d.src->cold(d.layers, job_e[(size_t) j]) == (pass == 1)) d.jobs_multi[(size_t) w++] = tmp[(size_t) j];
+                    if ((jcold[(size_t) j] != 0) == (pass == 1)) d.jobs_multi[(size_t) w++] = tmp[(size_t) j];
             d.cold_last_moved += n_cold;
         }
     }
@@ -4703,7 +4779,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_run += ms(c3, c4);
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
-        if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
+        if (e >= 0 && e < d.n_expert) {
+            d.job_of[(size_t) e] = -1;
+            if (alt_active) alt_pick[(size_t) e] = 0;
+        }
     }
     d.multi_misses += njobs;
     ++d.layers;

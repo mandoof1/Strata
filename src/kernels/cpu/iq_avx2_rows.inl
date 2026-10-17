@@ -28,6 +28,61 @@ STRATA_ROWS_FN inline __m256i dot4u(__m256i u8, __m256i s8) {
 #endif
 }
 
+// ---- #1415 / #1544: one token's gate/up rows in ggml's own float order (iq256_gu_rows_exact_one), ported onto #2215.
+// ggml's AVX2 single-token dots (ggml-cpu/arch/x86/quants.c) take d = x.d * y.d per block, one fmadd per block and
+// multiply by the format's constant after hsum_float_8; the integer sums are the same in any order.  So a lone token
+// gets ggml's bits (iq_avx2_parity, iq_single_parity and native_expert_parity check every row).
+STRATA_ROWS_FN inline float ggml_hsum8(__m256 x) {
+    __m128 s = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+template <int NT, bool GGML = false> STRATA_ROWS_FN
+inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res);
+
+template <int TY> STRATA_ROWS_FN
+inline float row_dot_ggml_one(const uint8_t* row, int nblocks, const block_q8_K* y) {
+    if constexpr (TY == 17) {   // IQ2_XS: the vectorized sign decode below, in ggml's float order
+        const block_q8_K* act[1] = {y};
+        float result = 0.0f;
+        row_dot_iq2xs<1, true>(row, nblocks, act, &result);
+        return result;
+    } else {
+        __m256 accum = _mm256_setzero_ps();
+        const int pf = prefetch_distance();
+        for (int i = 0; i < nblocks; ++i) {
+            const uint8_t* blk = row + (size_t) i * Fmt32<TY>::bytes;
+            rows_ahead(blk, pf);
+            __m256i sums[2] = {_mm256_setzero_si256(), _mm256_setzero_si256()};
+            for (int j = 0; j < 4; ++j)
+                for (int half = 0; half < 2; ++half) {
+                    __m256i g, sign, scale;
+                    Fmt32<TY>::decode(blk, j, half, g, sign, scale);
+                    const __m256i act = _mm256_loadu_si256((const __m256i*) (y[i].qs + 64 * j + 32 * half));
+                    const __m256i signed_act = _mm256_sign_epi8(act, sign);
+                    sums[half] = madd_add(sums[half], _mm256_maddubs_epi16(g, signed_act), scale);
+                }
+            const float d = h2f(u16(blk)) * y[i].d;
+            accum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sums[0], sums[1])), accum);
+        }
+        if constexpr (TY == 16 || TY == 22 || TY == 122) return 0.125f * ggml_hsum8(accum);
+        else if constexpr (TY == 18 || TY == 118) return 0.25f * ggml_hsum8(accum);
+        else return ggml_hsum8(accum);
+    }
+}
+
+template <int TY> STRATA_ROWS_FN
+void gu_ggml_one(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const block_q8_K* y, float* ff,
+                 int r0, int r1) {
+    for (int r = r0; r < r1; ++r) {
+        const float g = row_dot_ggml_one<TY>(blob + (size_t) r * gu_row, n / QK_K, y);
+        const float u = row_dot_ggml_one<TY>(blob + up_off + (size_t) r * gu_row, n / QK_K, y);
+        ff[r] = (g / (1.f + std::exp(-g))) * u;
+    }
+}
+
 template <int TY, int NT> STRATA_ROWS_FN
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     const int pf = prefetch_distance();
@@ -63,7 +118,7 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
 // 32-byte load.  The 8 scale bytes become all 16 half-scales with ggml's unpack trick.  The grid lookups
 // stay scalar loads into set_epi64x (ggml does the same).  Every token still only pays a load, a sign,
 // a maddubs, a madd and an add per half, into alternating accumulators.
-template <int NT> STRATA_ROWS_FN
+template <int NT, bool GGML> STRATA_ROWS_FN
 inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     static const uint8_t bit_sel[32] = {
         1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80, 1, 2, 4, 8, 16, 32, 64, (uint8_t) 0x80,
@@ -137,12 +192,19 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
                 }
             }
         }
-        const float dx = h2f(u16(blk)) * 0.125f;
-        for (int t = 0; t < NT; ++t)
-            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d),
-                _mm256_cvtepi32_ps(_mm256_add_epi32(acc[t][0], acc[t][1])), accf[t]);
+        if constexpr (GGML) {   // ggml's order: d = x.d * y.d per block, 0.125 after hsum_float_8 (below)
+            const float dx = h2f(u16(blk));
+            for (int t = 0; t < NT; ++t)
+                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d),
+                    _mm256_cvtepi32_ps(_mm256_add_epi32(acc[t][0], acc[t][1])), accf[t]);
+        } else {
+            const float dx = h2f(u16(blk)) * 0.125f;
+            for (int t = 0; t < NT; ++t)
+                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d),
+                    _mm256_cvtepi32_ps(_mm256_add_epi32(acc[t][0], acc[t][1])), accf[t]);
+        }
     }
-    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+    for (int t = 0; t < NT; ++t) res[t] = GGML ? 0.125f * ggml_hsum8(accf[t]) : hsum8(accf[t]);
 }
 
 template <int TY, int NT> STRATA_ROWS_FN
