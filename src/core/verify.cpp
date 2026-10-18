@@ -1086,6 +1086,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // host computing layer dl while the GPU runs layer dl+1)
     auto late_add = [&](int64_t dl, int grp) {
         const int tb = tb_[grp], n = te_[grp] - tb_[grp];
+        // local (cvec-defer): in pre(dl + 1) the vector has already projected layer dl's output, so the rows are
+        // projected as they join; in post(dl) (=check) its projection still comes after them
+        const bool proj = !defer_check_ && cvec().covers(dl);
         const uint32_t ring_d = (uint32_t) ((dl - lb_) * G + grp + 1);
         const int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);   // counts | start | dst: layer dl's plan
         const float* ym = m_ymiss_ + (size_t) tb * K * N;
@@ -1094,7 +1097,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             copy_or_zero_from_mapped(def_parts_, ym, (long long) n * K * N, skip_ + grp, ring_d, cs);
         } else {
 #if !defined(STRATA_GPU_METAL)
-            if (heavy && g_defer_fuse && !prof_on_) {   // iq3b: the wait, the light rows' copy and the add in one launch
+            if (heavy && g_defer_fuse && !prof_on_ && !proj) {   // iq3b: the wait, the light rows' copy and the add in one launch
                 late_add_rows_after(m_flag_, ring_d, ym, pl + 4 + MT * K + 1, pl + 1, w_ + tb * K, defer_heavy_,
                                     inj2_ + tb * HC, Rt(tb), N, (int) K, (int) HC, n, cs);
                 return;
@@ -1113,7 +1116,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_from_mapped(def_parts_, ym, (int64_t) n * K * N, cs);
         }
 #if !defined(STRATA_GPU_METAL)   // (the Metal window is metal/src/engine/window.cpp: no deferral, no entry point there)
-        defer_add_rows(def_parts_, w_ + tb * K, inj2_ + tb * HC, Rt(tb), N, (int) K, (int) HC, n, cs);
+        if (proj) defer_add_rows_proj(def_parts_, w_ + tb * K, inj2_ + tb * HC, Rt(tb), N, (int) K, (int) HC, n, (int) dl, cs);
+        else defer_add_rows(def_parts_, w_ + tb * K, inj2_ + tb * HC, Rt(tb), N, (int) K, (int) HC, n, cs);
 #endif
     };
     // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
@@ -1711,8 +1715,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 sl.w_save = dwsave_ + slot * (size_t) dslot_rows_;
                 sl.inj_save = disave_ + slot * (size_t) (dslot_rows_ / K) * HC;
             }
-            if (sl.n > 0)
-                defer_join_add(sl, (int) l, Rt(tb_[grp]), N, (int) K, (int) HC, te_[grp] - tb_[grp], cs);
+            // local (cvec-defer): rows that skipped a projecting vector's layers are projected through them as they join
+            bool proj = false;
+            for (int64_t s = l - 1; s >= lb_ && s >= l - defer_cold_k_; --s) proj = proj || cvec().covers(s);
+            if (sl.n > 0) {
+                if (proj) defer_join_add_proj(sl, (int) l, Rt(tb_[grp]), N, (int) K, (int) HC, te_[grp] - tb_[grp], cs);
+                else defer_join_add(sl, (int) l, Rt(tb_[grp]), N, (int) K, (int) HC, te_[grp] - tb_[grp], cs);
+            }
         }
 #endif
         stamp(l, 16, grp);
@@ -2286,9 +2295,9 @@ bool Verifier::defer_ok(int T, std::string* why) const {
     const bool ple_layer0 = lb_ == 0 && ss_->ple.ready() && ple_stage();
     if (le_ - 1 - lb_ - (ple_layer0 ? 1 : 0) < 1) return no("no layer of the stage to defer");
     // (STRATA_FUSE_HEAD_GR changes only the last layer's write, which is never deferred)
-    const strata::kernels::Cvec& cv = strata::kernels::cvec();
-    for (int64_t l = lb_; l < le_; ++l)
-        if (cv.covers(l)) return no("a control vector covers a layer of the stage");
+    // local (cvec-defer): a control vector no longer turns deferral off.  An additive one is applied at the layer's end
+    // whatever joins later; a projecting one also projects the late rows when they join (defer_add_rows_proj,
+    // defer_join_add_proj), which gives the on-time residual up to rounding.
     return true;
 }
 

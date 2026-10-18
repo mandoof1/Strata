@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/cvec.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
@@ -1650,6 +1651,171 @@ void defer_join_add(const DeferJoinSlots& slots, int m, float* R, int64_t n_embd
     defer_join_add_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, (cudaStream_t) stream>>>(
         slots, m, R, n_embd, k, hc, n_tok);
     check("defer_join_add");
+}
+
+namespace {
+// local (cvec-defer): one block of 256 threads per token, each thread holding columns tid + 256 j (j < 16: n_embd up
+// to 4096) between the row sum, the projections (cvec.cu's reduction: warp sums, then the warps' partials) and the add
+constexpr int kCvdThreads = 256;
+constexpr int kCvdCols = 16;
+
+__device__ __forceinline__ float cvd_block_sum(float v, float* part) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = v;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float p = threadIdx.x < kCvdThreads / 32 ? part[threadIdx.x] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffffu, p, o);
+        if (threadIdx.x == 0) part[kCvdThreads / 32] = p;
+    }
+    __syncthreads();
+    const float r = part[kCvdThreads / 32];
+    __syncthreads();   // `part` is reused by the next sum
+    return r;
+}
+
+// x <- x - s_l (x . v_l) v_l, as cvec_kernel projects a stream; a layer outside [first, last] or without a direction
+// (s_l = 0) is skipped (both uniform over the block)
+__device__ __forceinline__ void cvd_project(float (&x)[kCvdCols], int n, const float* __restrict__ dir,
+                                            const float* __restrict__ s_l, int layer, int first, int last, float* part) {
+    if (layer < first || layer > last) return;
+    const float s = s_l[layer];
+    if (s == 0.0f) return;
+    const float* v = dir + (int64_t) layer * n;
+    float dot = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kCvdCols; ++j) {
+        const int d = threadIdx.x + j * kCvdThreads;
+        if (d < n) dot = fmaf(x[j], v[d], dot);
+    }
+    dot = cvd_block_sum(dot, part) * s;
+#pragma unroll
+    for (int j = 0; j < kCvdCols; ++j) {
+        const int d = threadIdx.x + j * kCvdThreads;
+        if (d < n) x[j] = fmaf(-dot, v[d], x[j]);
+    }
+}
+
+// x added to every stream with the inject gate (defer_add_rows_kernel's write)
+__device__ __forceinline__ void cvd_add(const float (&x)[kCvdCols], const float* __restrict__ inj, float* __restrict__ r,
+                                        int n, int hc) {
+    for (int c = 0; c < hc; ++c) {
+        const float gw = 2.0f * (1.0f / (1.0f + __expf(-(inj[c] / (float) hc))));
+#pragma unroll
+        for (int j = 0; j < kCvdCols; ++j) {
+            const int d = threadIdx.x + j * kCvdThreads;
+            if (d < n) r[(int64_t) c * n + d] = fmaf(x[j], gw, r[(int64_t) c * n + d]);
+        }
+    }
+}
+
+__global__ void defer_add_rows_proj_kernel(const float* __restrict__ parts, const float* __restrict__ w,
+                                           const float* __restrict__ inject, float* __restrict__ R, int n, int k, int hc,
+                                           const float* __restrict__ dir, const float* __restrict__ s_l,
+                                           const int* __restrict__ on, int first, int last, int layer) {
+    __shared__ float part[kCvdThreads / 32 + 1];
+    const int64_t t = blockIdx.x;
+    const float* p = parts + t * k * n;
+    const float* wt = w + t * k;
+    float x[kCvdCols] = {};
+#pragma unroll
+    for (int j = 0; j < kCvdCols; ++j) {
+        const int d = threadIdx.x + j * kCvdThreads;
+        if (d >= n) continue;
+        float s = p[d] * wt[0];
+        for (int e = 1; e < k; ++e) s = fmaf(p[(int64_t) e * n + d], wt[e], s);
+        x[j] = s;
+    }
+    if (*on != 0) cvd_project(x, n, dir, s_l, layer, first, last, part);
+    cvd_add(x, inject + t * hc, R + t * hc * n, n, hc);
+}
+
+__global__ void defer_join_add_proj_kernel(DeferJoinSlots sl, int m, float* __restrict__ R, int n, int k, int hc,
+                                           int n_tok, const float* __restrict__ dir, const float* __restrict__ s_l,
+                                           const int* __restrict__ on, int first, int last) {
+    const int t = blockIdx.x;
+    __shared__ int jn[kDeferJoinMaxSlots][16];
+    __shared__ int any[kDeferJoinMaxSlots];
+    __shared__ float part[kCvdThreads / 32 + 1];
+    if (t == 0 && sl.w_save != nullptr) {
+        for (int i = threadIdx.x; i < n_tok * k; i += blockDim.x) sl.w_save[i] = sl.w[0][i];
+        for (int i = threadIdx.x; i < n_tok * hc; i += blockDim.x) sl.inj_save[i] = sl.inj[0][i];
+    }
+    if (threadIdx.x < (unsigned) sl.n) {
+        const int s = threadIdx.x;
+        int a = 0;
+        if (((const volatile int32_t*) sl.cnt[s])[sl.delay[s]] > 0)
+            for (int j = 0; j < k && j < 16; ++j) {
+                const int v = ((const volatile int32_t*) sl.join[s])[t * k + j];
+                jn[s][j] = v;
+                a |= v == m;
+            }
+        any[s] = a;
+    }
+    __syncthreads();
+    const bool steer = *on != 0;
+    for (int s = 0; s < sl.n; ++s) {
+        if (!any[s]) continue;
+        const volatile float* rows = (const volatile float*) sl.rows[s] + (int64_t) t * k * n;
+        const float* wt = sl.w[s] + t * k;
+        float x[kCvdCols] = {};
+#pragma unroll
+        for (int c = 0; c < kCvdCols; ++c) {
+            const int d = threadIdx.x + c * kCvdThreads;
+            if (d >= n) continue;
+            float acc = 0.0f;
+            bool first_row = true;
+            for (int j = 0; j < k && j < 16; ++j) {
+                if (jn[s][j] != m) continue;
+                const float p = rows[(int64_t) j * n + d];
+                acc = first_row ? p * wt[j] : fmaf(p, wt[j], acc);
+                first_row = false;
+            }
+            x[c] = acc;
+        }
+        // the layers whose projection these rows missed: their source layer's and every one up to this join's
+        if (steer)
+            for (int l = m - sl.delay[s]; l < m; ++l) cvd_project(x, n, dir, s_l, l, first, last, part);
+        cvd_add(x, sl.inj[s] + t * hc, R + (int64_t) t * hc * n, n, hc);
+    }
+}
+}  // namespace
+
+void defer_add_rows_proj(const float* parts, const float* w, const float* inject, float* R, int64_t n_embd, int k,
+                         int hc, int n_tok, int layer, void* stream) {
+    const float *dir = nullptr, *s = nullptr;
+    const int* on = nullptr;
+    if (cvec().mode != 0 || !cvec_tables(&dir, &s, &on)) {   // no vector, or an additive one: nothing to project
+        defer_add_rows(parts, w, inject, R, n_embd, k, hc, n_tok, stream);
+        return;
+    }
+    if (n_tok <= 0 || n_embd <= 0) return;
+    if (n_embd > (int64_t) kCvdThreads * kCvdCols) {
+        std::fprintf(stderr, "defer_add_rows_proj: n_embd %lld > %d\n", (long long) n_embd, kCvdThreads * kCvdCols);
+        std::exit(1);
+    }
+    defer_add_rows_proj_kernel<<<(unsigned) n_tok, kCvdThreads, 0, (cudaStream_t) stream>>>(
+        parts, w, inject, R, (int) n_embd, k, hc, dir, s, on, cvec().first, cvec().last, layer);
+    check("defer_add_rows_proj");
+}
+
+void defer_join_add_proj(const DeferJoinSlots& slots, int m, float* R, int64_t n_embd, int k, int hc, int n_tok,
+                         void* stream) {
+    const float *dir = nullptr, *s = nullptr;
+    const int* on = nullptr;
+    if (cvec().mode != 0 || !cvec_tables(&dir, &s, &on)) {
+        defer_join_add(slots, m, R, n_embd, k, hc, n_tok, stream);
+        return;
+    }
+    if (n_tok <= 0 || n_embd <= 0 || (slots.n <= 0 && slots.w_save == nullptr)) return;
+    if (k > 16 || slots.n > kDeferJoinMaxSlots || n_embd > (int64_t) kCvdThreads * kCvdCols) {
+        std::fprintf(stderr, "defer_join_add_proj: at most 16 routed experts, %d slots and n_embd %d\n", kDeferJoinMaxSlots,
+                     kCvdThreads * kCvdCols);
+        std::exit(1);
+    }
+    defer_join_add_proj_kernel<<<(unsigned) n_tok, kCvdThreads, 0, (cudaStream_t) stream>>>(
+        slots, m, R, (int) n_embd, k, hc, n_tok, dir, s, on, cvec().first, cvec().last);
+    check("defer_join_add_proj");
 }
 
 namespace {

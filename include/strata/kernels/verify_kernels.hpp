@@ -118,6 +118,17 @@ struct DeferJoinSlots {
 };
 void defer_join_add(const DeferJoinSlots& slots, int m, float* R, int64_t n_embd, int k, int hc, int n_tok,
                     void* stream);
+/// local (cvec-defer): defer_add_rows / defer_join_add for rows that missed the control vector's projection
+/// (cvec.hpp, project mode).  Deferred CPU rows join after the vector has projected their layer's output (and, for
+/// defer-cold, the outputs of the layers up to the join).  The projection is linear, so the token's row sum a is
+/// projected first - a -= s_j (a . v_j) v_j for each steered layer j from the source layer to the one before the join,
+/// in order - and then added with the same gate: the residual an on-time add would have given (up to rounding).  With
+/// the request's vector off, no vector or an additive one, the plain kernels' result bit for bit.  One block per token
+/// (n_embd <= 4096).  defer_add_rows_proj: `layer` = the rows' layer (they join in the next one).  Graph-capturable.
+void defer_add_rows_proj(const float* parts, const float* w, const float* inject, float* R, int64_t n_embd, int k,
+                         int hc, int n_tok, int layer, void* stream);
+void defer_join_add_proj(const DeferJoinSlots& slots, int m, float* R, int64_t n_embd, int k, int hc, int n_tok,
+                         void* stream);
 /// iq3b STRATA_DEFER_FUSE: wait_flag_ge(flag, value) + copy_rows_by_weight(take_heavy = false: the light CPU rows of the
 /// mapped `src`) + defer_add_rows in one launch, bit for bit the three (k <= 32).
 void late_add_rows_after(const uint32_t* flag, uint32_t value, const float* src, const int32_t* hit_rows,

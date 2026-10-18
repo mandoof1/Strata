@@ -7,6 +7,7 @@
 
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -216,6 +217,112 @@ int main() {
                     same = same && got[i] == R[i] + dir[(size_t) (kLayer * N + j)];
                 }
         check(same, "add is h + d in every stream (bitwise)");
+    }
+
+    // ---- 5. local (cvec-defer): deferred CPU rows projected as they join = the on-time residual
+    std::printf("deferred rows (project)\n");
+    {
+        constexpr int K = 4;
+        constexpr int64_t kNext = kLayer + 1, kJoin = kLayer + 2;
+        std::vector<float> d2((size_t) (L * N), 0.0f), s2((size_t) L, 0.0f);
+        for (const int64_t l : {kLayer, kNext}) {   // unit directions on two consecutive layers, s = 1
+            double nrm = 0.0;
+            std::vector<double> v((size_t) N);
+            for (auto& x : v) { x = nd(rng); nrm += x * x; }
+            for (int64_t j = 0; j < N; ++j) d2[(size_t) (l * N + j)] = (float) (v[(size_t) j] / std::sqrt(nrm));
+            s2[(size_t) l] = 1.0f;
+        }
+        if (!k::cvec_upload(d2, s2, /*project*/ 0, 4, 44, N, HC, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 2; }
+        std::vector<float> parts((size_t) (T * K * N)), w((size_t) (T * K)), bo1((size_t) (T * N)), inj1((size_t) (T * HC));
+        for (auto& x : parts) x = nd(rng);
+        for (auto& x : w) x = 0.25f + 0.1f * nd(rng);
+        for (auto& x : bo1) x = nd(rng);
+        for (auto& x : inj1) x = nd(rng);
+        std::vector<float> bo_full = bo;   // the layer's output with its CPU rows in, as the on-time combine has it
+        for (int64_t t = 0; t < T; ++t)
+            for (int64_t d = 0; d < N; ++d) {
+                const float* p = parts.data() + t * K * N + d;
+                float a = p[0] * w[(size_t) (t * K)];
+                for (int j = 1; j < K; ++j) a = std::fmaf(p[(int64_t) j * N], w[(size_t) (t * K + j)], a);
+                bo_full[(size_t) (t * N + d)] += a;
+            }
+        float* dparts = dalloc<float>(parts.size());
+        float* dw = dalloc<float>(w.size());
+        float* dbo_full = dalloc<float>(bo_full.size());
+        float* dbo1 = dalloc<float>(bo1.size());
+        float* dinj1 = dalloc<float>(inj1.size());
+        float* dRef = dalloc<float>(R.size());
+        up(dparts, parts); up(dw, w); up(dbo_full, bo_full); up(dbo1, bo1); up(dinj1, inj1);
+        auto worst_diff = [&](const std::vector<float>& a, const std::vector<float>& b) {
+            double m = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) m = std::fmax(m, std::fabs((double) a[i] - (double) b[i]));
+            return m;
+        };
+        auto dot_v = [&](const std::vector<float>& h, int64_t l) {   // the largest |h . v_l| over the streams
+            double m = 0.0;
+            for (int64_t t = 0; t < T; ++t)
+                for (int64_t c = 0; c < HC; ++c) {
+                    double dot = 0.0;
+                    for (int64_t j = 0; j < N; ++j) dot += (double) h[(size_t) (t * D + c * N + j)] * d2[(size_t) (l * N + j)];
+                    m = std::fmax(m, std::fabs(dot));
+                }
+            return m;
+        };
+
+        // STRATA_VERIFY_DEFER_CPU: the rows join in the next layer, after layer kLayer's write + projection
+        up(dRef, R);
+        k::cvec_apply(dRef, kLayer, T, D, dbo_full, N, dinj, HC, true, nullptr);
+        up(dR, R);
+        k::cvec_apply(dR, kLayer, T, D, dbo, N, dinj, HC, true, nullptr);
+        k::defer_add_rows_proj(dparts, dw, dinj, dR, N, K, HC, T, (int) kLayer, nullptr);
+        ck(cudaDeviceSynchronize(), "defer_add_rows_proj");
+        {
+            const auto ref = down(dRef, R.size()), got = down(dR, R.size());
+            const double e = worst_diff(ref, got), dv = dot_v(got, kLayer);
+            std::printf("    one layer late: max |on-time - deferred| %.3g, max |h.v| %.3g\n", e, dv);
+            check(e < 1e-3, "deferred + projected rows = the on-time write + projection");
+            check(dv < 1e-3, "the deferred rows bring no component along v back");
+        }
+        // defer-cold: two layers late (source kLayer, join at the start of kJoin, after kNext's write + projection)
+        std::vector<int32_t> join((size_t) (T * K), (int32_t) kJoin), cnt(4, 0);
+        cnt[2] = 1;
+        int32_t* djoin = dalloc<int32_t>(join.size());
+        int32_t* dcnt = dalloc<int32_t>(cnt.size());
+        up(djoin, join); up(dcnt, cnt);
+        k::DeferJoinSlots sl;
+        sl.n = 1; sl.rows[0] = dparts; sl.join[0] = djoin; sl.cnt[0] = dcnt; sl.w[0] = dw; sl.inj[0] = dinj; sl.delay[0] = 2;
+        up(dRef, R);
+        k::cvec_apply(dRef, kLayer, T, D, dbo_full, N, dinj, HC, true, nullptr);
+        k::cvec_apply(dRef, kNext, T, D, dbo1, N, dinj1, HC, true, nullptr);
+        up(dR, R);
+        k::cvec_apply(dR, kLayer, T, D, dbo, N, dinj, HC, true, nullptr);
+        k::cvec_apply(dR, kNext, T, D, dbo1, N, dinj1, HC, true, nullptr);
+        k::defer_join_add_proj(sl, (int) kJoin, dR, N, K, HC, T, nullptr);
+        ck(cudaDeviceSynchronize(), "defer_join_add_proj");
+        {
+            const auto ref = down(dRef, R.size()), got = down(dR, R.size());
+            const double e = worst_diff(ref, got), dv = dot_v(got, kNext);
+            std::printf("    two layers late: max |on-time - deferred| %.3g, max |h.v_next| %.3g\n", e, dv);
+            check(e < 1e-3, "rows two layers late, projected through both layers = on time");
+            check(dv < 1e-3, "no component along the later layer's v comes back");
+        }
+        // switched off: bitwise the plain kernels
+        k::cvec_set_enabled(false);
+        up(dRef, R);
+        k::defer_add_rows(dparts, dw, dinj, dRef, N, K, HC, T, nullptr);
+        up(dR, R);
+        k::defer_add_rows_proj(dparts, dw, dinj, dR, N, K, HC, T, (int) kLayer, nullptr);
+        ck(cudaDeviceSynchronize(), "off add");
+        check(std::memcmp(down(dRef, R.size()).data(), down(dR, R.size()).data(), R.size() * 4) == 0,
+              "off: defer_add_rows_proj is bitwise defer_add_rows");
+        up(dRef, R);
+        k::defer_join_add(sl, (int) kJoin, dRef, N, K, HC, T, nullptr);
+        up(dR, R);
+        k::defer_join_add_proj(sl, (int) kJoin, dR, N, K, HC, T, nullptr);
+        ck(cudaDeviceSynchronize(), "off join");
+        check(std::memcmp(down(dRef, R.size()).data(), down(dR, R.size()).data(), R.size() * 4) == 0,
+              "off: defer_join_add_proj is bitwise defer_join_add");
+        k::cvec_set_enabled(true);
     }
 
     std::printf(g_fail ? "cvec_parity: %d FAILED\n" : "cvec_parity: all passed\n", g_fail);
