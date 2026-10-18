@@ -1,3 +1,8 @@
+> **Fork note (mandoof1/Strata, branch `gamer-16gb`):** engine patches and a tuned config for an average gaming PC with a
+> 16 GB GPU, only 16 GB of RAM and an NVMe + SATA SSD. Qwen3.8-Flash-Next IQ3_S runs at 128K context there at 27-39
+> tokens/s, and reads pictures. Setup, measurements and what each patch does: [gamer-16gb/README.md](gamer-16gb/README.md).
+> Everything below is upstream's README.
+
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
