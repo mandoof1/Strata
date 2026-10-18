@@ -2283,6 +2283,7 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
+        self.gpu = bool(cfg.get("gpu"))                 # a CPU encoder needs no VRAM from the expert cache
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.proc = None
@@ -2445,6 +2446,14 @@ class Vision:
         out = io.BytesIO()
         im.save(out, format="PNG")
         return out.getvalue()
+
+    def cached(self, source) -> bool:
+        """This picture's embeddings are on disk already (a picture earlier in the conversation): no encoder needed."""
+        try:
+            data = self.normalize(source if isinstance(source, bytes) else self.load(source))
+        except Exception:                               # encode() says what is wrong with it
+            return False
+        return hashlib.sha256(data).hexdigest()[:32] in self.cache
 
     def encode_all(self, sources: list, cancel=None) -> list[tuple[Path, int]]:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
@@ -3285,7 +3294,7 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
             return
-        if hasattr(self.engine, "vram") and self.loaded():
+        if hasattr(self.engine, "vram") and self.loaded() and getattr(v, "gpu", True):   # a CPU encoder needs no VRAM
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
                 self.vision_held = True
@@ -3923,7 +3932,11 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self._turn(cancel):
-                self._vision_up()
+                # an elastic encoder starts only for a picture it has not read yet: an agent conversation sends its
+                # earlier pictures again with every turn, and their embeddings are cached
+                if not (getattr(self.vision, "elastic", False) and hasattr(self.vision, "cached")
+                        and all(self.vision.cached(s) for s in images)):
+                    self._vision_up()
                 try:
                     encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
                                else [self.vision.encode(src) for src in images])
@@ -6751,7 +6764,10 @@ def main() -> int:
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
-            elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
+            # a CPU encoder needs no VRAM: "elastic" alone starts it with the first picture and stops it when idle (its
+            # RAM goes back to the page cache); a GPU encoder's elastic VRAM needs "vram_elastic" (NVIDIA)
+            cpu_enc = not cfg["vision"].get("gpu")
+            elastic = cfg["vision"].get("elastic") is True and (cfg.get("vram_elastic") is True or cpu_enc)
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
                   "loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
@@ -6759,7 +6775,7 @@ def main() -> int:
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
+            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True and not cpu_enc:
                 print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False

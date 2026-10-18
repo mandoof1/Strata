@@ -1,7 +1,8 @@
-"""The elastic image encoder (the vision section's "elastic": true with "vram_elastic"): the first picture makes the
-expert cache keep the encoder's VRAM free and then starts it, later pictures use it as it is, an idle encoder stops and
-the cache takes its VRAM back, a POST /v1/vram reserve stacks on the encoder's share, and the engine's load never starts
-it on its own."""
+"""The elastic image encoder (the vision section's "elastic": true; a GPU encoder also needs "vram_elastic"): the
+first picture makes the expert cache keep the encoder's VRAM free and then starts it (a CPU encoder starts without
+asking for VRAM), later pictures use it as it is, a picture already read does not start a stopped encoder, an idle
+encoder stops and the cache takes its VRAM back, a POST /v1/vram reserve stacks on the encoder's share, and the
+engine's load never starts it on its own."""
 import tempfile
 import time
 import unittest
@@ -109,6 +110,20 @@ class Elastic(unittest.TestCase):
         self.assertEqual(self.svc.unload(), "unloaded")
         self.assertFalse(self.svc.vision_held)
         self.assertFalse(self.vision.up)
+
+    def test_a_cpu_encoder_starts_without_asking_the_cache_for_vram(self):
+        self.vision.gpu = False
+        self.picture()
+        self.assertEqual(self.vision.starts, 1)
+        self.assertEqual(self.engine.calls, [])             # its memory is RAM: the expert cache keeps every slot
+        self.assertFalse(self.svc.vision_held)
+
+    def test_a_cached_picture_does_not_start_a_stopped_encoder(self):
+        self.vision.cached = lambda source: True            # its embeddings are on disk from an earlier turn
+        self.vision.encode = lambda source: (self.vision.rows, 3)   # served from that cache, no process needed
+        self.picture()
+        self.assertEqual(self.vision.starts, 0)             # an agent resends its old pictures every turn
+        self.assertEqual(self.engine.calls, [])
 
     def test_the_config_keys(self):
         v = Vision({"exe": "e", "mmproj": "m", "model": "t", "elastic": True, "elastic_mib": 3000,
