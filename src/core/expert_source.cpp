@@ -4626,9 +4626,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // count that minimises the layer's longer side, max(c (nmiss - n), f n + fixed), from the EMAs of the pool's cost
         // per CPU expert c and the feed's cost per blob f (ExpertDispatch).  Until both have a sample: the share as is.
         // local (STRATA_PCIE_MMAP_LANDED=1): f is the landed cost per blob (pm_fl_ms) instead of the issued one.
+        // local (STRATA_PCIE_MMAP_AUTO_MAX / _AUTO_SLACK): the count capped at pm_auto_max blobs (0: the staging cap),
+        // and pm_slack_ms added to the feed's side, so the crossing moves to where the feed lands that much before
+        // the pool finishes (a margin against late flags).
         if (feed && d.pcie_auto && m > 0 && (d.pm_landed ? d.pm_fl_ok : d.pm_f_ok) && d.pm_c_ok) {
-            const int m_cap = (int) std::min<int64_t>({(int64_t) m, P.staging_cap, 64});
-            const double c = d.pm_c_ms, f = d.pm_landed ? d.pm_fl_ms : d.pm_f_ms, fx = d.pm_fixed_ms;
+            const int m_cap = (int) std::min<int64_t>({(int64_t) m, P.staging_cap, 64, d.pm_auto_max > 0 ? (int64_t) d.pm_auto_max : (int64_t) 64});
+            const double c = d.pm_c_ms, f = d.pm_landed ? d.pm_fl_ms : d.pm_f_ms, fx = d.pm_fixed_ms + d.pm_slack_ms;
             auto cost = [&](int n) { return n <= 0 ? c * (double) nmiss : std::max(c * (double) (nmiss - n), f * (double) n + fx); };
             int best = 0;
             double best_cost = cost(0);

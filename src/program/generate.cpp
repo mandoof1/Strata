@@ -8599,9 +8599,19 @@ int main(int argc, char** argv) {
                     if (const char* v = std::getenv("STRATA_PCIE_MMAP_AUTO"); v != nullptr && v[0] == '1') {
                         drive.d.pcie_auto = true;
                         if (const char* fx = std::getenv("STRATA_PCIE_MMAP_AUTO_FIXED_MS")) drive.d.pm_fixed_ms = std::max(0.0, std::atof(fx));
-                        char buf[200];
-                        std::snprintf(buf, sizeof buf, "the share balanced per layer against the pool, n = argmin max(c (misses - n), f n + %.2f ms), "
-                                                       "within the share above (STRATA_PCIE_MMAP_AUTO=1, _AUTO_FIXED_MS), %s", drive.d.pm_fixed_ms,
+                        // local (STRATA_PCIE_MMAP_AUTO_MAX=<n>: at most n blobs per layer-window, default the staging cap;
+                        // _AUTO_SLACK=<ms>: added to the feed's side of the balance, a margin against late flags, default 0)
+                        if (const char* v = std::getenv("STRATA_PCIE_MMAP_AUTO_MAX"); v != nullptr && v[0] != '\0')
+                            drive.d.pm_auto_max = std::max(0, std::min(64, std::atoi(v)));
+                        if (const char* v = std::getenv("STRATA_PCIE_MMAP_AUTO_SLACK"); v != nullptr && v[0] != '\0')
+                            drive.d.pm_slack_ms = std::max(0.0, std::atof(v));
+                        char cap_s[48];
+                        if (drive.d.pm_auto_max > 0) std::snprintf(cap_s, sizeof cap_s, "%d blobs", drive.d.pm_auto_max);
+                        else std::snprintf(cap_s, sizeof cap_s, "the staging cap");
+                        char buf[320];
+                        std::snprintf(buf, sizeof buf, "the share balanced per layer against the pool, n = argmin max(c (misses - n), f n + %.2f ms + "
+                                                       "%.2f ms slack), within the share above and at most %s per layer-window (STRATA_PCIE_MMAP_AUTO=1, "
+                                                       "_AUTO_FIXED_MS, _AUTO_SLACK, _AUTO_MAX), %s", drive.d.pm_fixed_ms, drive.d.pm_slack_ms, cap_s,
                                       drive.d.pm_landed ? "f the landed one" : "f the issued one");
                         pm_auto = buf;
                     }

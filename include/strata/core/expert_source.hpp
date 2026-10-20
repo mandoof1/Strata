@@ -537,6 +537,11 @@ struct ExpertDispatch {
     double pm_fixed_ms = 0.25;
     double pm_f_ms = 0.0, pm_c_ms = 0.0;
     bool pm_f_ok = false, pm_c_ok = false;
+    /// local (STRATA_PCIE_MMAP_AUTO_MAX=<n>, _AUTO_SLACK=<ms>, set by the driver): the balance's cap on the blobs per
+    /// layer-window (0: the staging cap) and a margin added to the feed's side, max(c (n_miss - n), f n + fixed +
+    /// slack), so the chosen n has the feed predicted to land `slack` ms before the pool finishes (0: the balance as is)
+    int pm_auto_max = 0;
+    double pm_slack_ms = 0.0;
     /// local (STRATA_PCIE_MMAP_LANDED=1, set by the driver): the feed's cost per blob measured to the LANDING of the
     /// layer's flag-B copies (the sink's landed ring) instead of the feeder's issue: the EMA pm_fl_ms (alpha 1/16) is
     /// kept beside pm_f_ms and the balance takes it.  Per request: fed calls with a landed time, their landed ms, flag
