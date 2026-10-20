@@ -14412,6 +14412,35 @@ int main(int argc, char** argv) {
                                  (unsigned long long) (pm_pr - pm_p), (unsigned long long) (pm_mc - pm_m),
                                  (unsigned long long) (pm_st - pm_s));
                     pm_e = drive.d.pcie_mmap_experts; pm_b = drive.d.pcie_mmap_bytes; pm_s = pm_st; pm_p = pm_pr; pm_m = pm_mc;
+                    // the feed against the pool this request (STRATA_PCIE_MMAP_AUTO's inputs; measured whenever the feed is on):
+                    // per plan call (layer-window), the blobs fed, the feed's ms from the fetch queued to its flag B issued
+                    // and the pool's c3..c4 ms, and whether flag B came after the pool finished (late) or before (early)
+                    strata::core::pcie_mmap_resolve(drive.d);
+                    strata::core::ExpertDispatch& dd = drive.d;
+                    if (dd.pm_calls > 0) {
+                        std::fprintf(stderr, "strata serve: PCIe feed vs pool this request: %lld layer-windows, %.2f blobs fed per layer-window "
+                                             "(%lld with a share), feed %.2f ms per layer-window with a share, pool %.2f ms per layer-window, "
+                                             "flag B late %lld / early %lld (unresolved %lld); EMAs f %.3f ms/blob, c %.3f ms/CPU expert, "
+                                             "fixed %.2f ms%s\n",
+                                     (long long) dd.pm_calls, (double) dd.pm_sum_npcie / (double) dd.pm_calls, (long long) dd.pm_fed_calls,
+                                     dd.pm_fed_calls > 0 ? dd.pm_sum_feed_ms / (double) dd.pm_fed_calls : 0.0,
+                                     dd.pm_fed_calls > 0 ? dd.pm_sum_pool_ms / (double) dd.pm_calls : 0.0,
+                                     (long long) dd.pm_late, (long long) dd.pm_early, (long long) dd.pm_unresolved,
+                                     dd.pm_f_ms, dd.pm_c_ms, dd.pm_fixed_ms, dd.pcie_auto ? " (STRATA_PCIE_MMAP_AUTO=1 chose the share)" : "");
+                        std::string per;   // per layer: feed ms / pool ms / blobs, averaged over the layer's calls
+                        for (size_t l = 0; l < dd.pm_layer_calls.size(); ++l) {
+                            const double nc = (double) std::max<int64_t>(1, dd.pm_layer_calls[l]);
+                            char buf[64];
+                            std::snprintf(buf, sizeof buf, "%s%zu:%.2f/%.2f/%.1f", l ? " " : "", l, dd.pm_layer_feed_ms[l] / nc,
+                                          dd.pm_layer_pool_ms[l] / nc, (double) dd.pm_layer_npcie[l] / nc);
+                            per += buf;
+                        }
+                        std::fprintf(stderr, "strata serve: PCIe feed per layer-window (layer:feed ms/pool ms/blobs, averaged over the "
+                                             "request's calls; feed 0 where no window gave the layer a share): %s\n", per.c_str());
+                    }
+                    dd.pm_calls = dd.pm_fed_calls = dd.pm_sum_npcie = dd.pm_late = dd.pm_early = dd.pm_unresolved = 0;
+                    dd.pm_sum_feed_ms = dd.pm_sum_pool_ms = 0.0;
+                    dd.pm_layer_calls.clear(); dd.pm_layer_npcie.clear(); dd.pm_layer_feed_ms.clear(); dd.pm_layer_pool_ms.clear();
                 }
                 // local (iq3d): what the prompt path's unbuffered reads did this request
                 if (src.prompt_direct()) {

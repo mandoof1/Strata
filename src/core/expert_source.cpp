@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -4270,6 +4271,33 @@ const ColdSkipCfg& cold_skip_cfg() {
 }  // namespace
 float cold_skip_below() { return cold_skip_cfg().below; }
 
+// local (STRATA_PCIE_MMAP): the feed timings.  A pending entry per plan call that queued a fetch (seq from the sink);
+// the feeder's ring says when the job's flag B was issued.  Jobs complete in seq order, so the first unfinished entry
+// ends the pass; an entry whose ring slot a later seq overwrote (more than 64 jobs behind) is counted unresolved.
+void pcie_mmap_resolve(ExpertDispatch& d) {
+    const GpuPlanSink* P = d.plan;
+    auto pop = [&] { d.pm_pend_head = (d.pm_pend_head + 1) & 63; --d.pm_pend_n; };
+    while (d.pm_pend_n > 0) {
+        ExpertDispatch::PmPending& e = d.pm_pend[(size_t) d.pm_pend_head];
+        if (P == nullptr || P->fetch_done_seq == nullptr) { ++d.pm_unresolved; pop(); continue; }
+        const uint64_t got = P->fetch_done_seq[e.seq & 63].load(std::memory_order_acquire);
+        if (got == UINT64_MAX || got < e.seq) break;                      // not issued yet (nor any later one)
+        if (got > e.seq) { ++d.pm_unresolved; pop(); continue; }         // its slot was reused: the time is lost
+        const int64_t done = P->fetch_done_ns[e.seq & 63].load(std::memory_order_relaxed);
+        if (e.n_pcie > 0) {
+            const double feed_ms = (double) (done - e.t_fetch_ns) / 1e6;
+            ++d.pm_fed_calls;
+            d.pm_sum_feed_ms += feed_ms;
+            if (done > e.t_pool_ns) ++d.pm_late; else ++d.pm_early;
+            const double per_blob = feed_ms / (double) e.n_pcie;
+            d.pm_f_ms = d.pm_f_ok ? d.pm_f_ms + (per_blob - d.pm_f_ms) * (1.0 / 16.0) : per_blob;
+            d.pm_f_ok = true;
+            if (e.layer >= 0 && (size_t) e.layer < d.pm_layer_feed_ms.size()) d.pm_layer_feed_ms[(size_t) e.layer] += feed_ms;
+        }
+        pop();
+    }
+}
+
 int defer_cold_layers() {
     static const int k = [] {
         int r = 0;
@@ -4572,6 +4600,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         int64_t pcie_i0[64];
         bool feed_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) feed_d[q] = false;
+        if (feed) pcie_mmap_resolve(d);   // (the earlier layers' feed timings, before this layer's choice)
         if (feed && m > 0) {
             const int cap = (int) std::min<int64_t>(P.staging_cap, 64);
             int chosen = 0;
@@ -4680,6 +4709,26 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        if (feed && P.fetch) {   // local (STRATA_PCIE_MMAP): the job's timing, settled by pcie_mmap_resolve once it is issued
+            if (d.pm_pend_n >= 64) { ++d.pm_unresolved; d.pm_pend_head = (d.pm_pend_head + 1) & 63; --d.pm_pend_n; }
+            const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            ExpertDispatch::PmPending& e = d.pm_pend[(size_t) ((d.pm_pend_head + d.pm_pend_n) & 63)];
+            e = {P.fetch_seq, d.layers, fetches, now, now};   // t_pool_ns: the pool's end, set below (its start otherwise)
+            ++d.pm_pend_n;
+            ++d.pm_calls;
+            d.pm_sum_npcie += fetches;
+            if (d.layers >= 0) {
+                if ((size_t) d.layers >= d.pm_layer_calls.size()) {
+                    d.pm_layer_calls.resize((size_t) d.layers + 1, 0);
+                    d.pm_layer_npcie.resize((size_t) d.layers + 1, 0);
+                    d.pm_layer_feed_ms.resize((size_t) d.layers + 1, 0.0);
+                    d.pm_layer_pool_ms.resize((size_t) d.layers + 1, 0.0);
+                }
+                ++d.pm_layer_calls[(size_t) d.layers];
+                d.pm_layer_npcie[(size_t) d.layers] += fetches;
+            }
+        }
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -5019,6 +5068,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
+    if (d.pcie_mmap && d.pm_pend_n > 0) {   // local (STRATA_PCIE_MMAP): the pool's side of this layer's balance
+        ExpertDispatch::PmPending& e = d.pm_pend[(size_t) ((d.pm_pend_head + d.pm_pend_n - 1) & 63)];
+        if (e.layer == d.layers && e.t_pool_ns == e.t_fetch_ns) {   // (the entry this call queued)
+            e.t_pool_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(c4.time_since_epoch()).count();
+            const double run_ms = ms(c3, c4);
+            d.pm_sum_pool_ms += run_ms;
+            if ((size_t) d.layers < d.pm_layer_pool_ms.size()) d.pm_layer_pool_ms[(size_t) d.layers] += run_ms;
+            if (njobs > 0) {
+                const double per_job = run_ms / (double) njobs;
+                d.pm_c_ms = d.pm_c_ok ? d.pm_c_ms + (per_job - d.pm_c_ms) * (1.0 / 16.0) : per_job;
+                d.pm_c_ok = true;
+            }
+        }
+    }
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) {

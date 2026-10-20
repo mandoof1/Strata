@@ -3034,7 +3034,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     const uint32_t want = v->cur_layer_ + 1;
     if (v->feed_ != nullptr) {   // local (STRATA_PCIE_MMAP): the mapped blobs go through the feeder's pinned slots
         v->copy_used_ = true;
-        v->feed_enqueue(src, n, bytes, (uint8_t*) v->sink_.staging, want);
+        v->sink_.fetch_seq = v->feed_enqueue(src, n, bytes, (uint8_t*) v->sink_.staging, want);   // (the plan's timing)
         return;
     }
     if (n <= 0) { v->raise_b(want); return; }
@@ -3151,6 +3151,9 @@ struct Verifier::MmapFeed {
     std::vector<std::thread> threads;
     std::atomic<uint64_t> stalls{0};
     std::atomic<uint64_t> preads{0}, memcpys{0};   // local (STRATA_PCIE_MMAP_PREAD): how the slots were filled
+    // the completion ring the plan reads (GpuPlanSink::fetch_done_*): by seq & 63, the time the job's flag B was issued
+    std::atomic<uint64_t> done_seq[64];
+    std::atomic<int64_t> done_ns[64];
 };
 
 bool Verifier::set_pcie_mmap_feed(int slots, int threads, size_t slot_bytes, std::string& err) {
@@ -3183,6 +3186,12 @@ bool Verifier::set_pcie_mmap_feed(int slots, int threads, size_t slot_bytes, std
         delete f;
         return false;
     }
+    for (int i = 0; i < 64; ++i) {
+        f->done_seq[i].store(UINT64_MAX, std::memory_order_relaxed);
+        f->done_ns[i].store(0, std::memory_order_relaxed);
+    }
+    sink_.fetch_done_seq = f->done_seq;
+    sink_.fetch_done_ns = f->done_ns;
     feed_ = f;
     for (int i = 0; i < threads; ++i) f->threads.emplace_back([this] { feed_worker(); });
     return true;
@@ -3197,7 +3206,7 @@ void Verifier::pcie_mmap_fill_counts(uint64_t& preads, uint64_t& memcpys) const 
     memcpys = feed_ != nullptr ? feed_->memcpys.load(std::memory_order_relaxed) : 0;
 }
 
-void Verifier::feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint8_t* stage, uint32_t want) {
+uint64_t Verifier::feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint8_t* stage, uint32_t want) {
     MmapFeed& f = *feed_;
     if (n > 64) n = 64;   // (the plan caps its fetches at 64 and the staging slots)
     std::lock_guard<std::mutex> lk(f.mu);
@@ -3210,6 +3219,7 @@ void Verifier::feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint
     j.stage = stage;
     for (int i = 0; i < n; ++i) j.src[i] = src[i];
     f.cv.notify_all();
+    return j.seq;
 }
 
 bool Verifier::feed_drain(int timeout_ms) {
@@ -3356,6 +3366,12 @@ void Verifier::feed_worker() {
                 std::lock_guard<std::mutex> il(f.issue_mu);
                 if (j->n == 0) raise_b_now(j->want);
                 else flag_b_after_copies(j->want);
+            }
+            {   // the completion ring the plan's timing reads (issued, not landed: the last DMA's tail is not in it)
+                const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                f.done_ns[j->seq & 63].store(now, std::memory_order_relaxed);
+                f.done_seq[j->seq & 63].store(j->seq, std::memory_order_release);
             }
             ++f.turn;
             f.jobs.pop_front();

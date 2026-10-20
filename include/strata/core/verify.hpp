@@ -532,7 +532,7 @@ private:
     std::vector<int> feed_cpus_;               // local (STRATA_PCIE_MMAP_CPUS): the feeders' CPUs (empty: --aux-cpus' choice)
     bool feed_renice_ = false; int feed_nice_ = 0;   // local (STRATA_PCIE_MMAP_NICE)
     FeedSpansFn feed_spans_ = nullptr; void* feed_spans_ctx_ = nullptr;   // local (STRATA_PCIE_MMAP_PREAD)
-    void feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint8_t* stage, uint32_t want);
+    uint64_t feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint8_t* stage, uint32_t want);   // -> the job's seq
     void feed_worker();
     bool feed_drain(int timeout_ms = -1);      // the host: every queued job issued (true; no-op without a feed)
     bool feed_idle();

@@ -350,6 +350,12 @@ struct GpuPlanSink {
     /// Starts the DMA copies of `n` host blobs (pinned) into staging slots 0..n-1 and signals the GPU when they land.
     void (*fetch)(void* ctx, const uint8_t* const* src, int n, size_t bytes) = nullptr;
     void* ctx = nullptr;
+    /// local (STRATA_PCIE_MMAP): the feeder's job `fetch` queued the blobs as (set by fetch, read by the plan after it),
+    /// and the feeder's completion ring, 64 entries by seq & 63: once done_seq[i] == seq, done_ns[i] is the
+    /// steady_clock time (ns) the job's flag B was issued behind its last copy (UINT64_MAX: never written).
+    uint64_t fetch_seq = 0;
+    const std::atomic<uint64_t>* fetch_done_seq = nullptr;
+    const std::atomic<int64_t>* fetch_done_ns = nullptr;
     /// Plan v0.3 P6: how a PCIe group reaches the GPU.  0 = the copy engine stages it (DMA, `fetch`); 1 = the grouped
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
@@ -512,6 +518,23 @@ struct ExpertDispatch {
     /// (never a cold one: those stay on the CPU / defer path).  The counters: distinct experts fed and their bytes.
     bool pcie_mmap = false;
     int64_t pcie_mmap_experts = 0, pcie_mmap_bytes = 0;
+    /// local (STRATA_PCIE_MMAP_AUTO=1, set by the driver): the share balanced per layer against the pool.  Global EMAs
+    /// (alpha 1/16) of the feed's cost per blob f (ms from the fetch's queueing to the feeder issuing the layer's flag B,
+    /// over its blobs; the plan sink's completion ring) and the pool's cost per CPU expert c (ms_run's c3..c4 over the
+    /// jobs); the plan takes n_pcie = argmin over n of max(c (n_miss - n), f n + pm_fixed_ms), within --pcie-frac's
+    /// share and the staging cap, never a cold blob.  The timing and the per-request counters run whenever the feed is
+    /// on; only the choice needs pcie_auto.  The driver prints and clears the per-request part.
+    bool pcie_auto = false;
+    double pm_fixed_ms = 0.25;
+    double pm_f_ms = 0.0, pm_c_ms = 0.0;
+    bool pm_f_ok = false, pm_c_ok = false;
+    struct PmPending { uint64_t seq; int64_t layer; int n_pcie; int64_t t_fetch_ns, t_pool_ns; };
+    PmPending pm_pend[64] = {};
+    int pm_pend_head = 0, pm_pend_n = 0;
+    int64_t pm_calls = 0, pm_fed_calls = 0, pm_sum_npcie = 0, pm_late = 0, pm_early = 0, pm_unresolved = 0;
+    double pm_sum_feed_ms = 0.0, pm_sum_pool_ms = 0.0;
+    std::vector<double> pm_layer_feed_ms, pm_layer_pool_ms;   ///< per layer, this request: sums over its calls
+    std::vector<int64_t> pm_layer_calls, pm_layer_npcie;
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;
@@ -586,6 +609,9 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
+/// local (STRATA_PCIE_MMAP): settles the pending feed timings of `d` (the feeder's completion ring) into its EMAs and
+/// per-request counters.  Called by the plan at each layer and by the driver before it prints the request's lines.
+void pcie_mmap_resolve(ExpertDispatch& d);
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
