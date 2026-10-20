@@ -107,6 +107,19 @@ public:
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
+    // ---- STRATA_DRAFT_SUFFIX_SKIP (the serve loop): a chain that ends after draft 0 when the next window will take the
+    // suffix lookup whatever the chain would draft.  `fn` is asked once draft 0 and its probability are known and the host
+    // rule (min_p, STRATA_SPEC_CUM) would go on; true ends the round there: no step graph is launched, the drafts past 0
+    // read 0, and the chain's state (the round's residual and token in the step inputs, the staged step rows) is kept so
+    // draft_resume() can still run the steps.  One-shot: the next draft() clears it.
+    typedef bool (*SkipAfterFirstFn)(void* user, int32_t draft0, float p0);
+    void set_skip_after_first(SkipAfterFirstFn fn, void* user) { skip_fn_ = fn; skip_user_ = user; }
+    /// True after a draft() that ended on the predicate: draft_resume() may follow (before the next draft()).
+    bool draft_resumable() const { return resume_.valid; }
+    /// The steps the last draft() left out, by the same host rule, into `drafts` / `probs` (draft 0 is written again):
+    /// what that draft() would have returned had the predicate said no.
+    bool draft_resume(int32_t* drafts, std::string& err, float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+
     /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
     /// the target's Philox draw for the verifying row, and `probs` is the draft's probability under that chain; a
@@ -250,6 +263,17 @@ private:
     int32_t hint_tok_[8] = {};
     int hint_n_ = 0;
     double hint_q_ = 0.0, hint_decay_ = 1.0;
+    // STRATA_DRAFT_SUFFIX_SKIP: the predicate, and the chain a draft() ended after draft 0 (draft_resume)
+    SkipAfterFirstFn skip_fn_ = nullptr;
+    void* skip_user_ = nullptr;
+    struct ResumeState {
+        bool valid = false, cp = false;
+        int max_steps = 0;
+        int32_t tok0 = 0;
+        float p0 = 0.0f;
+        double cum = 1.0;
+        int32_t ple_prev[2] = {0, 0};
+    } resume_;
     int32_t chain_tok_[8] = {};
     float chain_prob_[8] = {};
     int64_t n_vocab_ = 0;
