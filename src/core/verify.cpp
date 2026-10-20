@@ -2648,6 +2648,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     feed_drain();   // local (STRATA_PCIE_MMAP): the feeder is idle before b_streamed_ is read
     if ((b_streamed_ != 0 && *(volatile uint32_t*) h_flagB_ < b_streamed_) ||
         (b2_streamed_ != 0 && *(volatile uint32_t*) h_flagB2_ < b2_streamed_)) cudaStreamSynchronize(copy_);   // (landed)
+    feed_landed_ref();   // local (STRATA_PCIE_MMAP_LANDED): the last window's landed times, this window's reference
     b_streamed_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
     if (h_flagB2_ != nullptr) { b2_streamed_ = 0; *(volatile uint32_t*) h_flagB2_ = 0; }   // (STRATA_PCIE_MMAP_SPLIT)
@@ -2937,6 +2938,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (copy_used_) {
         feed_drain();   // local (STRATA_PCIE_MMAP): every queued copy is on the stream before it is drained
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+        feed_landed_flush();   // local (STRATA_PCIE_MMAP_LANDED): the window's landed times, before the driver reads them
         copy_used_ = false;
     }
     if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
@@ -3170,6 +3172,19 @@ struct Verifier::MmapFeed {
     // the completion ring the plan reads (GpuPlanSink::fetch_done_*): by seq & 63, the time the job's flag B was issued
     std::atomic<uint64_t> done_seq[64];
     std::atomic<int64_t> done_ns[64];
+    // local (STRATA_PCIE_MMAP_LANDED): the landed ring the plan reads (GpuPlanSink::fetch_land_*): by seq & 63, the host
+    // time the job's flag-B copies had landed (-1: lost).  land_ev[seq & 63] is the timing event recorded behind the
+    // job's flag-B write; land_q the seqs whose event is not stamped yet, in order (events complete in stream order);
+    // the time is ref_ns + the GPU's elapsed time from ref_ev, the reference the host records on the drained copy
+    // stream at each window's start (feed_landed_ref).  A job with no copies is stamped with its issue time.
+    std::atomic<uint64_t> land_seq[64];
+    std::atomic<int64_t> land_ns[64];
+    cudaEvent_t land_ev[64] = {};
+    cudaEvent_t ref_ev = nullptr;
+    int64_t ref_ns = 0;
+    bool ref_ok = false;
+    std::mutex land_mu;                  // land_q, ref_*
+    std::deque<uint64_t> land_q;
 };
 
 bool Verifier::set_pcie_mmap_feed(int slots, int threads, size_t slot_bytes, std::string& err) {
@@ -3272,8 +3287,12 @@ void Verifier::feed_stop() {
         if (sl.ev) cudaEventDestroy(sl.ev);
         if (sl.p) cudaFreeHost(sl.p);
     }
+    for (cudaEvent_t& e : f->land_ev)   // (STRATA_PCIE_MMAP_LANDED)
+        if (e) cudaEventDestroy(e);
+    if (f->ref_ev) cudaEventDestroy(f->ref_ev);
     (void) cudaGetLastError();
     feed_ = nullptr;
+    feed_landed_ = false;
     delete f;
 }
 
@@ -3392,6 +3411,8 @@ void Verifier::feed_worker() {
                 std::lock_guard<std::mutex> il(f.issue_mu);
                 if (j->n == 0) raise_b_now(j->want);
                 else flag_b_after_copies(j->want);
+                // local (STRATA_PCIE_MMAP_LANDED): the job's landed event behind its flag B (with the split: behind B2)
+                if (feed_landed_ && !feed_split_) feed_landed_record(f, j->seq, j->n > 0);
             }
             ++f.turn;
             if (!feed_split_) {
@@ -3409,6 +3430,7 @@ void Verifier::feed_worker() {
                 std::lock_guard<std::mutex> il(f.issue_mu);
                 if (j->n == 0) raise_b2_now(j->want);
                 else flag_b2_after_copies(j->want);
+                if (feed_landed_) feed_landed_record(f, j->seq, j->n > 0);   // (STRATA_PCIE_MMAP_LANDED: the job's end)
             }
             ++f.turn2;
             feed_done_stamp(f, j->seq);
@@ -3425,6 +3447,119 @@ void Verifier::feed_done_stamp(MmapFeed& f, uint64_t seq) {
                             std::chrono::steady_clock::now().time_since_epoch()).count();
     f.done_ns[seq & 63].store(now, std::memory_order_relaxed);
     f.done_seq[seq & 63].store(seq, std::memory_order_release);
+}
+
+// ---- local (STRATA_PCIE_MMAP_LANDED=1): when a job's flag-B copies landed, for the plan's balance.
+//
+// The completion ring above says when the feeder ISSUED flag B; the copies' tail (two blobs of 2.7 MB land ~0.45 ms
+// after the issue on PCIe 3.0 x16) is not in it, so the balance undercounts the feed.  Here the feeder records a
+// timing event on the copy stream right behind the job's flag-B write (so it completes once the copies and the flag
+// have landed) and keeps its seq in land_q.  The next job's issue - and the host at the window's edges, with the
+// copy stream drained - queries the queued events without blocking, in order, and stamps the landed ring with the
+// host time of each: ref_ns + cudaEventElapsedTime(ref_ev, event), ref_ev being an event the host records on the
+// drained copy stream at each window's start, ref_ns the host's clock at that record (the midpoint of record and
+// synchronize: the error is within the few tens of us a record and sync take).  The host thread makes no CUDA call
+// inside a window for it (the feeders query; the host only at the edges, where it already drains the copy stream).
+bool Verifier::set_pcie_mmap_landed(std::string& err) {
+    if (feed_ == nullptr) { err = "it needs the feed (STRATA_PCIE_MMAP=1)"; return false; }
+    if (feed_landed_) { err = "already set"; return false; }
+    const OnDevice on_device(device_);
+    MmapFeed& f = *feed_;
+    bool ok = cudaEventCreate(&f.ref_ev) == cudaSuccess;   // (timing on: cudaEventElapsedTime)
+    if (!ok) f.ref_ev = nullptr;
+    for (int i = 0; i < 64 && ok; ++i) {
+        ok = cudaEventCreate(&f.land_ev[i]) == cudaSuccess;
+        if (!ok) f.land_ev[i] = nullptr;
+    }
+    if (!ok) {
+        (void) cudaGetLastError();
+        for (cudaEvent_t& e : f.land_ev)
+            if (e) { cudaEventDestroy(e); e = nullptr; }
+        if (f.ref_ev) { cudaEventDestroy(f.ref_ev); f.ref_ev = nullptr; }
+        err = "the timing events could not be created";
+        return false;
+    }
+    for (int i = 0; i < 64; ++i) {
+        f.land_seq[i].store(UINT64_MAX, std::memory_order_relaxed);
+        f.land_ns[i].store(-1, std::memory_order_relaxed);
+    }
+    sink_.fetch_land_seq = f.land_seq;
+    sink_.fetch_land_ns = f.land_ns;
+    feed_landed_ = true;
+    return true;
+}
+
+static int64_t feed_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void Verifier::feed_land_stamp(MmapFeed& f, uint64_t seq, int64_t ns) {
+    f.land_ns[seq & 63].store(ns, std::memory_order_relaxed);
+    f.land_seq[seq & 63].store(seq, std::memory_order_release);
+}
+
+void Verifier::feed_landed_record(MmapFeed& f, uint64_t seq, bool copies) {
+    std::lock_guard<std::mutex> lk(f.land_mu);
+    if (!copies) {
+        feed_land_stamp(f, seq, feed_now_ns());   // nothing to land: the issue time
+    } else {
+        // a queued job whose event slot this seq reuses (64 or more behind: the feed is far behind): its time is lost
+        while (!f.land_q.empty() && f.land_q.front() + 64 <= seq) {
+            feed_land_stamp(f, f.land_q.front(), -1);
+            f.land_q.pop_front();
+        }
+        if (cudaEventRecord(f.land_ev[seq & 63], copy_) == cudaSuccess) {
+            f.land_q.push_back(seq);
+        } else {
+            (void) cudaGetLastError();
+            feed_land_stamp(f, seq, -1);
+        }
+    }
+    feed_landed_poll(f, false);   // the earlier jobs' events (usually the previous job's), without blocking
+}
+
+// Caller holds land_mu.  `all`: every queued event is waited for (the host at a window's edge, copy_ drained).
+void Verifier::feed_landed_poll(MmapFeed& f, bool all) {
+    while (!f.land_q.empty()) {
+        const uint64_t s = f.land_q.front();
+        cudaEvent_t ev = f.land_ev[s & 63];
+        cudaError_t q = cudaEventQuery(ev);
+        if (q == cudaErrorNotReady) {
+            if (!all) break;
+            q = cudaEventSynchronize(ev);
+        }
+        float ms = 0.0f;
+        if (q == cudaSuccess && f.ref_ok && cudaEventElapsedTime(&ms, f.ref_ev, ev) == cudaSuccess) {
+            feed_land_stamp(f, s, f.ref_ns + (int64_t) ((double) ms * 1e6));
+        } else {
+            (void) cudaGetLastError();
+            feed_land_stamp(f, s, -1);
+        }
+        f.land_q.pop_front();
+    }
+}
+
+void Verifier::feed_landed_ref() {
+    if (!feed_landed_ || feed_ == nullptr) return;
+    MmapFeed& f = *feed_;
+    std::lock_guard<std::mutex> lk(f.land_mu);
+    feed_landed_poll(f, true);   // the last window's jobs, against the reference they were recorded behind
+    f.ref_ok = false;
+    const int64_t t0 = feed_now_ns();
+    if (cudaEventRecord(f.ref_ev, copy_) != cudaSuccess || cudaEventSynchronize(f.ref_ev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    const int64_t t1 = feed_now_ns();
+    f.ref_ns = t0 + (t1 - t0) / 2;
+    f.ref_ok = true;
+}
+
+void Verifier::feed_landed_flush() {
+    if (!feed_landed_ || feed_ == nullptr) return;
+    MmapFeed& f = *feed_;
+    std::lock_guard<std::mutex> lk(f.land_mu);
+    feed_landed_poll(f, true);
 }
 
 // ---- local (STRATA_PCIE_MMAP_SPLIT=1): flag B2, the second half of the fed share.  Mirrors flag B's raise paths.
@@ -3923,6 +4058,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     feed_drain();   // local (STRATA_PCIE_MMAP): the feeder is idle before b_streamed_ is read
     if ((b_streamed_ != 0 && *(volatile uint32_t*) h_flagB_ < b_streamed_) ||
         (b2_streamed_ != 0 && *(volatile uint32_t*) h_flagB2_ < b2_streamed_)) cudaStreamSynchronize(copy_);   // (landed)
+    feed_landed_ref();   // local (STRATA_PCIE_MMAP_LANDED)
     b_streamed_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
     if (h_flagB2_ != nullptr) { b2_streamed_ = 0; *(volatile uint32_t*) h_flagB2_ = 0; }   // (STRATA_PCIE_MMAP_SPLIT)
@@ -3973,6 +4109,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
         feed_drain();   // local (STRATA_PCIE_MMAP)
         cudaStreamSynchronize(copy_);
+        feed_landed_flush();   // local (STRATA_PCIE_MMAP_LANDED)
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -4043,6 +4180,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
     feed_drain();   // local (STRATA_PCIE_MMAP)
     cudaStreamSynchronize(copy_);
+    feed_landed_flush();   // local (STRATA_PCIE_MMAP_LANDED)
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -4515,6 +4653,7 @@ bool Verifier::done(std::string& err) {
     if (q != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(q); return false; }
     if (copy_used_) {   // no host function of this window may raise flag B in the next one
         if (!feed_idle() || cudaStreamQuery(copy_) == cudaErrorNotReady) return false;   // (feed_idle: STRATA_PCIE_MMAP)
+        feed_landed_flush();   // local (STRATA_PCIE_MMAP_LANDED): copy_ is drained
         copy_used_ = false;
     }
     return true;

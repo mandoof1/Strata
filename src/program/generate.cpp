@@ -8576,16 +8576,29 @@ int main(int argc, char** argv) {
                         if (ver.set_pcie_mmap_split(swhy)) pm_split = "two launches per layer: the first half of the blobs behind flag B, the second behind flag B2 (STRATA_PCIE_MMAP_SPLIT=1)";
                         else std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP_SPLIT=1 ignored: %s\n", swhy.c_str());
                     }
+                    // local (STRATA_PCIE_MMAP_LANDED=1): the feed's cost per blob measured to the landing of the layer's
+                    // copies on the GPU (a timing event behind flag B) beside the issue-based one; the balance takes it
+                    const char* pm_landed = "f timed to the feeder's issue of flag B";
+                    if (const char* v = std::getenv("STRATA_PCIE_MMAP_LANDED"); v != nullptr && v[0] == '1') {
+                        std::string lwhy;
+                        if (ver.set_pcie_mmap_landed(lwhy)) {
+                            drive.d.pm_landed = true;
+                            pm_landed = "f timed to the landing of the layer's copies (STRATA_PCIE_MMAP_LANDED=1; the issue-based f is kept beside it)";
+                        } else
+                            std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP_LANDED=1 ignored: %s\n", lwhy.c_str());
+                    }
                     // local (STRATA_PCIE_MMAP_AUTO=1): the share per layer balanced against the pool (ExpertDispatch's EMAs)
                     std::string pm_auto = "the share as given";
                     if (const char* v = std::getenv("STRATA_PCIE_MMAP_AUTO"); v != nullptr && v[0] == '1') {
                         drive.d.pcie_auto = true;
                         if (const char* fx = std::getenv("STRATA_PCIE_MMAP_AUTO_FIXED_MS")) drive.d.pm_fixed_ms = std::max(0.0, std::atof(fx));
-                        char buf[160];
+                        char buf[200];
                         std::snprintf(buf, sizeof buf, "the share balanced per layer against the pool, n = argmin max(c (misses - n), f n + %.2f ms), "
-                                                       "within the share above (STRATA_PCIE_MMAP_AUTO=1, _AUTO_FIXED_MS)", drive.d.pm_fixed_ms);
+                                                       "within the share above (STRATA_PCIE_MMAP_AUTO=1, _AUTO_FIXED_MS), %s", drive.d.pm_fixed_ms,
+                                      drive.d.pm_landed ? "f the landed one" : "f the issued one");
                         pm_auto = buf;
                     }
+                    pm_auto += std::string(", ") + pm_landed;
                     std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP=1: the PCIe share (pcie_frac %.2f, the last %d/256 of a layer's "
                                          "misses whose pages are cached) is fed from the mapping through %d pinned slots of %.1f MB "
                                          "(%.0f MB) by %d feeder thread%s %s, slots filled by %s, %s, %s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
@@ -14445,6 +14458,14 @@ int main(int argc, char** argv) {
                                      dd.pm_fed_calls > 0 ? dd.pm_sum_pool_ms / (double) dd.pm_calls : 0.0,
                                      (long long) dd.pm_late, (long long) dd.pm_early, (long long) dd.pm_unresolved,
                                      dd.pm_f_ms, dd.pm_c_ms, dd.pm_fixed_ms, dd.pcie_auto ? " (STRATA_PCIE_MMAP_AUTO=1 chose the share)" : "");
+                        // local (STRATA_PCIE_MMAP_LANDED=1): the same feed timed to the landing of the layer's copies
+                        if (dd.pm_landed)
+                            std::fprintf(stderr, "strata serve: PCIe feed landed this request: landed %.2f ms per layer-window with a share "
+                                                 "(%lld timed, %lld lost), flag B landed late %lld / early %lld; EMA f_landed %.3f ms/blob "
+                                                 "(f issued %.3f)%s\n",
+                                         dd.pm_land_fed > 0 ? dd.pm_sum_land_ms / (double) dd.pm_land_fed : 0.0, (long long) dd.pm_land_fed,
+                                         (long long) dd.pm_land_unresolved, (long long) dd.pm_land_late, (long long) dd.pm_land_early,
+                                         dd.pm_fl_ms, dd.pm_f_ms, dd.pcie_auto ? " (the share's f)" : "");
                         std::string per;   // per layer: feed ms / pool ms / blobs, averaged over the layer's calls
                         for (size_t l = 0; l < dd.pm_layer_calls.size(); ++l) {
                             const double nc = (double) std::max<int64_t>(1, dd.pm_layer_calls[l]);
@@ -14458,6 +14479,8 @@ int main(int argc, char** argv) {
                     }
                     dd.pm_calls = dd.pm_fed_calls = dd.pm_sum_npcie = dd.pm_late = dd.pm_early = dd.pm_unresolved = 0;
                     dd.pm_sum_feed_ms = dd.pm_sum_pool_ms = 0.0;
+                    dd.pm_land_fed = dd.pm_land_late = dd.pm_land_early = dd.pm_land_unresolved = 0;   // (STRATA_PCIE_MMAP_LANDED)
+                    dd.pm_sum_land_ms = 0.0;
                     dd.pm_layer_calls.clear(); dd.pm_layer_npcie.clear(); dd.pm_layer_feed_ms.clear(); dd.pm_layer_pool_ms.clear();
                 }
                 // local (iq3d): what the prompt path's unbuffered reads did this request

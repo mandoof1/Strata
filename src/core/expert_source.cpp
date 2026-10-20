@@ -4283,6 +4283,14 @@ void pcie_mmap_resolve(ExpertDispatch& d) {
         const uint64_t got = P->fetch_done_seq[e.seq & 63].load(std::memory_order_acquire);
         if (got == UINT64_MAX || got < e.seq) break;                      // not issued yet (nor any later one)
         if (got > e.seq) { ++d.pm_unresolved; pop(); continue; }         // its slot was reused: the time is lost
+        // local (STRATA_PCIE_MMAP_LANDED): the landed ring too, stamped a job or two after the issue (the event is
+        // queried when a later job is issued, and at the window's edges); its slot reused or the time lost: unresolved
+        int64_t land = -1;
+        if (d.pm_landed && P->fetch_land_seq != nullptr) {
+            const uint64_t lg = P->fetch_land_seq[e.seq & 63].load(std::memory_order_acquire);
+            if (lg == UINT64_MAX || lg < e.seq) break;                    // not landed (stamped) yet
+            if (lg == e.seq) land = P->fetch_land_ns[e.seq & 63].load(std::memory_order_relaxed);
+        }
         const int64_t done = P->fetch_done_ns[e.seq & 63].load(std::memory_order_relaxed);
         if (e.n_pcie > 0) {
             const double feed_ms = (double) (done - e.t_fetch_ns) / 1e6;
@@ -4293,6 +4301,19 @@ void pcie_mmap_resolve(ExpertDispatch& d) {
             d.pm_f_ms = d.pm_f_ok ? d.pm_f_ms + (per_blob - d.pm_f_ms) * (1.0 / 16.0) : per_blob;
             d.pm_f_ok = true;
             if (e.layer >= 0 && (size_t) e.layer < d.pm_layer_feed_ms.size()) d.pm_layer_feed_ms[(size_t) e.layer] += feed_ms;
+            if (d.pm_landed) {
+                if (land < 0) {
+                    ++d.pm_land_unresolved;
+                } else {
+                    const double land_ms = (double) (land - e.t_fetch_ns) / 1e6;
+                    ++d.pm_land_fed;
+                    d.pm_sum_land_ms += land_ms;
+                    if (land > e.t_pool_ns) ++d.pm_land_late; else ++d.pm_land_early;
+                    const double per_blob_l = land_ms / (double) e.n_pcie;
+                    d.pm_fl_ms = d.pm_fl_ok ? d.pm_fl_ms + (per_blob_l - d.pm_fl_ms) * (1.0 / 16.0) : per_blob_l;
+                    d.pm_fl_ok = true;
+                }
+            }
         }
         pop();
     }
@@ -4604,9 +4625,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // local (STRATA_PCIE_MMAP_AUTO=1): within the share above (--pcie-frac's cut of the misses, the staging cap), the
         // count that minimises the layer's longer side, max(c (nmiss - n), f n + fixed), from the EMAs of the pool's cost
         // per CPU expert c and the feed's cost per blob f (ExpertDispatch).  Until both have a sample: the share as is.
-        if (feed && d.pcie_auto && m > 0 && d.pm_f_ok && d.pm_c_ok) {
+        // local (STRATA_PCIE_MMAP_LANDED=1): f is the landed cost per blob (pm_fl_ms) instead of the issued one.
+        if (feed && d.pcie_auto && m > 0 && (d.pm_landed ? d.pm_fl_ok : d.pm_f_ok) && d.pm_c_ok) {
             const int m_cap = (int) std::min<int64_t>({(int64_t) m, P.staging_cap, 64});
-            const double c = d.pm_c_ms, f = d.pm_f_ms, fx = d.pm_fixed_ms;
+            const double c = d.pm_c_ms, f = d.pm_landed ? d.pm_fl_ms : d.pm_f_ms, fx = d.pm_fixed_ms;
             auto cost = [&](int n) { return n <= 0 ? c * (double) nmiss : std::max(c * (double) (nmiss - n), f * (double) n + fx); };
             int best = 0;
             double best_cost = cost(0);

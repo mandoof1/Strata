@@ -292,6 +292,13 @@ public:
     /// set_pcie_mmap_feed, before the first capture; not with the device plan (it never writes counts[3]).
     bool set_pcie_mmap_split(std::string& err);
     bool pcie_mmap_split() const { return feed_split_; }
+    /// local (STRATA_PCIE_MMAP_LANDED=1): the time a job's flag-B copies LANDED on the GPU, for the plan's balance (the
+    /// issue-based completion ring leaves the last DMA's tail out).  The feeder records a timing event behind each
+    /// job's flag-B write on the copy stream; a later issue (and the host at the window's edges) queries it without
+    /// blocking and stamps the sink's landed ring with ref_ns + the GPU's elapsed time from the reference event the
+    /// host records on the drained copy stream at each window's start.  After set_pcie_mmap_feed.
+    bool set_pcie_mmap_landed(std::string& err);
+    bool pcie_mmap_landed() const { return feed_landed_; }
     bool pcie_mmap_feed() const { return feed_ != nullptr; }
     uint64_t pcie_mmap_stalls() const;   ///< feeder waits for a slot whose last DMA had not landed (or was not queued)
     cudaStream_t stream() const { return cs_; }
@@ -554,6 +561,13 @@ private:
     bool feed_idle();
     void feed_stop();
     static void feed_done_stamp(MmapFeed& f, uint64_t seq);   // the completion ring the plan's timing reads
+    // local (STRATA_PCIE_MMAP_LANDED): the landed ring (set_pcie_mmap_landed)
+    bool feed_landed_ = false;
+    static void feed_land_stamp(MmapFeed& f, uint64_t seq, int64_t ns);   // the landed ring (-1: lost); caller holds land_mu
+    void feed_landed_record(MmapFeed& f, uint64_t seq, bool copies);     // the feeder, right after the job's flag B (issue_mu held)
+    void feed_landed_poll(MmapFeed& f, bool all);                        // the queued events, stamped; `all`: wait for each (an edge)
+    void feed_landed_ref();                                              // the host: the window's reference event + time
+    void feed_landed_flush();                                            // the host: every queued event stamped (copy_ drained)
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block

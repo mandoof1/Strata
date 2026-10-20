@@ -356,6 +356,11 @@ struct GpuPlanSink {
     uint64_t fetch_seq = 0;
     const std::atomic<uint64_t>* fetch_done_seq = nullptr;
     const std::atomic<int64_t>* fetch_done_ns = nullptr;
+    /// local (STRATA_PCIE_MMAP_LANDED=1, set by the verifier): the landed ring, as the completion ring: once
+    /// land_seq[i] == seq, land_ns[i] is the steady_clock time (ns) the job's flag-B copies had landed on the GPU (a
+    /// timing event behind the flag-B write, against the window's reference event), -1 where the time was lost.
+    const std::atomic<uint64_t>* fetch_land_seq = nullptr;
+    const std::atomic<int64_t>* fetch_land_ns = nullptr;
     /// local (STRATA_PCIE_MMAP_SPLIT, set by the verifier): the PCIe groups in two halves - the first ceil(n/2) in
     /// staging slots [0, staging_cap/2) with counts[2] = their number, the rest from slot staging_cap/2 on with
     /// counts[3]; start2 is indexed the same way (its sentinels at [counts[2]] and [staging_cap/2 + counts[3]]).
@@ -532,6 +537,15 @@ struct ExpertDispatch {
     double pm_fixed_ms = 0.25;
     double pm_f_ms = 0.0, pm_c_ms = 0.0;
     bool pm_f_ok = false, pm_c_ok = false;
+    /// local (STRATA_PCIE_MMAP_LANDED=1, set by the driver): the feed's cost per blob measured to the LANDING of the
+    /// layer's flag-B copies (the sink's landed ring) instead of the feeder's issue: the EMA pm_fl_ms (alpha 1/16) is
+    /// kept beside pm_f_ms and the balance takes it.  Per request: fed calls with a landed time, their landed ms, flag
+    /// B landed after the pool finished (late) or before (early), lost times.
+    bool pm_landed = false;
+    double pm_fl_ms = 0.0;
+    bool pm_fl_ok = false;
+    int64_t pm_land_fed = 0, pm_land_late = 0, pm_land_early = 0, pm_land_unresolved = 0;
+    double pm_sum_land_ms = 0.0;
     struct PmPending { uint64_t seq; int64_t layer; int n_pcie; int64_t t_fetch_ns, t_pool_ns; };
     PmPending pm_pend[64] = {};
     int pm_pend_head = 0, pm_pend_n = 0;
