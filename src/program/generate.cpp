@@ -8568,11 +8568,21 @@ int main(int argc, char** argv) {
                         pm_fill = "memcpy from the mapping (STRATA_PCIE_MMAP_PREAD is Linux only)";
 #endif
                     }
+                    // local (STRATA_PCIE_MMAP_AUTO=1): the share per layer balanced against the pool (ExpertDispatch's EMAs)
+                    std::string pm_auto = "the share as given";
+                    if (const char* v = std::getenv("STRATA_PCIE_MMAP_AUTO"); v != nullptr && v[0] == '1') {
+                        drive.d.pcie_auto = true;
+                        if (const char* fx = std::getenv("STRATA_PCIE_MMAP_AUTO_FIXED_MS")) drive.d.pm_fixed_ms = std::max(0.0, std::atof(fx));
+                        char buf[160];
+                        std::snprintf(buf, sizeof buf, "the share balanced per layer against the pool, n = argmin max(c (misses - n), f n + %.2f ms), "
+                                                       "within the share above (STRATA_PCIE_MMAP_AUTO=1, _AUTO_FIXED_MS)", drive.d.pm_fixed_ms);
+                        pm_auto = buf;
+                    }
                     std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP=1: the PCIe share (pcie_frac %.2f, the last %d/256 of a layer's "
                                          "misses whose pages are cached) is fed from the mapping through %d pinned slots of %.1f MB "
-                                         "(%.0f MB) by %d feeder thread%s %s, slots filled by %s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
+                                         "(%.0f MB) by %d feeder thread%s %s, slots filled by %s, %s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
                                  o.pcie_frac, pm_num, pm_slots, (double) pm_bytes / 1e6, (double) pm_slots * (double) pm_bytes / 1e6,
-                                 pm_threads, pm_threads == 1 ? "" : "s", pm_place.c_str(), pm_fill);
+                                 pm_threads, pm_threads == 1 ? "" : "s", pm_place.c_str(), pm_fill, pm_auto.c_str());
 #if defined(STRATA_USE_HIP)
                     // Verifier::init: the copy stream shares a hardware queue with the window's unless it has a priority
                     // of its own, and the window's graph spins on the flag the copies raise

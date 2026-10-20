@@ -4601,6 +4601,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         bool feed_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) feed_d[q] = false;
         if (feed) pcie_mmap_resolve(d);   // (the earlier layers' feed timings, before this layer's choice)
+        // local (STRATA_PCIE_MMAP_AUTO=1): within the share above (--pcie-frac's cut of the misses, the staging cap), the
+        // count that minimises the layer's longer side, max(c (nmiss - n), f n + fixed), from the EMAs of the pool's cost
+        // per CPU expert c and the feed's cost per blob f (ExpertDispatch).  Until both have a sample: the share as is.
+        if (feed && d.pcie_auto && m > 0 && d.pm_f_ok && d.pm_c_ok) {
+            const int m_cap = (int) std::min<int64_t>({(int64_t) m, P.staging_cap, 64});
+            const double c = d.pm_c_ms, f = d.pm_f_ms, fx = d.pm_fixed_ms;
+            auto cost = [&](int n) { return n <= 0 ? c * (double) nmiss : std::max(c * (double) (nmiss - n), f * (double) n + fx); };
+            int best = 0;
+            double best_cost = cost(0);
+            const double nx = c + f > 0.0 ? (c * (double) nmiss - fx) / (c + f) : 0.0;   // where the two sides cross
+            const int lo = (int) std::floor(nx);
+            for (int n : {lo, lo + 1}) {
+                const int nn = std::max(0, std::min(m_cap, n));
+                if (cost(nn) < best_cost) { best = nn; best_cost = cost(nn); }
+            }
+            m = best;
+        }
         if (feed && m > 0) {
             const int cap = (int) std::min<int64_t>(P.staging_cap, 64);
             int chosen = 0;
