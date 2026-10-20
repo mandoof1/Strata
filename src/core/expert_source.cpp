@@ -4308,7 +4308,12 @@ void pcie_mmap_resolve(ExpertDispatch& d) {
                     const double land_ms = (double) (land - e.t_fetch_ns) / 1e6;
                     ++d.pm_land_fed;
                     d.pm_sum_land_ms += land_ms;
-                    if (land > e.t_pool_ns) ++d.pm_land_late; else ++d.pm_land_early;
+                    if (land > e.t_pool_ns) {
+                        ++d.pm_land_late;
+                        d.pm_sum_land_late_ms += (double) (land - e.t_pool_ns) / 1e6;   // the GPU's wait on flag B, at most
+                    } else {
+                        ++d.pm_land_early;
+                    }
                     const double per_blob_l = land_ms / (double) e.n_pcie;
                     d.pm_fl_ms = d.pm_fl_ok ? d.pm_fl_ms + (per_blob_l - d.pm_fl_ms) * (1.0 / 16.0) : per_blob_l;
                     d.pm_fl_ok = true;

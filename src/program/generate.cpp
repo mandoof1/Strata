@@ -14478,10 +14478,12 @@ int main(int argc, char** argv) {
                         // local (STRATA_PCIE_MMAP_LANDED=1): the same feed timed to the landing of the layer's copies
                         if (dd.pm_landed)
                             std::fprintf(stderr, "strata serve: PCIe feed landed this request: landed %.2f ms per layer-window with a share "
-                                                 "(%lld timed, %lld lost), flag B landed late %lld / early %lld; EMA f_landed %.3f ms/blob "
+                                                 "(%lld timed, %lld lost), flag B landed late %lld / early %lld, the late ones by %.2f ms on "
+                                                 "average (%.1f ms in all: the GPU's wait on flag B at most); EMA f_landed %.3f ms/blob "
                                                  "(f issued %.3f)%s\n",
                                          dd.pm_land_fed > 0 ? dd.pm_sum_land_ms / (double) dd.pm_land_fed : 0.0, (long long) dd.pm_land_fed,
                                          (long long) dd.pm_land_unresolved, (long long) dd.pm_land_late, (long long) dd.pm_land_early,
+                                         dd.pm_land_late > 0 ? dd.pm_sum_land_late_ms / (double) dd.pm_land_late : 0.0, dd.pm_sum_land_late_ms,
                                          dd.pm_fl_ms, dd.pm_f_ms, dd.pcie_auto ? " (the share's f)" : "");
                         std::string per;   // per layer: feed ms / pool ms / blobs, averaged over the layer's calls
                         for (size_t l = 0; l < dd.pm_layer_calls.size(); ++l) {
@@ -14497,7 +14499,7 @@ int main(int argc, char** argv) {
                     dd.pm_calls = dd.pm_fed_calls = dd.pm_sum_npcie = dd.pm_late = dd.pm_early = dd.pm_unresolved = 0;
                     dd.pm_sum_feed_ms = dd.pm_sum_pool_ms = 0.0;
                     dd.pm_land_fed = dd.pm_land_late = dd.pm_land_early = dd.pm_land_unresolved = 0;   // (STRATA_PCIE_MMAP_LANDED)
-                    dd.pm_sum_land_ms = 0.0;
+                    dd.pm_sum_land_ms = dd.pm_sum_land_late_ms = 0.0;
                     dd.pm_layer_calls.clear(); dd.pm_layer_npcie.clear(); dd.pm_layer_feed_ms.clear(); dd.pm_layer_pool_ms.clear();
                 }
                 // local (iq3d): what the prompt path's unbuffered reads did this request

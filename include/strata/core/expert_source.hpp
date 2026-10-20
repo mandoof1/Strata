@@ -551,6 +551,7 @@ struct ExpertDispatch {
     bool pm_fl_ok = false;
     int64_t pm_land_fed = 0, pm_land_late = 0, pm_land_early = 0, pm_land_unresolved = 0;
     double pm_sum_land_ms = 0.0;
+    double pm_sum_land_late_ms = 0.0;   ///< over the late ones: landed - the pool's finish (the GPU's wait on flag B at most)
     struct PmPending { uint64_t seq; int64_t layer; int n_pcie; int64_t t_fetch_ns, t_pool_ns; };
     PmPending pm_pend[64] = {};
     int pm_pend_head = 0, pm_pend_n = 0;
