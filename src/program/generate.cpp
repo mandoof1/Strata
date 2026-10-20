@@ -8554,11 +8554,25 @@ int main(int argc, char** argv) {
                 if (ver.set_pcie_mmap_feed(pm_slots, pm_threads, pm_bytes, why)) {
                     pcie_mmap_on = true;
                     drive.d.pcie_mmap = true;
+                    // local (STRATA_PCIE_MMAP_PREAD=1): a slot is filled by pread of the blob's file bytes (the io prefetch
+                    // descriptors, the head copy's for a STRATA_EXPERTS_HEAD split) instead of a memcpy from the mapping
+                    const char* pm_fill = "memcpy from the mapping";
+                    if (const char* v = std::getenv("STRATA_PCIE_MMAP_PREAD"); v != nullptr && v[0] == '1') {
+#if defined(__linux__)
+                        ver.set_pcie_mmap_feed_pread(
+                            [](void* c, const uint8_t* p, size_t n, int* fd, uint64_t* off, uint64_t* len) {
+                                return ((strata::core::FileExpertSource*) c)->feed_spans(p, n, fd, off, len);
+                            }, &src);
+                        pm_fill = "pread of the file bytes (STRATA_PCIE_MMAP_PREAD=1; memcpy where a span is unknown)";
+#else
+                        pm_fill = "memcpy from the mapping (STRATA_PCIE_MMAP_PREAD is Linux only)";
+#endif
+                    }
                     std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP=1: the PCIe share (pcie_frac %.2f, the last %d/256 of a layer's "
                                          "misses whose pages are cached) is fed from the mapping through %d pinned slots of %.1f MB "
-                                         "(%.0f MB) by %d feeder thread%s %s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
+                                         "(%.0f MB) by %d feeder thread%s %s, slots filled by %s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
                                  o.pcie_frac, pm_num, pm_slots, (double) pm_bytes / 1e6, (double) pm_slots * (double) pm_bytes / 1e6,
-                                 pm_threads, pm_threads == 1 ? "" : "s", pm_place.c_str());
+                                 pm_threads, pm_threads == 1 ? "" : "s", pm_place.c_str(), pm_fill);
 #if defined(STRATA_USE_HIP)
                     // Verifier::init: the copy stream shares a hardware queue with the window's unless it has a priority
                     // of its own, and the window's graph spins on the flag the copies raise
@@ -14388,13 +14402,16 @@ int main(int argc, char** argv) {
                 }
                 if (drive.d.pcie_mmap) {   // local (STRATA_PCIE_MMAP=1), this request
                     static int64_t pm_e = 0, pm_b = 0;
-                    static uint64_t pm_s = 0;
+                    static uint64_t pm_s = 0, pm_p = 0, pm_m = 0;
                     const uint64_t pm_st = ver.pcie_mmap_stalls();
+                    uint64_t pm_pr = 0, pm_mc = 0;
+                    ver.pcie_mmap_fill_counts(pm_pr, pm_mc);   // (STRATA_PCIE_MMAP_PREAD: how the slots were filled)
                     std::fprintf(stderr, "strata serve: PCIe from the mapping this request: %lld experts (%.1f MB) fed through the "
-                                         "pinned slots, %llu stalls waiting for a free slot\n",
+                                         "pinned slots (%llu by pread, %llu by memcpy), %llu stalls waiting for a free slot\n",
                                  (long long) (drive.d.pcie_mmap_experts - pm_e), (double) (drive.d.pcie_mmap_bytes - pm_b) / 1e6,
+                                 (unsigned long long) (pm_pr - pm_p), (unsigned long long) (pm_mc - pm_m),
                                  (unsigned long long) (pm_st - pm_s));
-                    pm_e = drive.d.pcie_mmap_experts; pm_b = drive.d.pcie_mmap_bytes; pm_s = pm_st;
+                    pm_e = drive.d.pcie_mmap_experts; pm_b = drive.d.pcie_mmap_bytes; pm_s = pm_st; pm_p = pm_pr; pm_m = pm_mc;
                 }
                 // local (iq3d): what the prompt path's unbuffered reads did this request
                 if (src.prompt_direct()) {

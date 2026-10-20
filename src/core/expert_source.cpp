@@ -643,6 +643,32 @@ int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
     return 2;
 }
 
+// local (STRATA_PCIE_MMAP_PREAD): spans() by pointer - the same descriptors and offsets the io prefetch threads use
+// (io_fds_[0] for experts.bin, io_head_fd_ for the STRATA_EXPERTS_HEAD copy, which backs [0, split_n_) at the same
+// offsets).  Only the experts.bin layout (role_ptr_ empty: the GGUF in place has no contiguous blob).
+int FileExpertSource::feed_spans(const uint8_t* p, uint64_t n, int* fd, uint64_t* off, uint64_t* len) const {
+    if (!role_ptr_.empty() || unmapped_ || base_ == nullptr || p == nullptr || n == 0 || io_fds_.empty()) return 0;
+    const uintptr_t pa = (uintptr_t) p, ba = (uintptr_t) base_;
+    if (pa < ba || (uint64_t) (pa - ba) > mapped_bytes_ || n > mapped_bytes_ - (uint64_t) (pa - ba)) return 0;
+    const int main_fd = io_fds_[0];
+    const uint64_t o = (uint64_t) (pa - ba);
+    if (split_n_ == 0 || o >= split_n_) {
+        if (main_fd < 0) return 0;
+        fd[0] = main_fd; off[0] = o; len[0] = n;
+        return 1;
+    }
+    if (io_head_fd_ < 0) return 0;
+    if (o + n <= split_n_) {
+        fd[0] = io_head_fd_; off[0] = o; len[0] = n;
+        return 1;
+    }
+    if (main_fd < 0) return 0;
+    const uint64_t n0 = split_n_ - o;
+    fd[0] = io_head_fd_; off[0] = o; len[0] = n0;
+    fd[1] = main_fd; off[1] = split_n_; len[1] = n - n0;
+    return 2;
+}
+
 uint64_t FileExpertSource::cached_bytes(int64_t layer, int64_t expert, uint64_t& total, bool exact) const {
     total = 0;
 #if defined(__linux__)

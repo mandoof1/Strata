@@ -277,6 +277,13 @@ public:
     void set_pcie_mmap_feed_place(const std::vector<int>& cpus, bool renice, int nice) {
         feed_cpus_ = cpus; feed_renice_ = renice; feed_nice_ = nice;
     }
+    /// local (STRATA_PCIE_MMAP_PREAD=1): a feeder fills its slot with pread() of the blob's file bytes instead of a memcpy
+    /// from the mapping (no page-table faults on the mapping).  `spans(ctx, p, n, fd, off, len)` answers up to 2 spans
+    /// behind the mapped blob (FileExpertSource::feed_spans); 0 or a short read: the memcpy as before (the same bytes).
+    using FeedSpansFn = int (*)(void* ctx, const uint8_t* p, size_t n, int* fd, uint64_t* off, uint64_t* len);
+    void set_pcie_mmap_feed_pread(FeedSpansFn spans, void* ctx) { feed_spans_ = spans; feed_spans_ctx_ = ctx; }
+    /// local (STRATA_PCIE_MMAP_PREAD): blobs the feeders filled with pread / with memcpy (the fallback), cumulative
+    void pcie_mmap_fill_counts(uint64_t& preads, uint64_t& memcpys) const;
     bool pcie_mmap_feed() const { return feed_ != nullptr; }
     uint64_t pcie_mmap_stalls() const;   ///< feeder waits for a slot whose last DMA had not landed (or was not queued)
     cudaStream_t stream() const { return cs_; }
@@ -524,6 +531,7 @@ private:
     MmapFeed* feed_ = nullptr;
     std::vector<int> feed_cpus_;               // local (STRATA_PCIE_MMAP_CPUS): the feeders' CPUs (empty: --aux-cpus' choice)
     bool feed_renice_ = false; int feed_nice_ = 0;   // local (STRATA_PCIE_MMAP_NICE)
+    FeedSpansFn feed_spans_ = nullptr; void* feed_spans_ctx_ = nullptr;   // local (STRATA_PCIE_MMAP_PREAD)
     void feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint8_t* stage, uint32_t want);
     void feed_worker();
     bool feed_drain(int timeout_ms = -1);      // the host: every queued job issued (true; no-op without a feed)

@@ -867,6 +867,11 @@ public:
     bool io_prefetch() const { return io_pf_; }
     /// local (STRATA_PCIE_MMAP): `probe_cold` can answer and `blob` hands out the mapping (experts.bin, io prefetch on)
     bool page_probe() const { return staged() && io_fill_ && io_pf_ && direct_.empty(); }
+    /// local (STRATA_PCIE_MMAP_PREAD): the file bytes behind `n` bytes of the mapping at `p`, as the io prefetch threads
+    /// read them: up to 2 (fd, offset, length) spans - the STRATA_EXPERTS_HEAD copy's descriptor for the head, experts.bin's
+    /// for the rest - through the descriptors set_io_prefetch opened (POSIX_FADV_RANDOM).  0 when `p` is not in the
+    /// experts.bin mapping, no descriptor is open, or a span's descriptor is missing: the caller then copies from `p`.
+    int feed_spans(const uint8_t* p, uint64_t n, int* fd, uint64_t* off, uint64_t* len) const;
     /// Counts the cached / uncached bytes of every blob read from the files (mincore, page-granular).  Free with
     /// io_prefetch; otherwise opt in with STRATA_IO_STATS=1 (the check costs a few microseconds per blob).
     void set_io_stats(bool on) { io_stats_ = on || io_pf_; }

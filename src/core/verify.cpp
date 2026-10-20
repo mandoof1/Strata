@@ -3150,6 +3150,7 @@ struct Verifier::MmapFeed {
     bool quit = false;
     std::vector<std::thread> threads;
     std::atomic<uint64_t> stalls{0};
+    std::atomic<uint64_t> preads{0}, memcpys{0};   // local (STRATA_PCIE_MMAP_PREAD): how the slots were filled
 };
 
 bool Verifier::set_pcie_mmap_feed(int slots, int threads, size_t slot_bytes, std::string& err) {
@@ -3189,6 +3190,11 @@ bool Verifier::set_pcie_mmap_feed(int slots, int threads, size_t slot_bytes, std
 
 uint64_t Verifier::pcie_mmap_stalls() const {
     return feed_ != nullptr ? feed_->stalls.load(std::memory_order_relaxed) : 0;
+}
+
+void Verifier::pcie_mmap_fill_counts(uint64_t& preads, uint64_t& memcpys) const {
+    preads = feed_ != nullptr ? feed_->preads.load(std::memory_order_relaxed) : 0;
+    memcpys = feed_ != nullptr ? feed_->memcpys.load(std::memory_order_relaxed) : 0;
 }
 
 void Verifier::feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint8_t* stage, uint32_t want) {
@@ -3292,7 +3298,35 @@ void Verifier::feed_worker() {
                 f.stalls.fetch_add(1, std::memory_order_relaxed);
                 (void) cudaEventSynchronize(sl.ev);
             }
-            std::memcpy(sl.p, j->src[i], j->bytes);
+            // local (STRATA_PCIE_MMAP_PREAD): the blob's file bytes by pread into the slot (the io prefetch threads'
+            // descriptors, POSIX_FADV_RANDOM); a span the source cannot name or a short read: the memcpy as before
+            bool filled = false;
+#if defined(__linux__)
+            if (feed_spans_ != nullptr) {
+                int fd[2]; uint64_t off[2], len[2];
+                const int ns = feed_spans_(feed_spans_ctx_, j->src[i], j->bytes, fd, off, len);
+                if (ns > 0) {
+                    uint64_t at = 0;
+                    bool ok = true;
+                    for (int k = 0; k < ns && ok; ++k) {
+                        uint64_t done = 0;
+                        while (done < len[k]) {
+                            const ssize_t r = ::pread(fd[k], sl.p + at + done, (size_t) (len[k] - done), (off_t) (off[k] + done));
+                            if (r < 0 && errno == EINTR) continue;
+                            if (r <= 0) { ok = false; break; }
+                            done += (uint64_t) r;
+                        }
+                        at += len[k];
+                    }
+                    filled = ok && at == j->bytes;
+                }
+                if (filled) f.preads.fetch_add(1, std::memory_order_relaxed);
+            }
+#endif
+            if (!filled) {
+                std::memcpy(sl.p, j->src[i], j->bytes);
+                f.memcpys.fetch_add(1, std::memory_order_relaxed);
+            }
             {
                 std::lock_guard<std::mutex> il(f.issue_mu);
                 cudaMemcpyAsync(j->stage + (size_t) i * j->bytes, sl.p, j->bytes, cudaMemcpyHostToDevice, copy_);
