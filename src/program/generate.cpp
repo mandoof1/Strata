@@ -8506,9 +8506,54 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: STRATA_ROUTE_PRIOR_KEEP=%s (changes the output): the router's own top %s "
                                  "stay, only the later ranks are picked with STRATA_ROUTE_PRIOR's bonus\n", pk, pk);
         // local (STRATA_NO_PCIE_WAIT=1): no miss can take the PCIe path (no pinned RAM copy, one GPU, no helper caches):
+        // local (STRATA_PCIE_MMAP=1, opt-in; off: nothing below runs): with --mmap-experts and no pinned RAM copy the
+        // PCIe share (--pcie-frac) was inert - pinned() is false for every blob, so the plan never gave the GPU a miss and
+        // the CPU computed them all while the GPU waited.  The feed: the plan takes the share from the misses whose
+        // pages the page cache holds (never a cold one) and hands the verifier the mapped pointers; feeder threads copy
+        // them into pinned slots and DMA the slots into staging on the copy stream, flag B behind the layer's copies
+        // (Verifier::MmapFeed).  DMA mode for the window graphs (staging, not a device alias).  Not with a pinned RAM
+        // copy (the share reads it as before), a second stage, a peer, helper or batch slots.
+        bool pcie_mmap_on = false;
+        if (const char* pm = std::getenv("STRATA_PCIE_MMAP"); pm != nullptr && pm[0] == '1') {
+            const int pm_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+            bool pm_helper = false;   // a helper GPU's cache (RemoteExperts)
+            for (const int r : o.expert_cache_remote) pm_helper = pm_helper || r > 0;
+            std::string why;
+            if (srcp != &src || !o.mmap_experts) why = "it needs --mmap-experts (the experts.bin mapping)";
+            else if (src.complement_pinned()) why = "a pinned RAM copy exists: the PCIe share reads it as before";
+            else if (!src.page_probe()) why = "it needs STRATA_IO_PREFETCH=1 on an experts.bin mapping (the page-cache probe)";
+            else if (n_stages != 1 || remote_opt || o.peer_device >= 0 || o.batch > 0 || pm_helper)
+                why = "one GPU, one stage, no helper GPU, no batch slots only";
+            else if (pm_num <= 0) why = "--pcie-frac is 0: no share to feed";
+            else {
+                int pm_slots = 32, pm_threads = 2;
+                if (const char* v = std::getenv("STRATA_PCIE_MMAP_SLOTS")) pm_slots = std::max(16, std::min(256, std::atoi(v)));
+                if (const char* v = std::getenv("STRATA_PCIE_MMAP_THREADS")) pm_threads = std::max(1, std::min(8, std::atoi(v)));
+                const size_t pm_bytes = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+                if (ver.set_pcie_mmap_feed(pm_slots, pm_threads, pm_bytes, why)) {
+                    pcie_mmap_on = true;
+                    drive.d.pcie_mmap = true;
+                    std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP=1: the PCIe share (pcie_frac %.2f, the last %d/256 of a layer's "
+                                         "misses whose pages are cached) is fed from the mapping through %d pinned slots of %.1f MB "
+                                         "(%.0f MB) by %d feeder thread%s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
+                                 o.pcie_frac, pm_num, pm_slots, (double) pm_bytes / 1e6, (double) pm_slots * (double) pm_bytes / 1e6,
+                                 pm_threads, pm_threads == 1 ? "" : "s");
+#if defined(STRATA_USE_HIP)
+                    // Verifier::init: the copy stream shares a hardware queue with the window's unless it has a priority
+                    // of its own, and the window's graph spins on the flag the copies raise
+                    if (const char* cp = std::getenv("STRATA_COPY_HIP_PRIO"); cp == nullptr || std::atoi(cp) == 0)
+                        std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP: note: the copies go on the copy stream (DMA mode); "
+                                             "on HIP give it its own hardware queue with STRATA_COPY_HIP_PRIO=1 if a window "
+                                             "times out waiting for the PCIe share\n");
+#endif
+                }
+            }
+            if (!pcie_mmap_on)
+                std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP=1 ignored: %s\n", why.c_str());
+        }
         // the window graphs leave out every layer's flag-B wait and empty PCIe group launch (see Verifier::set_no_pcie)
         if (const char* nv = std::getenv("STRATA_NO_PCIE_WAIT"); nv != nullptr && nv[0] == '1') {
-            bool none = srcp == &src && n_stages == 1 && !remote_opt && !src.complement_ready();
+            bool none = srcp == &src && n_stages == 1 && !remote_opt && !src.complement_ready() && !pcie_mmap_on;
             for (const int r : o.expert_cache_remote) none = none && r <= 0;
             for (int64_t l = 0; l < g.n_layers && none; ++l) none = !src.pcie_layer(l);
             ver.set_no_pcie(none);
@@ -8575,7 +8620,7 @@ int main(int argc, char** argv) {
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_mode(pcie_mmap_on ? 0 : o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);   // (STRATA_PCIE_MMAP: DMA)
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it
@@ -14216,6 +14261,16 @@ int main(int argc, char** argv) {
                     io_prev = io_now;
                     ic_prev = ic;
                     fb_prev = fb;
+                }
+                if (drive.d.pcie_mmap) {   // local (STRATA_PCIE_MMAP=1), this request
+                    static int64_t pm_e = 0, pm_b = 0;
+                    static uint64_t pm_s = 0;
+                    const uint64_t pm_st = ver.pcie_mmap_stalls();
+                    std::fprintf(stderr, "strata serve: PCIe from the mapping this request: %lld experts (%.1f MB) fed through the "
+                                         "pinned slots, %llu stalls waiting for a free slot\n",
+                                 (long long) (drive.d.pcie_mmap_experts - pm_e), (double) (drive.d.pcie_mmap_bytes - pm_b) / 1e6,
+                                 (unsigned long long) (pm_st - pm_s));
+                    pm_e = drive.d.pcie_mmap_experts; pm_b = drive.d.pcie_mmap_bytes; pm_s = pm_st;
                 }
                 // local (iq3d): what the prompt path's unbuffered reads did this request
                 if (src.prompt_direct()) {

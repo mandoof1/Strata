@@ -4527,7 +4527,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
         }
-        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
+        // local (STRATA_PCIE_MMAP=1): no pinned RAM copy (pcie_layer false), so the share is fed from the mapping: the
+        // last `m` misses in routing order whose blob pages the page cache holds (probe_cold 0), skipping the cold ones
+        // (they stay with the CPU / the defer path).  Only on the plain single-GPU path (as the cold skip).  The probes
+        // made here are handed to prefetch_probed below, so no blob is probed twice.
+        const bool feed = d.pcie_mmap && d.pcie_num > 0 && d.fs == nullptr && d.peer == nullptr && d.remote_count == 0 &&
+                          !alt_active && !d.src->pcie_layer(d.layers);
+        const bool pcie_ok = d.pcie_num > 0 && (feed || d.src->pcie_layer(d.layers));
         int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         // STRATA_PCIE_MIN1 (opt-in): the share rounds to 0 for 1-2 misses per layer, so the PCIe lane idles on the typical
         // decode step; with >= 2 misses give it at least one (the last in routing order).  It only flies if its blob is
@@ -4538,6 +4544,28 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
+        bool feed_d[kMaxWindowEntries];
+        for (int q = 0; q < nd; ++q) feed_d[q] = false;
+        if (feed && m > 0) {
+            const int cap = (int) std::min<int64_t>(P.staging_cap, 64);
+            int chosen = 0;
+            for (int q = nd - 1; q >= 0 && chosen < m && chosen < cap; --q) {   // the last misses first, as the share is cut
+                const int32_t e = ids[distinct[q]];
+                if (skip_d[q] || fs_taken[q] || e < 0 || e >= d.n_expert) continue;
+                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                int pc = -1;
+                for (int r = 0; r < npr && pc < 0; ++r)
+                    if (pr_e[r] == e) pc = pr_c[r];
+                if (pc < 0) {
+                    pc = d.src->probe_cold(d.layers, e);
+                    if (pc < 0) break;   // this source cannot tell (no page-cache tier): no feed this layer
+                    if (npr < kMaxWindowEntries) { pr_e[npr] = e; pr_c[npr] = (int8_t) pc; ++npr; }
+                }
+                if (pc != 0) continue;   // cold: the CPU reads and computes it (or defers it), as before
+                feed_d[q] = true;
+                ++chosen;
+            }
+        }
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
@@ -4567,7 +4595,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
+                    if (feed_d[q] && fetches < P.staging_cap && fetches < 64) {   // STRATA_PCIE_MMAP: the mapping, fed by the verifier
+                        const uint8_t* src = d.src->blob(d.layers, e);
+                        if (src != nullptr) {
+                            kd = 1;
+                            dma_src[fetches] = src;
+                            pcie_i0[fetches] = i0;
+                            ++fetches;
+                            ++d.pcie_mmap_experts;
+                            d.pcie_mmap_bytes += (int64_t) lay.blob_bytes(d.layers);
+                        }
+                    } else if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;

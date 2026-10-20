@@ -507,6 +507,11 @@ struct ExpertDispatch {
     GpuPlanSink* plan = nullptr;
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
+    /// local (STRATA_PCIE_MMAP=1, set by the driver): with no pinned RAM copy, the PCIe share is taken from the missed
+    /// experts whose blob pages the page cache holds (probe_cold == 0), handed to the verifier's feeder as the mapping
+    /// (never a cold one: those stay on the CPU / defer path).  The counters: distinct experts fed and their bytes.
+    bool pcie_mmap = false;
+    int64_t pcie_mmap_experts = 0, pcie_mmap_bytes = 0;
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;
@@ -860,6 +865,8 @@ public:
     // The bytes are the same bytes, so the output is the same.  `threads` = I/O threads (0: default 4).
     void set_io_prefetch(bool on, int threads);
     bool io_prefetch() const { return io_pf_; }
+    /// local (STRATA_PCIE_MMAP): `probe_cold` can answer and `blob` hands out the mapping (experts.bin, io prefetch on)
+    bool page_probe() const { return staged() && io_fill_ && io_pf_ && direct_.empty(); }
     /// Counts the cached / uncached bytes of every blob read from the files (mincore, page-granular).  Free with
     /// io_prefetch; otherwise opt in with STRATA_IO_STATS=1 (the check costs a few microseconds per blob).
     void set_io_stats(bool on) { io_stats_ = on || io_pf_; }

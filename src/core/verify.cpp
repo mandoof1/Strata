@@ -56,6 +56,8 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <string>
 #include <thread>
 #include <vector>
@@ -443,6 +445,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     _mm_sfence();
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
+    (void) feed_drain(timeout_ms);   // local (STRATA_PCIE_MMAP): the feeder's own flag-B writes go first
     for (cudaStream_t s : {cs_, copy_}) {
         if (s == nullptr) continue;
         while (cudaStreamQuery(s) == cudaErrorNotReady) {
@@ -565,6 +568,7 @@ Verifier::~Verifier() {
     if (pf_cs_) cudaStreamDestroy(pf_cs_);
     if (ev_pplan_) cudaEventDestroy(ev_pplan_);
     if (ev_pjoin_) cudaEventDestroy(ev_pjoin_);
+    feed_stop();   // local (STRATA_PCIE_MMAP): the feeders and their slots, before the copy stream
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (ev_done_) cudaEventDestroy(ev_done_);
@@ -2622,6 +2626,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
+    feed_drain();   // local (STRATA_PCIE_MMAP): the feeder is idle before b_streamed_ is read
     if (b_streamed_ != 0 && *(volatile uint32_t*) h_flagB_ < b_streamed_) cudaStreamSynchronize(copy_);   // (landed)
     b_streamed_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
@@ -2908,6 +2913,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
+        feed_drain();   // local (STRATA_PCIE_MMAP): every queued copy is on the stream before it is drained
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
         copy_used_ = false;
     }
@@ -3018,6 +3024,11 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
+    if (v->feed_ != nullptr) {   // local (STRATA_PCIE_MMAP): the mapped blobs go through the feeder's pinned slots
+        v->copy_used_ = true;
+        v->feed_enqueue(src, n, bytes, (uint8_t*) v->sink_.staging, want);
+        return;
+    }
     if (n <= 0) { v->raise_b(want); return; }
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
@@ -3037,6 +3048,11 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
             std::abort();
         }
     }
+    v->flag_b_after_copies(want);
+}
+
+void Verifier::flag_b_after_copies(uint32_t want) {
+    Verifier* v = this;
 #if defined(STRATA_USE_HIP)
     // STRATA_DMA_FLAG_WRITE (on; =0 a host function): the copy stream writes flag B itself once the uploads have
     // landed.  A host function reaches the GPU 15.0 us after the copies' end (a HIP runtime thread wakes for it), the
@@ -3053,7 +3069,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
         (void) hipGetLastError();   // (a host function below)
     }
 #endif
-    FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
+    FlagSet& fs = v->flag_sets_[(want - 1) % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];   // (cur_layer_ = want - 1)
     fs.flag = v->h_flagB_;
     fs.value = want;
     cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
@@ -3063,6 +3079,15 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
 // the last one has not landed, a direct raise could be lowered by it (a split window's second group with no PCIe
 // share raising past the first group's write still in flight), so the raise goes behind it on the stream.
 void Verifier::raise_b(uint32_t want) {
+    if (feed_ != nullptr) {   // local (STRATA_PCIE_MMAP): behind the layers queued before it, on the feeder
+        copy_used_ = true;
+        feed_enqueue(nullptr, 0, 0, nullptr, want);
+        return;
+    }
+    raise_b_now(want);
+}
+
+void Verifier::raise_b_now(uint32_t want) {
 #if defined(STRATA_USE_HIP)
     if (b_streamed_ != 0 && *(volatile uint32_t*) h_flagB_ < b_streamed_) {
         if (hipStreamWriteValue32(copy_, (void*) m_flagB_, want, 0) == hipSuccess) {
@@ -3074,6 +3099,212 @@ void Verifier::raise_b(uint32_t want) {
     }
 #endif
     raise_flag(h_flagB_, want);
+}
+
+// ---- local (STRATA_PCIE_MMAP=1): the PCIe share fed from the mapping.
+//
+// With --mmap-experts and no pinned RAM copy the plan could never give the GPU a PCIe share (pinned() is false for every
+// blob), so the CPU computed every miss while the GPU spun on flag B.  The feed: the plan picks the share among the
+// misses whose pages the page cache holds and hands fetch_dma the mapped pointers; the host thread queues one job per
+// layer (group) and goes on to its own experts.  Feeder threads take the job's blobs: memcpy from the mapping into a
+// pinned slot (never a slot whose last DMA has not been queued, and only after that DMA's event - PR 1237's race), then
+// the slot's cudaMemcpyAsync into this group's staging on the copy stream and the slot's event behind it.  The worker
+// that finishes a job's last blob raises flag B exactly as fetch_dma did (behind every copy of the layer on the stream),
+// and in layer order: a job's flag write waits for its turn, so the stream's plain flag stores (STRATA_DMA_FLAG_WRITE)
+// can never put a later layer's value before an earlier layer's copies.  A job with no blobs (an empty share, or the
+// host's own raise_b for a layer without a plan) only takes its turn.  The host reads b_streamed_ only after
+// feed_drain(), at the window's edges, where the feeder is idle.
+struct Verifier::MmapFeed {
+    struct Slot {
+        uint8_t* p = nullptr;
+        cudaEvent_t ev = nullptr;
+        bool recorded = false;   // ev records the DMA that last read p
+        bool busy = false;       // taken for a memcpy whose DMA is not yet queued (under mu)
+    };
+    struct Job {
+        uint64_t seq = 0;
+        uint32_t want = 0;
+        int n = 0;
+        size_t bytes = 0;
+        uint8_t* stage = nullptr;
+        int taken = 0, done = 0;
+        const uint8_t* src[64] = {};
+    };
+    std::mutex mu;                       // jobs, the slots' busy flags, take_seq / turn
+    std::mutex issue_mu;                 // one thread at a time issues on the copy stream
+    std::condition_variable cv;          // the feeders: a job to take, a slot freed, a turn
+    std::condition_variable cv_host;     // the host: the queue drained
+    std::deque<Job> jobs;                // seq turn .. next_seq - 1 (deque: references stay valid across push/pop)
+    uint64_t next_seq = 0, take_seq = 0, turn = 0;
+    std::vector<Slot> slots;
+    size_t slot_bytes = 0;
+    int next_slot = 0;
+    bool quit = false;
+    std::vector<std::thread> threads;
+    std::atomic<uint64_t> stalls{0};
+};
+
+bool Verifier::set_pcie_mmap_feed(int slots, int threads, size_t slot_bytes, std::string& err) {
+    if (feed_ != nullptr) { err = "the feed is already set"; return false; }
+    if (copy_ == nullptr) { err = "no copy stream"; return false; }
+    if (slots < 1 || threads < 1 || slot_bytes == 0) { err = "no slots, threads or bytes"; return false; }
+    const OnDevice on_device(device_);
+    MmapFeed* f = new MmapFeed();
+    f->slot_bytes = slot_bytes;
+    f->slots.resize((size_t) slots);
+    for (MmapFeed::Slot& sl : f->slots) {
+        if (cudaHostAlloc((void**) &sl.p, slot_bytes, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            sl.p = nullptr;
+            err = "the pinned slots could not be allocated (" + std::to_string((double) slots * (double) slot_bytes / 1048576.0) + " MiB)";
+            break;
+        }
+        if (cudaEventCreateWithFlags(&sl.ev, cudaEventDisableTiming) != cudaSuccess) {
+            (void) cudaGetLastError();
+            sl.ev = nullptr;
+            err = "the slot events could not be created";
+            break;
+        }
+    }
+    if (!err.empty()) {
+        for (MmapFeed::Slot& sl : f->slots) {
+            if (sl.ev) cudaEventDestroy(sl.ev);
+            if (sl.p) cudaFreeHost(sl.p);
+        }
+        delete f;
+        return false;
+    }
+    feed_ = f;
+    for (int i = 0; i < threads; ++i) f->threads.emplace_back([this] { feed_worker(); });
+    return true;
+}
+
+uint64_t Verifier::pcie_mmap_stalls() const {
+    return feed_ != nullptr ? feed_->stalls.load(std::memory_order_relaxed) : 0;
+}
+
+void Verifier::feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint8_t* stage, uint32_t want) {
+    MmapFeed& f = *feed_;
+    if (n > 64) n = 64;   // (the plan caps its fetches at 64 and the staging slots)
+    std::lock_guard<std::mutex> lk(f.mu);
+    f.jobs.emplace_back();
+    MmapFeed::Job& j = f.jobs.back();
+    j.seq = f.next_seq++;
+    j.want = want;
+    j.n = n;
+    j.bytes = bytes;
+    j.stage = stage;
+    for (int i = 0; i < n; ++i) j.src[i] = src[i];
+    f.cv.notify_all();
+}
+
+bool Verifier::feed_drain(int timeout_ms) {
+    if (feed_ == nullptr) return true;
+    MmapFeed& f = *feed_;
+    std::unique_lock<std::mutex> lk(f.mu);
+    if (timeout_ms < 0) {
+        f.cv_host.wait(lk, [&] { return f.jobs.empty(); });
+        return true;
+    }
+    return f.cv_host.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] { return f.jobs.empty(); });
+}
+
+bool Verifier::feed_idle() {
+    if (feed_ == nullptr) return true;
+    std::lock_guard<std::mutex> lk(feed_->mu);
+    return feed_->jobs.empty();
+}
+
+void Verifier::feed_stop() {
+    if (feed_ == nullptr) return;
+    MmapFeed* f = feed_;
+    {
+        std::lock_guard<std::mutex> lk(f->mu);
+        f->quit = true;
+    }
+    f->cv.notify_all();
+    for (std::thread& t : f->threads)
+        if (t.joinable()) t.join();
+    if (copy_) cudaStreamSynchronize(copy_);   // the slots' DMAs, before the slots go
+    for (MmapFeed::Slot& sl : f->slots) {
+        if (sl.ev) cudaEventDestroy(sl.ev);
+        if (sl.p) cudaFreeHost(sl.p);
+    }
+    (void) cudaGetLastError();
+    feed_ = nullptr;
+    delete f;
+}
+
+void Verifier::feed_worker() {
+    MmapFeed& f = *feed_;
+    (void) cudaSetDevice(device_);
+    for (;;) {
+        MmapFeed::Job* j = nullptr;
+        int i = -1, s = -1;
+        {
+            std::unique_lock<std::mutex> lk(f.mu);
+            f.cv.wait(lk, [&] { return f.quit || f.take_seq < f.next_seq; });
+            if (f.quit) return;
+            j = &f.jobs[(size_t) (f.take_seq - f.jobs.front().seq)];   // (turn <= take_seq: a job is popped only once taken whole)
+            if (j->n == 0) {
+                ++f.take_seq;                                           // nothing to copy: its turn below
+            } else {
+                i = j->taken++;
+                if (j->taken == j->n) ++f.take_seq;
+                s = f.next_slot;
+                f.next_slot = (f.next_slot + 1) % (int) f.slots.size();
+                // the slot's last taker has not queued its DMA yet (the feed is more than a ring behind): wait for it
+                if (f.slots[(size_t) s].busy) f.stalls.fetch_add(1, std::memory_order_relaxed);
+                while (f.slots[(size_t) s].busy && !f.quit) f.cv.wait(lk);
+                if (f.quit) return;
+                f.slots[(size_t) s].busy = true;
+            }
+        }
+        if (i >= 0) {
+            MmapFeed::Slot& sl = f.slots[(size_t) s];
+            // the DMA that last read this slot has landed before it is overwritten (PR 1237: a page-locked buffer is
+            // read by the copy engine after the call returned)
+            if (sl.recorded && cudaEventQuery(sl.ev) != cudaSuccess) {
+                f.stalls.fetch_add(1, std::memory_order_relaxed);
+                (void) cudaEventSynchronize(sl.ev);
+            }
+            std::memcpy(sl.p, j->src[i], j->bytes);
+            {
+                std::lock_guard<std::mutex> il(f.issue_mu);
+                cudaMemcpyAsync(j->stage + (size_t) i * j->bytes, sl.p, j->bytes, cudaMemcpyHostToDevice, copy_);
+                if (cudaEventRecord(sl.ev, copy_) == cudaSuccess) {
+                    sl.recorded = true;
+                } else {                          // no event: the copy is waited for here instead (as PinnedRing)
+                    (void) cudaGetLastError();
+                    cudaStreamSynchronize(copy_);
+                    sl.recorded = false;
+                }
+            }
+            bool last = false;
+            {
+                std::lock_guard<std::mutex> lk(f.mu);
+                sl.busy = false;
+                last = ++j->done == j->n;
+            }
+            f.cv.notify_all();
+            if (!last) continue;
+        }
+        // the job's flag B, in layer order, behind every copy of the layer on the copy stream
+        {
+            std::unique_lock<std::mutex> lk(f.mu);
+            f.cv.wait(lk, [&] { return f.quit || f.turn == j->seq; });
+            if (f.quit) return;
+            {
+                std::lock_guard<std::mutex> il(f.issue_mu);
+                if (j->n == 0) raise_b_now(j->want);
+                else flag_b_after_copies(j->want);
+            }
+            ++f.turn;
+            f.jobs.pop_front();
+        }
+        f.cv.notify_all();
+        f.cv_host.notify_all();
+    }
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -3520,6 +3751,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
+    feed_drain();   // local (STRATA_PCIE_MMAP): the feeder is idle before b_streamed_ is read
     if (b_streamed_ != 0 && *(volatile uint32_t*) h_flagB_ < b_streamed_) cudaStreamSynchronize(copy_);   // (landed)
     b_streamed_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
@@ -3568,6 +3800,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         }
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
+        feed_drain();   // local (STRATA_PCIE_MMAP)
         cudaStreamSynchronize(copy_);
         if (prof_on_) collect_profile();
         ++windows;
@@ -3636,6 +3869,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
+    feed_drain();   // local (STRATA_PCIE_MMAP)
     cudaStreamSynchronize(copy_);
     if (prof_on_) collect_profile();
     ++windows;
@@ -3797,6 +4031,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     const cudaError_t q = cudaStreamQuery(cs_);
     if (q == cudaErrorNotReady) return 0;
     if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
+    if (!feed_idle()) return 0;                           // local (STRATA_PCIE_MMAP): the feeder has queued every copy
     const cudaError_t qc = cudaStreamQuery(copy_);   // no host function of this window may raise flag B in the next
     if (qc == cudaErrorNotReady) return 0;
     if (prof_on_) collect_profile();
@@ -4105,7 +4340,7 @@ bool Verifier::done(std::string& err) {
     }
     if (q != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(q); return false; }
     if (copy_used_) {   // no host function of this window may raise flag B in the next one
-        if (cudaStreamQuery(copy_) == cudaErrorNotReady) return false;
+        if (!feed_idle() || cudaStreamQuery(copy_) == cudaErrorNotReady) return false;   // (feed_idle: STRATA_PCIE_MMAP)
         copy_used_ = false;
     }
     return true;

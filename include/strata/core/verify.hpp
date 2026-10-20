@@ -265,6 +265,14 @@ public:
     /// local (STRATA_NO_PCIE_WAIT=1): the caller knows no miss can take the PCIe path (no pinned RAM copy), so the
     /// window graphs leave out the flag-B wait and the PCIe group launch of every layer.  Before a capture.
     void set_no_pcie(bool on) { no_pcie_ = on; }
+    /// local (STRATA_PCIE_MMAP=1): the PCIe share fed from the experts.bin mapping (no pinned RAM copy).  `slots` pinned
+    /// slots of `slot_bytes` and `threads` feeder threads: a feeder copies a mapped blob into a free slot (memcpy), queues
+    /// the slot's DMA into staging on the copy stream and records the slot's event (the slot is refilled only after it),
+    /// and the last blob of a layer is followed by flag B on the same stream.  The host thread only queues (fetch_dma,
+    /// raise_b).  DMA mode (set_pcie_mode(0)); before the first window.  False with the reason in `err`.
+    bool set_pcie_mmap_feed(int slots, int threads, size_t slot_bytes, std::string& err);
+    bool pcie_mmap_feed() const { return feed_ != nullptr; }
+    uint64_t pcie_mmap_stalls() const;   ///< feeder waits for a slot whose last DMA had not landed (or was not queued)
     cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
@@ -498,10 +506,21 @@ private:
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
+    void flag_b_after_copies(uint32_t want);   // fetch_dma's tail: flag B behind the copies on the copy stream
     /// STRATA_DMA_FLAG_WRITE: the last value the copy stream was given to write into flag B (0: none this window);
     /// while it has not landed, a later raise of flag B goes behind it on the stream (a direct store could be lowered)
     uint32_t b_streamed_ = 0;
     void raise_b(uint32_t want);
+    void raise_b_now(uint32_t want);           // raise_b on the calling thread (the feeder's, or the host's without a feed)
+    // local (STRATA_PCIE_MMAP): the feeder (set_pcie_mmap_feed).  With a feed, every raise of flag B of a window goes
+    // through its queue in layer order, so b_streamed_ is the feeders' alone between feed_drain()s.
+    struct MmapFeed;
+    MmapFeed* feed_ = nullptr;
+    void feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint8_t* stage, uint32_t want);
+    void feed_worker();
+    bool feed_drain(int timeout_ms = -1);      // the host: every queued job issued (true; no-op without a feed)
+    bool feed_idle();
+    void feed_stop();
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
