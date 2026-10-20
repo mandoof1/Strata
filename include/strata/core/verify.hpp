@@ -299,6 +299,13 @@ public:
     /// host records on the drained copy stream at each window's start.  After set_pcie_mmap_feed.
     bool set_pcie_mmap_landed(std::string& err);
     bool pcie_mmap_landed() const { return feed_landed_; }
+    /// local (STRATA_PCIE_MMAP_LATE=1): in the window graphs, a layer's wait for the CPU rows' flag (the partial flag
+    /// of a deferred layer with the heavy split, the window flag otherwise) goes BEFORE its flag-B wait and PCIe group
+    /// launch, so a fed share that lands after the CPU rows stalls the GPU once, on the later of the two.  Only with
+    /// the feed (DMA mode, no fork, no device plan); a deferred layer whose every CPU row joins late is unchanged.
+    /// Before a capture.
+    void set_pcie_mmap_late(bool on) { feed_late_ = on; }
+    bool pcie_mmap_late() const { return feed_late_; }
     bool pcie_mmap_feed() const { return feed_ != nullptr; }
     uint64_t pcie_mmap_stalls() const;   ///< feeder waits for a slot whose last DMA had not landed (or was not queued)
     cudaStream_t stream() const { return cs_; }
@@ -563,6 +570,7 @@ private:
     static void feed_done_stamp(MmapFeed& f, uint64_t seq);   // the completion ring the plan's timing reads
     // local (STRATA_PCIE_MMAP_LANDED): the landed ring (set_pcie_mmap_landed)
     bool feed_landed_ = false;
+    bool feed_late_ = false;   // local (STRATA_PCIE_MMAP_LATE): the CPU rows' flag before flag B in record_window's post
     static void feed_land_stamp(MmapFeed& f, uint64_t seq, int64_t ns);   // the landed ring (-1: lost); caller holds land_mu
     void feed_landed_record(MmapFeed& f, uint64_t seq, bool copies);     // the feeder, right after the job's flag B (issue_mu held)
     void feed_landed_poll(MmapFeed& f, bool all);                        // the queued events, stamped; `all`: wait for each (an edge)

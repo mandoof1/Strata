@@ -1971,6 +1971,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // STRATA_PCIE_FORK: the native layouts only (their scratch is per entry: the PCIe entries follow the VRAM ones)
         const bool pcie_fork = g_pcie_fork && pf_cs_ != nullptr && !prof_on_ && !ar_on() && !device_plan_ &&
                                sink_.pcie_mode != 2 && lay.native && !no_pcie_;   // iq3b: no PCIe share, no fork
+        // local (STRATA_PCIE_MMAP_LATE=1): the CPU rows' flag this post waits for anyway - the partial flag of a
+        // deferred layer with the heavy split, the window flag of a layer that is not deferred, none where every CPU
+        // row joins late (late_add) - waited for BEFORE flag B, so a fed share whose copies land after the CPU rows
+        // stalls the GPU once, on the later of the two, and the PCIe groups run once the rows are there.  The explicit
+        // waits below are skipped then; a fused wait (wait_copy_rows_from_mapped, the wait+combine kernels) spins on a
+        // flag already raised.  The rows themselves: the PCIe groups write their own entries of hit_out and the CPU rows
+        // are copied into their own of parts, both read by the combine after this - no sum changes its order.  Only
+        // with the feed, in DMA mode, off the fork, the device plan and the all-resident path.
+        const uint32_t* late_flag = nullptr;
+        if (feed_late_ && feed_ != nullptr && !no_pcie_ && !pcie_fork && !device_plan_ && sink_.pcie_mode == 0 && !ar_on())
+            late_flag = deferred(l) ? (heavy && m_pflag_ != nullptr ? m_pflag_ : nullptr) : m_flag_;
         bool hits_in_combine = false;
         if (ar_on()) {
             stamp(l, 19, grp);
@@ -2007,6 +2018,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // empty group launch on any layer (the host still raises flag B; nothing waits for it).  (iq3b: merged with
             // the imdad fork's STRATA_PCIE_FORK, which is off under no_pcie_, and its fused staging wait)
             if (!no_pcie_) {
+            if (late_flag != nullptr) wait_flag_ge(late_flag, ring, cs);   // local (STRATA_PCIE_MMAP_LATE): the CPU rows first
             if (pcie_fork) {}   // (above, on its own stream)
             else if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else if (!(g_wait_fuse() && sink_.pcie_mode == 2))
@@ -2041,7 +2053,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (dfused) {
                 stamp(l, 23, grp);
             } else if (deferred(l)) {
-                if (heavy) wait_flag_ge(m_pflag_, ring, cs);   // STRATA_VERIFY_DEFER_CPU_BELOW: the heavy rows (waitCPU)
+                if (heavy && late_flag == nullptr) wait_flag_ge(m_pflag_, ring, cs);   // STRATA_VERIFY_DEFER_CPU_BELOW: the heavy rows (waitCPU; LATE: above)
                 stamp(l, 23, grp);   // (no split, no wait: the zeroing counts as copy+combine, as the copy it replaces)
 #if !defined(STRATA_GPU_METAL)   // (as late_add's defer_add_rows)
                 if (heavy)
@@ -2060,7 +2072,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                            native_moe_combine_enabled() && !sg_gated_[grp] && K == 10 &&
                            native_moe_wait_combine_ok(m_ymiss_ + (size_t) tb * K * N, hit_out, shared_ + tb * N, bo_ + tb * N,
                                                       N, K, n);
-                if (!fuse_rows) wait_flag_ge(m_flag_, ring, cs);   // the CPU's share is in the mapped rows
+                if (!fuse_rows && late_flag == nullptr) wait_flag_ge(m_flag_, ring, cs);   // the CPU's share is in the mapped rows (LATE: above)
                 stamp(l, 23, grp);
                 if (wc_fused) {}   // the combine below waits for the rows and reads them
                 else if (fuse_rows)

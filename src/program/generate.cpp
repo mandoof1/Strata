@@ -8587,6 +8587,13 @@ int main(int argc, char** argv) {
                         } else
                             std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP_LANDED=1 ignored: %s\n", lwhy.c_str());
                     }
+                    // local (STRATA_PCIE_MMAP_LATE=1): the window graphs wait for the layer's CPU rows before flag B (one
+                    // stall on the later of the two instead of two; Verifier::set_pcie_mmap_late, before the capture)
+                    const char* pm_late = "flag B waited for before the CPU rows";
+                    if (const char* v = std::getenv("STRATA_PCIE_MMAP_LATE"); v != nullptr && v[0] == '1') {
+                        ver.set_pcie_mmap_late(true);
+                        pm_late = "the CPU rows' flag waited for before flag B, one stall on the later of the two (STRATA_PCIE_MMAP_LATE=1)";
+                    }
                     // local (STRATA_PCIE_MMAP_AUTO=1): the share per layer balanced against the pool (ExpertDispatch's EMAs)
                     std::string pm_auto = "the share as given";
                     if (const char* v = std::getenv("STRATA_PCIE_MMAP_AUTO"); v != nullptr && v[0] == '1') {
@@ -8598,7 +8605,7 @@ int main(int argc, char** argv) {
                                       drive.d.pm_landed ? "f the landed one" : "f the issued one");
                         pm_auto = buf;
                     }
-                    pm_auto += std::string(", ") + pm_landed;
+                    pm_auto += std::string(", ") + pm_landed + ", " + pm_late;
                     std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP=1: the PCIe share (pcie_frac %.2f, the last %d/256 of a layer's "
                                          "misses whose pages are cached) is fed from the mapping through %d pinned slots of %.1f MB "
                                          "(%.0f MB) by %d feeder thread%s %s, slots filled by %s, %s, %s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
