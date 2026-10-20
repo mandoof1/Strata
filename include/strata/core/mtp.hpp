@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -119,6 +120,17 @@ public:
     /// The steps the last draft() left out, by the same host rule, into `drafts` / `probs` (draft 0 is written again):
     /// what that draft() would have returned had the predicate said no.
     bool draft_resume(int32_t* drafts, std::string& err, float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+
+    // ---- STRATA_DRAFT_EARLY (the serve loop): draft() in two halves.  draft_launch stages the round's inputs and launches
+    // the round (every step too where min_p <= 0) and returns at once; draft_finish is the rest of draft() (the host rule
+    // over the steps, the final wait, the outputs).  The window's commit and emit run on the host between them: the
+    // round reads nothing the commit graph writes (its K/V is its own, the window's final rows are complete when the
+    // window's picks are).  `committed`: the n_committed tokens the commit keeps, for the PLE prefetch's history
+    // (draft() reads the session's ple_prev after the commit; here the commit comes later).
+    bool draft_launch(int T, const int32_t* tokens, int64_t p, int a, float min_p, std::string& err,
+                      const int32_t* committed = nullptr, int n_committed = 0);
+    bool draft_finish(int32_t* drafts, std::string& err, float* probs = nullptr, int* n_drafts = nullptr);
+    bool draft_launched() const { return run_.live; }
 
     /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
@@ -274,6 +286,16 @@ private:
         double cum = 1.0;
         int32_t ple_prev[2] = {0, 0};
     } resume_;
+    // the round between draft_launch and draft_finish (draft() is the two back to back)
+    struct RunState {
+        bool live = false, cp = false, do_ple = false;
+        int T = 0, max_steps = 0;
+        float min_p = 0.0f;
+        std::chrono::steady_clock::time_point t0;
+        double ms_launch = 0.0;      ///< the launch half's host time (ms_draft counts both halves, not what lies between)
+        int32_t ple_prev[2] = {0, 0};   ///< the PLE prefetch's history along the chain
+    } run_;
+    void ple_prefetch(int32_t tok);
     int32_t chain_tok_[8] = {};
     float chain_prob_[8] = {};
     int64_t n_vocab_ = 0;

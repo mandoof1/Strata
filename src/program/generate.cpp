@@ -13635,6 +13635,20 @@ int main(int argc, char** argv) {
             std::vector<int32_t> skbuf((size_t) S, 0);   // the predicate's own proposal buffer (sbuf is the loop's)
             bool draft_skipped = false;
             int64_t skip_windows = 0, skip_resumed = 0;
+            // STRATA_DRAFT_EARLY=1 (opt-in, exact): the draft round is launched as soon as the window's accepted count is
+            // known - before the adaptive tier's finalize and thread, the commit graph's launch, the non-finite check and
+            // the tokens' emit - and finished after them, so the host's commit/emit work overlaps the round on the GPU
+            // instead of leaving it idle.  The round reads none of what the commit graph writes (GDN conv / state, the
+            // QSA indexer tails, the PLE history: verify.cpp capture_commit; the drafter's K/V is its own and the window's
+            // final rows are complete once its picks are read).  The one host-side thing the commit changes that the
+            // drafter reads is ple_prev (its PLE page prefetch, a hint): the launch gets the commit's tokens and advances
+            // it the same way.  Not with coupled drafts under penalties (their history is staged after the emit) nor on a
+            // layer split (the commit is synchronous there).
+            static const bool draft_early = [] {
+                const char* e = std::getenv("STRATA_DRAFT_EARLY");
+                return e != nullptr && e[0] != '\0' && e[0] != '0';
+            }();
+            int64_t early_windows = 0;
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 if (draft_skipped) {
                     // STRATA_DRAFT_SUFFIX_SKIP: the last chain ended after draft 0 on this top's forecast.  The policy as it
@@ -13815,6 +13829,26 @@ int main(int argc, char** argv) {
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
                 const Clock::time_point tw1 = Clock::now();
+                // STRATA_DRAFT_EARLY: the round now, if the emit below will leave a draft to do (the same rule as the draft
+                // call after it: no draft after a stop token or the last token of the request)
+                bool draft_launched = false;
+                if (draft_early && use_mtp && !multi_gpu && !(mtp.coupled() && hist_n > 0)) {
+                    bool eos_ahead = false;
+                    int64_t pn = produced_n;
+                    for (int i = 0; i <= a && pn < max_new && !eos_ahead; ++i) {
+                        ++pn;
+                        eos_ahead = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                    }
+                    if (!eos_ahead && pn < max_new) {
+                        // the commit keeps the window's first a + 1 tokens (window[0..a]): the PLE history's advance
+                        if (!mtp.draft_launch(T, outv.data(), p, a, (float) req_spec_min_p, err, window.data(), a + 1)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        draft_launched = true;
+                        ++early_windows;
+                    }
+                }
                 finalize_layered();   // STRATA_ADAPT_LAYERWAIT: every layer has waited for its copies in this window
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
@@ -13836,6 +13870,8 @@ int main(int argc, char** argv) {
                 }
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
+                    if (draft_launched && !mtp.draft_finish(drafts.data(), err, dprob.data()))   // (its drafts are not used)
+                        std::fprintf(stderr, "strata serve: the early draft round after a non-finite window failed: %s\n", err.c_str());
                     if (!adapt_ok) {
                         std::printf("ERR an adaptive refill failed\n");
                         return 1;
@@ -13891,8 +13927,11 @@ int main(int argc, char** argv) {
                         [](void* u, int32_t d0, float p0) -> bool { return (*static_cast<std::function<bool(int32_t, float)>*>(u))(d0, p0); },
                         &sfx_skip_pred);
                 }
-                const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                // (STRATA_DRAFT_EARLY: a launched round is always finished, so the drafter never keeps one across windows)
+                const bool drafted = draft_launched
+                                         ? mtp.draft_finish(drafts.data(), err, dprob.data())
+                                         : !use_mtp || eos || produced_n >= max_new ||
+                                               mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 draft_skipped = drafted && use_mtp && mtp.draft_resumable();
                 {
                     const Clock::time_point tw3 = Clock::now();
@@ -14404,6 +14443,9 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: STRATA_DRAFT_SUFFIX_SKIP: %lld chains ended after draft 0 before a suffix "
                                      "window, %lld resumed (the forecast missed)\n",
                              (long long) skip_windows, (long long) skip_resumed);
+            if (draft_early && early_windows > 0)
+                std::fprintf(stderr, "strata serve: STRATA_DRAFT_EARLY: the draft round was launched before the commit on %lld of "
+                                     "%lld windows\n", (long long) early_windows, (long long) dec_windows);
             if (o.lookup_chain > 0)
                 std::fprintf(stderr, "strata serve: lookup chain: %lld of %lld windows, %lld of %lld chained drafts accepted\n",
                              (long long) chain_windows, (long long) dec_windows, (long long) chain_ok, (long long) chain_drafts);

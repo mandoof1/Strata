@@ -1625,15 +1625,40 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         return true;
     }
 #endif
+    if (!draft_launch(T, tokens, p, a, min_p, err)) return false;
+    return draft_finish(drafts, err, probs, n_drafts);
+}
+
+// The PLE prefetch for one token of the round's chain (its history in run_.ple_prev): a hint for the next window's
+// per-layer embedding pages, nothing the output depends on
+void MtpDrafter::ple_prefetch(int32_t tok) {
+    SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
+    if (!run_.do_ple || tok < 0 || pss == nullptr) return;
+    const Clock::time_point tp = Clock::now();
+    struct PleT { bool on; double& acc; Clock::time_point t; ~PleT() { if (on) acc += std::chrono::duration<double, std::milli>(Clock::now() - t).count(); } } ple_t{g_dt.on, g_dt.ple_ms, tp};
+    uint32_t rows16[strata::kernels::PLE_N_HEADS];
+    strata::kernels::ngram_rows(&tok, run_.ple_prev, 1, pss->ple.consts, rows16);
+    run_.ple_prev[0] = run_.ple_prev[1];
+    run_.ple_prev[1] = tok;
+    pss->ple.table->prefetch_rows(rows16);
+}
+
+// draft()'s first half: the graphs, the staged inputs, the round's launch (every step's too where min_p <= 0) and the
+// PLE prefetch for tokens[a]; it returns without waiting for the device.  STRATA_DRAFT_EARLY (the serve loop) calls it
+// before the window's commit and emit, with `committed` (the n_committed tokens the commit keeps) for the PLE history
+// that Verifier::commit advances on the host - draft() reads the session's after the commit, this runs before it.
+bool MtpDrafter::draft_launch(int T, const int32_t* tokens, int64_t p, int a, float min_p, std::string& err,
+                              const int32_t* committed, int n_committed) {
+#if defined(STRATA_GPU_METAL)
+    (void) T; (void) tokens; (void) p; (void) a; (void) min_p; (void) committed; (void) n_committed;
+    err = "mtp: draft_launch is not available on Metal";
+    return false;
+#endif
     const OnDevice on_device(device_);
+    if (run_.live) { err = "mtp: a draft round is already launched"; return false; }
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
-    // STRATA_DRAFT_SUFFIX_SKIP: this round's predicate (one-shot); a new round ends any chain left to resume
-    const SkipAfterFirstFn skip_fn = skip_fn_;
-    void* const skip_user = skip_user_;
-    skip_fn_ = nullptr;
-    skip_user_ = nullptr;
-    resume_.valid = false;
+    resume_.valid = false;   // (STRATA_DRAFT_SUFFIX_SKIP: a new round ends any chain left to resume)
     // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected
     // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
     if (!mtp_catchup_all()) T = a + 1;
@@ -1669,21 +1694,22 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
     const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
-    int32_t ple_prev[2] = {do_ple ? pss->ple_prev[0] : 0, do_ple ? pss->ple_prev[1] : 0};
-    const bool dth = g_dt.on;
+    run_.do_ple = do_ple;
+    run_.ple_prev[0] = do_ple ? pss->ple_prev[0] : 0;
+    run_.ple_prev[1] = do_ple ? pss->ple_prev[1] : 0;
+    // STRATA_DRAFT_EARLY: the commit's advance of the session's ple_prev (Verifier::commit's host side), ahead of it
+    for (int t = 0; do_ple && committed != nullptr && t < n_committed; ++t) {
+        run_.ple_prev[0] = run_.ple_prev[1];
+        run_.ple_prev[1] = committed[t];
+    }
+    run_.T = T;
+    run_.cp = cp;
+    run_.max_steps = max_steps;
+    run_.min_p = min_p;
+    run_.t0 = t0;
+    run_.ms_launch = 0.0;
     auto hms = [](Clock::time_point a0) { return std::chrono::duration<double, std::milli>(Clock::now() - a0).count(); };
-    auto prefetch_ple = [&](int32_t tok) {
-        if (!do_ple || tok < 0) return;
-        const Clock::time_point tp = Clock::now();
-        struct PleT { bool on; double& acc; Clock::time_point t; ~PleT() { if (on) acc += std::chrono::duration<double, std::milli>(Clock::now() - t).count(); } } ple_t{dth, g_dt.ple_ms, tp};
-        uint32_t rows16[strata::kernels::PLE_N_HEADS];
-        strata::kernels::ngram_rows(&tok, ple_prev, 1, pss->ple.consts, rows16);
-        ple_prev[0] = ple_prev[1];
-        ple_prev[1] = tok;
-        pss->ple.table->prefetch_rows(rows16);
-    };
 
-    int n = 0;
     if (min_p <= 0.0f && max_steps > 0) {
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
@@ -1696,7 +1722,51 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
         }
         (void) cudaStreamQuery(cs_);
-        prefetch_ple(tokens[a]);
+        ple_prefetch(tokens[a]);
+    } else if (max_steps > 0) {
+        g_dt.init();
+        const bool dt = g_dt.on;
+        if (dt) g_dt.pre_ms += hms(t0);
+        if (dt) cudaEventRecord(g_dt.eb[0], cs_);
+        const Clock::time_point tl = Clock::now();
+        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        if (dt) g_dt.launch_ms += hms(tl);
+        if (dt) cudaEventRecord(g_dt.ea[0], cs_);
+        (void) cudaStreamQuery(cs_);
+        ple_prefetch(tokens[a]);
+    }
+    run_.live = true;
+    run_.ms_launch = ms_since(t0);
+    return true;
+}
+
+// draft()'s second half: the host rule over the steps (min_p, STRATA_SPEC_CUM, the suffix-skip predicate), the final
+// wait and the outputs - what follows the round's launch in draft().
+bool MtpDrafter::draft_finish(int32_t* drafts, std::string& err, float* probs, int* n_drafts) {
+#if defined(STRATA_GPU_METAL)
+    (void) drafts; (void) probs; (void) n_drafts;
+    err = "mtp: draft_finish is not available on Metal";
+    return false;
+#endif
+    const OnDevice on_device(device_);
+    if (!run_.live) { err = "mtp: no draft round is launched"; return false; }
+    run_.live = false;
+    const Clock::time_point tf0 = Clock::now();
+    // STRATA_DRAFT_SUFFIX_SKIP: this round's predicate (one-shot)
+    const SkipAfterFirstFn skip_fn = skip_fn_;
+    void* const skip_user = skip_user_;
+    skip_fn_ = nullptr;
+    skip_user_ = nullptr;
+    const bool cp = run_.cp;
+    const int max_steps = run_.max_steps;
+    const float min_p = run_.min_p;
+    auto hms = [](Clock::time_point a0) { return std::chrono::duration<double, std::milli>(Clock::now() - a0).count(); };
+
+    int n = 0;
+    if (min_p <= 0.0f && max_steps > 0) {
         progress_at("mtp draft: waiting for the GPU");   // #2065
         for (int j = 0; j + 1 < max_steps; ++j) {
             uint32_t spins = 0;
@@ -1708,7 +1778,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             if (probs) probs[j] = ((volatile float*) h_prob_)[j];
-            prefetch_ple(drafts[j]);
+            ple_prefetch(drafts[j]);
         }
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
@@ -1717,22 +1787,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         const int last = max_steps - 1;
         drafts[last] = ((volatile int32_t*) h_out_)[last];
         if (probs) probs[last] = ((volatile float*) h_prob_)[last];
-        prefetch_ple(drafts[last]);
+        ple_prefetch(drafts[last]);
         n = max_steps;
     } else if (max_steps > 0) {
-        g_dt.init();
         const bool dt = g_dt.on;
-        if (dt) g_dt.pre_ms += hms(t0);
-        if (dt) cudaEventRecord(g_dt.eb[0], cs_);
-        Clock::time_point tl = Clock::now();
-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
-            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
-            return false;
-        }
-        if (dt) g_dt.launch_ms += hms(tl);
-        if (dt) cudaEventRecord(g_dt.ea[0], cs_);
-        (void) cudaStreamQuery(cs_);
-        prefetch_ple(tokens[a]);
         progress_at("mtp draft: waiting for the GPU");   // #2065: a stall here read as "decode", the verify window before it
         auto wait_step = [&](int j) {
             uint32_t spins = 0;
@@ -1743,7 +1801,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
                 if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
         };
-        tl = Clock::now();
+        Clock::time_point tl = Clock::now();
         wait_step(0);
         if (dt) g_dt.wait0_ms += hms(tl);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
@@ -1769,7 +1827,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             if (dt) g_dt.launch_ms += hms(tl);
             if (dt) cudaEventRecord(g_dt.ea[j], cs_);
             (void) cudaStreamQuery(cs_);
-            prefetch_ple(drafts[j - 1]);
+            ple_prefetch(drafts[j - 1]);
             tl = Clock::now();
             wait_step(j);
             if (dt) g_dt.waitj_ms += hms(tl);
@@ -1780,7 +1838,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             cum *= stop_q(j, drafts[j], pj);
             ++n;
         }
-        prefetch_ple(drafts[n - 1]);
+        ple_prefetch(drafts[n - 1]);
         if (skip) {   // the chain's state for draft_resume (the PLE prefetch has seen tokens[a] and draft 0)
             resume_.valid = true;
             resume_.cp = cp;
@@ -1788,8 +1846,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             resume_.tok0 = drafts[0];
             resume_.p0 = pj;
             resume_.cum = cum;
-            resume_.ple_prev[0] = ple_prev[0];
-            resume_.ple_prev[1] = ple_prev[1];
+            resume_.ple_prev[0] = run_.ple_prev[0];
+            resume_.ple_prev[1] = run_.ple_prev[1];
         }
         const Clock::time_point t_pre_sync = Clock::now();
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
@@ -1806,7 +1864,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
             g_dt.round_ms += r; g_dt.step_ms += s; g_dt.gap_ms += gp;
             g_dt.steps += n - 1; ++g_dt.rounds;
-            g_dt.wall_ms += ms_since(t0);
+            g_dt.wall_ms += run_.ms_launch + ms_since(tf0);   // the host's time in the two halves (not what lies between)
             g_dt.tail_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_pre_sync).count();
             if (g_dt.rounds % 300 == 0) g_dt.report();
         }
@@ -1817,7 +1875,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
-    ms_draft += ms_since(t0);
+    ms_draft += run_.ms_launch + ms_since(tf0);
     ++rounds;
     return true;
 }
