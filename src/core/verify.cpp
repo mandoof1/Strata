@@ -58,6 +58,14 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#if defined(__linux__)
+#include <cerrno>                // local (STRATA_PCIE_MMAP_CPUS / _NICE): the feeders' placement
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include "strata/platform/aux_cpus.hpp"
+#endif
 #include <string>
 #include <thread>
 #include <vector>
@@ -3238,6 +3246,22 @@ void Verifier::feed_stop() {
 void Verifier::feed_worker() {
     MmapFeed& f = *feed_;
     (void) cudaSetDevice(device_);
+#if defined(__linux__)
+    // local (STRATA_PCIE_MMAP_CPUS): on the given CPUs, as an owned thread (aux_cpus' sweep moves every thread it does
+    // not own to the aux set at each request; without the list the feeders are placed by --aux-cpus as before)
+    if (!feed_cpus_.empty()) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (int c : feed_cpus_)
+            if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
+        if (sched_setaffinity(0, sizeof set, &set) == 0) strata::aux_cpus::note_owned_thread();
+        else std::fprintf(stderr, "strata verify: STRATA_PCIE_MMAP_CPUS: sched_setaffinity failed (%s): this feeder stays where it was\n",
+                          std::strerror(errno));
+    }
+    // local (STRATA_PCIE_MMAP_NICE): the feeder's own nice value (a thread's, on Linux)
+    if (feed_renice_ && setpriority(PRIO_PROCESS, (id_t) syscall(SYS_gettid), feed_nice_) != 0)
+        std::fprintf(stderr, "strata verify: STRATA_PCIE_MMAP_NICE=%d: setpriority failed (%s)\n", feed_nice_, std::strerror(errno));
+#endif
     for (;;) {
         MmapFeed::Job* j = nullptr;
         int i = -1, s = -1;

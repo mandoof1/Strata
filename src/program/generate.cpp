@@ -8530,14 +8530,35 @@ int main(int argc, char** argv) {
                 if (const char* v = std::getenv("STRATA_PCIE_MMAP_SLOTS")) pm_slots = std::max(16, std::min(256, std::atoi(v)));
                 if (const char* v = std::getenv("STRATA_PCIE_MMAP_THREADS")) pm_threads = std::max(1, std::min(8, std::atoi(v)));
                 const size_t pm_bytes = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+                // local (STRATA_PCIE_MMAP_CPUS=<list>, _NICE=<n>): the feeders pinned to these CPUs (owned: --aux-cpus'
+                // sweep leaves them) and reniced; unset: placed by --aux-cpus with the other aux threads, default nice
+                std::string pm_place = "placed by --aux-cpus (STRATA_PCIE_MMAP_CPUS unset)";
+                {
+                    std::vector<int> pm_cpus;
+                    bool pm_renice = false;
+                    int pm_nice = 0;
+                    if (const char* v = std::getenv("STRATA_PCIE_MMAP_CPUS"); v != nullptr && v[0] != '\0') {
+                        if (strata::aux_cpus::parse_cpu_list(v, pm_cpus)) {
+                            pm_place = "pinned to CPUs " + std::string(v) + " (STRATA_PCIE_MMAP_CPUS)";
+                        } else
+                            std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP_CPUS=%s ignored: not a CPU list such as 4,5 or 4-5\n", v);
+                    }
+                    if (const char* v = std::getenv("STRATA_PCIE_MMAP_NICE"); v != nullptr && v[0] != '\0') {
+                        pm_renice = true;
+                        pm_nice = std::max(-20, std::min(19, std::atoi(v)));
+                        pm_place += ", nice " + std::to_string(pm_nice) + " (STRATA_PCIE_MMAP_NICE)";
+                    } else
+                        pm_place += ", default nice";
+                    ver.set_pcie_mmap_feed_place(pm_cpus, pm_renice, pm_nice);
+                }
                 if (ver.set_pcie_mmap_feed(pm_slots, pm_threads, pm_bytes, why)) {
                     pcie_mmap_on = true;
                     drive.d.pcie_mmap = true;
                     std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP=1: the PCIe share (pcie_frac %.2f, the last %d/256 of a layer's "
                                          "misses whose pages are cached) is fed from the mapping through %d pinned slots of %.1f MB "
-                                         "(%.0f MB) by %d feeder thread%s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
+                                         "(%.0f MB) by %d feeder thread%s %s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
                                  o.pcie_frac, pm_num, pm_slots, (double) pm_bytes / 1e6, (double) pm_slots * (double) pm_bytes / 1e6,
-                                 pm_threads, pm_threads == 1 ? "" : "s");
+                                 pm_threads, pm_threads == 1 ? "" : "s", pm_place.c_str());
 #if defined(STRATA_USE_HIP)
                     // Verifier::init: the copy stream shares a hardware queue with the window's unless it has a priority
                     // of its own, and the window's graph spins on the flag the copies raise

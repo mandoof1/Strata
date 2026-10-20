@@ -271,6 +271,12 @@ public:
     /// and the last blob of a layer is followed by flag B on the same stream.  The host thread only queues (fetch_dma,
     /// raise_b).  DMA mode (set_pcie_mode(0)); before the first window.  False with the reason in `err`.
     bool set_pcie_mmap_feed(int slots, int threads, size_t slot_bytes, std::string& err);
+    /// local (STRATA_PCIE_MMAP_CPUS / _NICE): where the feeder threads run.  `cpus` non-empty: each feeder pins itself to
+    /// them (sched_setaffinity) first thing and registers as an owned thread, so --aux-cpus' sweep leaves it there;
+    /// `renice`: setpriority(`nice`) on the feeder's tid.  Before set_pcie_mmap_feed (the threads start there).
+    void set_pcie_mmap_feed_place(const std::vector<int>& cpus, bool renice, int nice) {
+        feed_cpus_ = cpus; feed_renice_ = renice; feed_nice_ = nice;
+    }
     bool pcie_mmap_feed() const { return feed_ != nullptr; }
     uint64_t pcie_mmap_stalls() const;   ///< feeder waits for a slot whose last DMA had not landed (or was not queued)
     cudaStream_t stream() const { return cs_; }
@@ -516,6 +522,8 @@ private:
     // through its queue in layer order, so b_streamed_ is the feeders' alone between feed_drain()s.
     struct MmapFeed;
     MmapFeed* feed_ = nullptr;
+    std::vector<int> feed_cpus_;               // local (STRATA_PCIE_MMAP_CPUS): the feeders' CPUs (empty: --aux-cpus' choice)
+    bool feed_renice_ = false; int feed_nice_ = 0;   // local (STRATA_PCIE_MMAP_NICE)
     void feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint8_t* stage, uint32_t want);
     void feed_worker();
     bool feed_drain(int timeout_ms = -1);      // the host: every queued job issued (true; no-op without a feed)
