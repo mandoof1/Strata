@@ -4704,11 +4704,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         P.start[groups] = entries;
         const uint64_t bb = lay.blob_bytes(d.layers);
+        // local (STRATA_PCIE_MMAP_SPLIT): the first ceil(fetches/2) groups in slots [0, sh), the rest from slot sh on
+        // (sh = half the staging cap), each half with its own count and start2 sentinel; the feeder lays the blobs out
+        // the same way (fetch_dma computes the same n0 / sh from n and the staging cap)
+        const bool split = P.split && P.pcie_mode == 0;
+        const int sh = split ? (int) (P.staging_cap / 2) : 0;
+        const int n0 = split ? (fetches + 1) / 2 : fetches;
+        int ent_mid = entries;
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
-            P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
-                                 : P.staging + (unsigned long long) q * (unsigned long long) bb;
-            P.start2[q] = entries;
+            const int slot = q < n0 ? q : sh + (q - n0);
+            if (q == n0) ent_mid = entries;
+            P.ptr2[slot] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
+                                    : P.staging + (unsigned long long) slot * (unsigned long long) bb;
+            P.start2[slot] = entries;
             for (int64_t i = i0; i < n; ++i)
                 if (first_of[i] == i0) {
                     P.dst[entries] = (int32_t) i;
@@ -4717,10 +4726,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             ++d.pcie_experts;
         }
+        if (split) {
+            P.start2[n0] = fetches > n0 ? ent_mid : entries;   // the first half's sentinel: where the second half starts
+            P.start2[sh + (fetches - n0)] = entries;
+        } else
         P.start2[fetches] = entries;
         P.counts[0] = groups;
         P.counts[1] = entries;
-        P.counts[2] = fetches;
+        P.counts[2] = n0;
+        if (split) P.counts[3] = fetches - n0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);

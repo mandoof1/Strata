@@ -8568,6 +8568,14 @@ int main(int argc, char** argv) {
                         pm_fill = "memcpy from the mapping (STRATA_PCIE_MMAP_PREAD is Linux only)";
 #endif
                     }
+                    // local (STRATA_PCIE_MMAP_SPLIT=1): the share in two launches per layer, the first half behind flag B,
+                    // the second behind flag B2, so the GPU starts on the first half while the second copies
+                    const char* pm_split = "one launch per layer behind flag B";
+                    if (const char* v = std::getenv("STRATA_PCIE_MMAP_SPLIT"); v != nullptr && v[0] == '1') {
+                        std::string swhy;
+                        if (ver.set_pcie_mmap_split(swhy)) pm_split = "two launches per layer: the first half of the blobs behind flag B, the second behind flag B2 (STRATA_PCIE_MMAP_SPLIT=1)";
+                        else std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP_SPLIT=1 ignored: %s\n", swhy.c_str());
+                    }
                     // local (STRATA_PCIE_MMAP_AUTO=1): the share per layer balanced against the pool (ExpertDispatch's EMAs)
                     std::string pm_auto = "the share as given";
                     if (const char* v = std::getenv("STRATA_PCIE_MMAP_AUTO"); v != nullptr && v[0] == '1') {
@@ -8580,9 +8588,9 @@ int main(int argc, char** argv) {
                     }
                     std::fprintf(stderr, "strata serve: STRATA_PCIE_MMAP=1: the PCIe share (pcie_frac %.2f, the last %d/256 of a layer's "
                                          "misses whose pages are cached) is fed from the mapping through %d pinned slots of %.1f MB "
-                                         "(%.0f MB) by %d feeder thread%s %s, slots filled by %s, %s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
+                                         "(%.0f MB) by %d feeder thread%s %s, slots filled by %s, %s, %s, DMA mode (STRATA_PCIE_MMAP_SLOTS, _THREADS)\n",
                                  o.pcie_frac, pm_num, pm_slots, (double) pm_bytes / 1e6, (double) pm_slots * (double) pm_bytes / 1e6,
-                                 pm_threads, pm_threads == 1 ? "" : "s", pm_place.c_str(), pm_fill, pm_auto.c_str());
+                                 pm_threads, pm_threads == 1 ? "" : "s", pm_place.c_str(), pm_fill, pm_split, pm_auto.c_str());
 #if defined(STRATA_USE_HIP)
                     // Verifier::init: the copy stream shares a hardware queue with the window's unless it has a priority
                     // of its own, and the window's graph spins on the flag the copies raise

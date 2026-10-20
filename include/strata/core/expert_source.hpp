@@ -356,6 +356,10 @@ struct GpuPlanSink {
     uint64_t fetch_seq = 0;
     const std::atomic<uint64_t>* fetch_done_seq = nullptr;
     const std::atomic<int64_t>* fetch_done_ns = nullptr;
+    /// local (STRATA_PCIE_MMAP_SPLIT, set by the verifier): the PCIe groups in two halves - the first ceil(n/2) in
+    /// staging slots [0, staging_cap/2) with counts[2] = their number, the rest from slot staging_cap/2 on with
+    /// counts[3]; start2 is indexed the same way (its sentinels at [counts[2]] and [staging_cap/2 + counts[3]]).
+    bool split = false;
     /// Plan v0.3 P6: how a PCIe group reaches the GPU.  0 = the copy engine stages it (DMA, `fetch`); 1 = the grouped
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.

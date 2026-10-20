@@ -284,6 +284,14 @@ public:
     void set_pcie_mmap_feed_pread(FeedSpansFn spans, void* ctx) { feed_spans_ = spans; feed_spans_ctx_ = ctx; }
     /// local (STRATA_PCIE_MMAP_PREAD): blobs the feeders filled with pread / with memcpy (the fallback), cumulative
     void pcie_mmap_fill_counts(uint64_t& preads, uint64_t& memcpys) const;
+    /// local (STRATA_PCIE_MMAP_SPLIT=1): the fed share in two launches per (layer, group).  The plan puts the first
+    /// ceil(n/2) of its blobs in staging slots [0, h) and the rest in [h, 2h), h = half the group's staging cap, with
+    /// counts[2] / counts[3] their numbers; the window graphs launch the first half behind flag B and the second behind
+    /// a second word, flag B2.  The feeder raises B once the first half's copies are issued and B2 after the whole
+    /// job (both in layer order), so the GPU starts on the first half while the second copies.  After
+    /// set_pcie_mmap_feed, before the first capture; not with the device plan (it never writes counts[3]).
+    bool set_pcie_mmap_split(std::string& err);
+    bool pcie_mmap_split() const { return feed_split_; }
     bool pcie_mmap_feed() const { return feed_ != nullptr; }
     uint64_t pcie_mmap_stalls() const;   ///< feeder waits for a slot whose last DMA had not landed (or was not queued)
     cudaStream_t stream() const { return cs_; }
@@ -532,11 +540,20 @@ private:
     std::vector<int> feed_cpus_;               // local (STRATA_PCIE_MMAP_CPUS): the feeders' CPUs (empty: --aux-cpus' choice)
     bool feed_renice_ = false; int feed_nice_ = 0;   // local (STRATA_PCIE_MMAP_NICE)
     FeedSpansFn feed_spans_ = nullptr; void* feed_spans_ctx_ = nullptr;   // local (STRATA_PCIE_MMAP_PREAD)
+    // local (STRATA_PCIE_MMAP_SPLIT): flag B2 (the second half of the fed share has landed), its stream-write
+    // bookkeeping and host-function arguments, as flag B's
+    bool feed_split_ = false;
+    uint32_t* h_flagB2_ = nullptr; uint32_t* m_flagB2_ = nullptr;
+    uint32_t b2_streamed_ = 0;
+    FlagSet flag_sets2_[2 * 64 * 2] = {};
+    void flag_b2_after_copies(uint32_t want);
+    void raise_b2_now(uint32_t want);
     uint64_t feed_enqueue(const uint8_t* const* src, int n, size_t bytes, uint8_t* stage, uint32_t want);   // -> the job's seq
     void feed_worker();
     bool feed_drain(int timeout_ms = -1);      // the host: every queued job issued (true; no-op without a feed)
     bool feed_idle();
     void feed_stop();
+    static void feed_done_stamp(MmapFeed& f, uint64_t seq);   // the completion ring the plan's timing reads
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block

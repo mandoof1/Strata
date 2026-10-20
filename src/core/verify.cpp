@@ -447,7 +447,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
-    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, h_pflag_})
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, h_pflag_, h_flagB2_})
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
@@ -466,6 +466,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     }
     // STRATA_DMA_FLAG_WRITE: a stream write that landed during the drain may have lowered flag B; copy_ is drained now
     if (h_flagB_ != nullptr) *(volatile uint32_t*) h_flagB_ = UINT32_MAX;
+    if (h_flagB2_ != nullptr) *(volatile uint32_t*) h_flagB2_ = UINT32_MAX;   // (STRATA_PCIE_MMAP_SPLIT)
     trace_ev("RELEASE-DRAINED", -1, -1, (int64_t) ms_since(t0));   // aux: ms the GPU took to finish once released
     return true;
 }
@@ -591,7 +592,7 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, h_pflag_, h_drows_, h_djoin_, h_dcnt_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, h_pflag_, h_drows_, h_djoin_, h_dcnt_, h_flagB2_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -1993,6 +1994,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 cudaStreamWaitEvent(pf_cs_, ev_pplan_, 0);
                 wait_flag_ge(m_flagB_, ring, pf_cs_);              // the PCIe share is in staging (DMA) or mapped
                 grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, pf_cs_);
+                if (feed_split_) {   // local (STRATA_PCIE_MMAP_SPLIT): the share's second half, behind flag B2
+                    const int64_t split_h = (G == 2 ? kStagingBlobs / 2 : kStagingBlobs) / 2;
+                    wait_flag_ge(m_flagB2_, ring, pf_cs_);
+                    grouped(p_ptr2 + split_h, p_start2 + split_h, p_counts + 3, kPcieGroupRows, hit_out, pf_cs_);
+                }
                 cudaEventRecord(ev_pjoin_, pf_cs_);
             }
             grouped(p_ptr, p_start, p_counts, 0, hit_out, cs);
@@ -2019,6 +2025,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
             if (!no_pcie_ && !pcie_fork) grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, cs);
+            if (!no_pcie_ && !pcie_fork && feed_split_) {   // local (STRATA_PCIE_MMAP_SPLIT): the second half, behind flag B2
+                const int64_t split_h = (G == 2 ? kStagingBlobs / 2 : kStagingBlobs) / 2;   // (set_plan_slot's per / 2)
+                wait_flag_ge(m_flagB2_, ring, cs);
+                grouped(p_ptr2 + split_h, p_start2 + split_h, p_counts + 3, kPcieGroupRows, hit_out, cs);
+            }
             stamp(l, 22, grp);
             // STRATA_VERIFY_DEFER_CPU: no wait, no CPU rows now (late_add adds them later): zeros, plus the hits
             // iq3b STRATA_DEFER_FUSE: where the combine below is the add-hits one, it waits for the heavy rows and reads them
@@ -2635,9 +2646,11 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     feed_drain();   // local (STRATA_PCIE_MMAP): the feeder is idle before b_streamed_ is read
-    if (b_streamed_ != 0 && *(volatile uint32_t*) h_flagB_ < b_streamed_) cudaStreamSynchronize(copy_);   // (landed)
+    if ((b_streamed_ != 0 && *(volatile uint32_t*) h_flagB_ < b_streamed_) ||
+        (b2_streamed_ != 0 && *(volatile uint32_t*) h_flagB2_ < b2_streamed_)) cudaStreamSynchronize(copy_);   // (landed)
     b_streamed_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_flagB2_ != nullptr) { b2_streamed_ = 0; *(volatile uint32_t*) h_flagB2_ = 0; }   // (STRATA_PCIE_MMAP_SPLIT)
     if (h_pflag_ != nullptr) *(volatile uint32_t*) h_pflag_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
@@ -2873,6 +2886,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            if (feed_split_) sink_.counts[3] = 0;   // (STRATA_PCIE_MMAP_SPLIT: the second half's count)
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -3136,6 +3150,7 @@ struct Verifier::MmapFeed {
         size_t bytes = 0;
         uint8_t* stage = nullptr;
         int taken = 0, done = 0;
+        int n0 = 0, sh = 0, done_first = 0;   // local (STRATA_PCIE_MMAP_SPLIT): blobs [0, n0) in slots [0, n0), the rest from slot sh
         const uint8_t* src[64] = {};
     };
     std::mutex mu;                       // jobs, the slots' busy flags, take_seq / turn
@@ -3144,6 +3159,7 @@ struct Verifier::MmapFeed {
     std::condition_variable cv_host;     // the host: the queue drained
     std::deque<Job> jobs;                // seq turn .. next_seq - 1 (deque: references stay valid across push/pop)
     uint64_t next_seq = 0, take_seq = 0, turn = 0;
+    uint64_t turn2 = 0;                  // local (STRATA_PCIE_MMAP_SPLIT): flag B2's turn (the job's end, in layer order)
     std::vector<Slot> slots;
     size_t slot_bytes = 0;
     int next_slot = 0;
@@ -3217,6 +3233,8 @@ uint64_t Verifier::feed_enqueue(const uint8_t* const* src, int n, size_t bytes, 
     j.n = n;
     j.bytes = bytes;
     j.stage = stage;
+    j.n0 = feed_split_ ? (n + 1) / 2 : n;                         // (as the plan lays the groups out)
+    j.sh = feed_split_ ? (int) (sink_.staging_cap / 2) : 0;
     for (int i = 0; i < n; ++i) j.src[i] = src[i];
     f.cv.notify_all();
     return j.seq;
@@ -3281,6 +3299,7 @@ void Verifier::feed_worker() {
     for (;;) {
         MmapFeed::Job* j = nullptr;
         int i = -1, s = -1;
+        bool do_b = true, do_b2 = feed_split_;   // a job with no blobs: its taker raises (both words with the split)
         {
             std::unique_lock<std::mutex> lk(f.mu);
             f.cv.wait(lk, [&] { return f.quit || f.take_seq < f.next_seq; });
@@ -3339,7 +3358,8 @@ void Verifier::feed_worker() {
             }
             {
                 std::lock_guard<std::mutex> il(f.issue_mu);
-                cudaMemcpyAsync(j->stage + (size_t) i * j->bytes, sl.p, j->bytes, cudaMemcpyHostToDevice, copy_);
+                const int slot = i < j->n0 ? i : j->sh + (i - j->n0);   // (STRATA_PCIE_MMAP_SPLIT: the second half from sh)
+                cudaMemcpyAsync(j->stage + (size_t) slot * j->bytes, sl.p, j->bytes, cudaMemcpyHostToDevice, copy_);
                 if (cudaEventRecord(sl.ev, copy_) == cudaSuccess) {
                     sl.recorded = true;
                 } else {                          // no event: the copy is waited for here instead (as PinnedRing)
@@ -3348,17 +3368,23 @@ void Verifier::feed_worker() {
                     sl.recorded = false;
                 }
             }
-            bool last = false;
+            bool last = false, first = false;
             {
                 std::lock_guard<std::mutex> lk(f.mu);
                 sl.busy = false;
                 last = ++j->done == j->n;
+                // local (STRATA_PCIE_MMAP_SPLIT): the first half's copies are all issued - flag B's point; B2 is the job's end
+                if (feed_split_ && i < j->n0) first = ++j->done_first == j->n0;
             }
             f.cv.notify_all();
-            if (!last) continue;
+            if (!last && !first) continue;
+            do_b = feed_split_ ? first : last;
+            do_b2 = feed_split_ && last;
         }
-        // the job's flag B, in layer order, behind every copy of the layer on the copy stream
-        {
+        // the job's flag B, in layer order, behind every copy of the layer (with the split: of its first half) on the
+        // copy stream; with the split, flag B2 behind the whole job, in layer order too (a job with no blobs takes both
+        // turns in a row, so the raises of each word stay in layer order on the stream)
+        if (do_b) {
             std::unique_lock<std::mutex> lk(f.mu);
             f.cv.wait(lk, [&] { return f.quit || f.turn == j->seq; });
             if (f.quit) return;
@@ -3367,18 +3393,87 @@ void Verifier::feed_worker() {
                 if (j->n == 0) raise_b_now(j->want);
                 else flag_b_after_copies(j->want);
             }
-            {   // the completion ring the plan's timing reads (issued, not landed: the last DMA's tail is not in it)
-                const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                        std::chrono::steady_clock::now().time_since_epoch()).count();
-                f.done_ns[j->seq & 63].store(now, std::memory_order_relaxed);
-                f.done_seq[j->seq & 63].store(j->seq, std::memory_order_release);
-            }
             ++f.turn;
+            if (!feed_split_) {
+                feed_done_stamp(f, j->seq);
+                f.jobs.pop_front();
+            }
+            lk.unlock();
+            f.cv.notify_all();   // (the next job's flag-B turn, before this worker waits for its own B2 turn)
+        }
+        if (do_b2) {
+            std::unique_lock<std::mutex> lk(f.mu);
+            f.cv.wait(lk, [&] { return f.quit || f.turn2 == j->seq; });
+            if (f.quit) return;
+            {
+                std::lock_guard<std::mutex> il(f.issue_mu);
+                if (j->n == 0) raise_b2_now(j->want);
+                else flag_b2_after_copies(j->want);
+            }
+            ++f.turn2;
+            feed_done_stamp(f, j->seq);
             f.jobs.pop_front();
         }
         f.cv.notify_all();
         f.cv_host.notify_all();
     }
+}
+
+// the completion ring the plan's timing reads (issued, not landed: the last DMA's tail is not in it).  Caller holds mu.
+void Verifier::feed_done_stamp(MmapFeed& f, uint64_t seq) {
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+    f.done_ns[seq & 63].store(now, std::memory_order_relaxed);
+    f.done_seq[seq & 63].store(seq, std::memory_order_release);
+}
+
+// ---- local (STRATA_PCIE_MMAP_SPLIT=1): flag B2, the second half of the fed share.  Mirrors flag B's raise paths.
+bool Verifier::set_pcie_mmap_split(std::string& err) {
+    if (feed_ == nullptr) { err = "it needs the feed (STRATA_PCIE_MMAP=1)"; return false; }
+    if (feed_split_) { err = "already set"; return false; }
+    if (device_plan_) { err = "not with STRATA_VERIFY_DEVICE_PLAN (a device-built plan never writes counts[3])"; return false; }
+    if (sink_.cap < kStagingBlobs) { err = "the plan's capacity is below the staging slots (a window of one token)"; return false; }
+    const OnDevice on_device(device_);
+    if (!mapped(64, (void**) &h_flagB2_, (void**) &m_flagB2_)) {
+        (void) cudaGetLastError();
+        h_flagB2_ = nullptr; m_flagB2_ = nullptr;
+        err = "flag B2 could not be allocated";
+        return false;
+    }
+    feed_split_ = true;
+    sink_.split = true;
+    return true;
+}
+
+void Verifier::flag_b2_after_copies(uint32_t want) {
+#if defined(STRATA_USE_HIP)
+    static const bool fw = [] { const char* e = std::getenv("STRATA_DMA_FLAG_WRITE"); return e == nullptr || e[0] != '0'; }();
+    if (fw) {
+        if (hipStreamWriteValue32(copy_, (void*) m_flagB2_, want, 0) == hipSuccess) {
+            b2_streamed_ = want;
+            return;
+        }
+        (void) hipGetLastError();   // (a host function below)
+    }
+#endif
+    FlagSet& fs = flag_sets2_[(want - 1) % (sizeof flag_sets2_ / sizeof flag_sets2_[0])];
+    fs.flag = h_flagB2_;
+    fs.value = want;
+    cudaLaunchHostFunc(copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
+}
+
+void Verifier::raise_b2_now(uint32_t want) {
+#if defined(STRATA_USE_HIP)
+    if (b2_streamed_ != 0 && *(volatile uint32_t*) h_flagB2_ < b2_streamed_) {
+        if (hipStreamWriteValue32(copy_, (void*) m_flagB2_, want, 0) == hipSuccess) {
+            b2_streamed_ = want;
+            return;
+        }
+        (void) hipGetLastError();
+        cudaStreamSynchronize(copy_);   // (cannot queue it: the earlier write lands first)
+    }
+#endif
+    raise_flag(h_flagB2_, want);
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -3826,9 +3921,11 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     feed_drain();   // local (STRATA_PCIE_MMAP): the feeder is idle before b_streamed_ is read
-    if (b_streamed_ != 0 && *(volatile uint32_t*) h_flagB_ < b_streamed_) cudaStreamSynchronize(copy_);   // (landed)
+    if ((b_streamed_ != 0 && *(volatile uint32_t*) h_flagB_ < b_streamed_) ||
+        (b2_streamed_ != 0 && *(volatile uint32_t*) h_flagB2_ < b2_streamed_)) cudaStreamSynchronize(copy_);   // (landed)
     b_streamed_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_flagB2_ != nullptr) { b2_streamed_ = 0; *(volatile uint32_t*) h_flagB2_ = 0; }   // (STRATA_PCIE_MMAP_SPLIT)
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
@@ -3931,6 +4028,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            if (feed_split_) sink_.counts[3] = 0;   // (STRATA_PCIE_MMAP_SPLIT: the second half's count)
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -4091,6 +4189,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            if (feed_split_) sink_.counts[3] = 0;   // (STRATA_PCIE_MMAP_SPLIT: the second half's count)
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -4384,6 +4483,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            if (feed_split_) sink_.counts[3] = 0;   // (STRATA_PCIE_MMAP_SPLIT: the second half's count)
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
