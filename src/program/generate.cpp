@@ -12115,7 +12115,13 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
-                    drive.d.cold_skip_window = logpos_decode;   // (local drift harness, see above)
+                    // local (prompt-cold): STRATA_COLD_SKIP_PROMPT=1 (opt-in, changes the output) - a prompt's windows
+                    // take decode's cold skip and cold deferral too, so a short read stops waiting on drive reads
+                    static const bool prompt_cold = [] {
+                        const char* v = std::getenv("STRATA_COLD_SKIP_PROMPT");
+                        return v != nullptr && std::atoi(v) != 0;
+                    }();
+                    drive.d.cold_skip_window = logpos_decode || prompt_cold;   // (local drift harness, see above)
                     drive.d.alt_on = logpos_decode && drive.d.alt != nullptr;   // iq3all: STRATA_ALT_EXPERTS there too
                     const bool ran = ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e);
                     drive.d.cold_skip_window = false;
