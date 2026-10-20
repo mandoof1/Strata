@@ -1836,6 +1836,61 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     return el > 0 ? (double) done / el : -1.0;
 }
 
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+// The R9700 / RX 9000 "bimodal prompt speed" (0.2.0 known limit).  The runtime opens the process's hardware queues
+// lazily, as the first stream of each kind is used, and the kernel's scheduler (MES) puts a queue on one of the
+// card's compute pipes when the queue first gets work.  The loader threads reach their streams in a different order
+// every start, so in about half of the starts the prompt path's two busy queues (the compute stream and the expert
+// staging stream) landed on the SAME pipe: every one of the ~30,000 hand-offs of a prompt then waits for the pipe to
+// switch queues, and a 4K prompt reads 13% slower (p620, 1,980 vs 2,290 tok/s).  Opening the queues here, one after
+// the other on the main thread and before any other thread exists, makes the placement the same in every start (and
+// it is the fast one).  Streams are destroyed again; the runtime keeps the queues.
+//   Two queues are enough (R9700, "nn": 0 slow of 32 fresh starts, unprimed 10 of 32); five (nnnnh) fixed the starts too but cost
+//   decode 2 to 3.6% and two expert slots, four normal ones did not even fix the starts.
+//   STRATA_HIP_QUEUE_PRIME unset: gfx1200 / gfx1201 on Linux only, "nn"; "0": off; any other string is a spec
+//   ('n' = a stream at the default priority, 'h' = at the highest) for experiments on other cards.
+static void prime_hw_queues() {
+    const char* env = std::getenv("STRATA_HIP_QUEUE_PRIME");
+    if (env != nullptr && std::strcmp(env, "0") == 0) return;
+    const char* pv = std::getenv("STRATA_PRIMARY_DEVICE");
+    const int dev = pv != nullptr && std::atoi(pv) > 0 ? std::atoi(pv) : 0;
+    int n_dev = 0;
+    if (cudaGetDeviceCount(&n_dev) != cudaSuccess || dev >= n_dev) { (void) cudaGetLastError(); return; }
+    const char* spec = env != nullptr && env[0] != 0 ? env : nullptr;
+    if (spec == nullptr) {
+#if defined(_WIN32)
+        return;
+#else
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess || !strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName)) {
+            (void) cudaGetLastError();
+            return;
+        }
+        spec = "nn";
+#endif
+    }
+    if (dev != 0 && cudaSetDevice(dev) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    void* buf = nullptr;
+    if (cudaMalloc(&buf, 256) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    int lo = 0, hi = 0;
+    const bool have_prio = hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess;
+    std::vector<cudaStream_t> ss;
+    for (const char* c = spec; *c != 0; ++c) {
+        cudaStream_t s = nullptr;
+        const bool ok = (*c == 'h' && have_prio) ? hipStreamCreateWithPriority(&s, hipStreamNonBlocking, hi) == hipSuccess
+                                                 : cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess;
+        if (!ok) continue;
+        cudaMemsetAsync(buf, 0, 256, s);
+        cudaStreamSynchronize(s);
+        ss.push_back(s);
+    }
+    for (cudaStream_t s : ss) cudaStreamDestroy(s);
+    cudaFree(buf);
+    (void) cudaGetLastError();
+    std::fprintf(stderr, "strata generate: opened %zu GPU queues in a fixed order (STRATA_HIP_QUEUE_PRIME=0 turns it off)\n", ss.size());
+}
+#endif
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -1919,6 +1974,9 @@ int main(int argc, char** argv) {
         if (qwen35) return strata::qwen35::run(argc, argv);
         break;
     }
+#endif
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    prime_hw_queues();
 #endif
     Options o;
     bool have_tokens = false;
