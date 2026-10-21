@@ -4603,7 +4603,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     for (int64_t i = 0; i < n; ++i)
                         if (qof[i] == q) ++per_tok[i / k];
                     ++d.cold_skip_experts;
-                    warm_e[nwarm++] = e;
+                    // local (night r4): STRATA_COLD_SKIP_WARM_MIN=w warms only the skipped experts whose heaviest routing
+                    // weight in this window is >= w (0 = all, as before): fewer warm-up reads for the lightest ones
+                    static const float warm_min = [] { const char* v = std::getenv("STRATA_COLD_SKIP_WARM_MIN"); return v != nullptr ? (float) std::atof(v) : 0.0f; }();
+                    if (maxw[q] >= warm_min) warm_e[nwarm++] = e;
                 }
             }
         }
