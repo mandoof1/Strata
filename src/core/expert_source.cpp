@@ -4889,6 +4889,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     // local (cold-skip): the skipped cold blobs into the page cache in the background, queued after this layer's demand
     // reads so they never go before them
+    // local (night r4): STRATA_COLD_SKIP_WARM=0 queues no warm-up reads at all (they are ~65% of decode's NVMe bytes on a
+    // 15 GB box; the skipped expert is read on demand when it is routed again) - changes only what the page cache holds
+    static const bool warm_on = [] { const char* v = std::getenv("STRATA_COLD_SKIP_WARM"); return v == nullptr || std::atoi(v) != 0; }();
+    if (warm_on)
     for (int w = 0; w < nwarm; ++w)   // (iq3all: with STRATA_ALT_EXPERTS the second pack's blob, where it would be read)
         if ((alt_active ? (ExpertSource*) d.alt : d.src)->warm_background(d.layers, warm_e[w])) ++d.cold_skip_warm;
     int njobs = 0;
