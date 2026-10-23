@@ -9,6 +9,116 @@ at **128K context with int8 KV at 27-39 tokens/s**, and it can read pictures wit
 
 This is a personal fork for people with a similar setup. It is not meant to be merged upstream.
 
+**Who it is for:** Linux PCs whose RAM cannot hold the model's experts. IQ3_S has 50.3 GB of them, and upstream's
+setup copies them into RAM once a PC has about 61 GB. This branch was tuned and measured with 16 GB of RAM. With 64 GB
+or more, upstream's normal mode (experts in RAM) is what Strata is built for, and this tuning was never measured
+there. Nothing between 16 and 64 GB was measured either.
+
+## For AI agents: install and run this branch
+
+Written for a coding agent (Claude Code, Codex, pi, ...) setting this up for its user. Do the steps in order and tell
+the user the result of each.
+
+Rules:
+
+- Linux only. The launcher and the copy script are shell scripts, and the patches use Linux calls (`mincore`,
+  `MADV_PAGEOUT`, `readahead`, `O_DIRECT`). On Windows or macOS, stop and tell the user.
+- Run everything as the user, never with `sudo` or as root (a root-owned experts copy silently disables the
+  prioritized reads). If setup wants to install build tools it asks first; let the user type their password.
+- Ask the user before the ~84 GB download and before starting the server. While it runs, the engine takes almost all of
+  the GPU's memory and most of the RAM.
+- Do not edit the engine source to get past an error. Show the user the last lines of the output or log, and stop.
+- The patches are this branch's source. There is no separate patch file: building this branch is applying them.
+
+**1. Check the PC.**
+
+```bash
+uname -s                                            # must be Linux
+free -g                                             # total RAM
+rocminfo 2>/dev/null | grep -m1 -o 'gfx[0-9a-f]*'   # AMD GPU, if any
+nvidia-smi --query-gpu=name,memory.total --format=csv 2>/dev/null   # NVIDIA GPU, if any
+lsblk -d -o NAME,ROTA,TRAN,SIZE                     # which drives are NVMe
+df -h ~                                             # free space
+```
+
+- **RAM 64 GB or more:** tell the user this branch targets less RAM and is unmeasured on their PC, and recommend
+  upstream Strata (https://github.com/Niko1221/Strata) in its normal mode. Continue only if they still want this.
+- **AMD:** measured on an RX 9060 XT 16 GB (gfx1200, ROCm 7.2.4). Setup always compiles the engine on Linux, so it
+  builds this source. Other cards that upstream supports should build the same way, but they are not measured.
+- **NVIDIA:** add `--build` to setup in step 2. Without it, setup installs upstream's ready-made engine, which does not
+  have these patches. This branch has never been compiled or run with CUDA: if the build fails, report it and stop.
+- **Disk:** about 140 GB free where the model files go (84 GB download, 53 GB prepared pack, 7 GB MTP draft layer).
+  Put them on an NVMe SSD if one has room (`--data-dir` in step 2). Otherwise step 3 copies the 50 GB experts file to
+  the NVMe.
+
+**2. Get the branch and run setup** (download, preparation and build can take hours):
+
+```bash
+git clone -b gamer-16gb https://github.com/mandoof1/Strata
+cd Strata
+./setup.sh --setup --no-start --yes --model IQ3_S --context 131072 --vision cpu
+# add --data-dir /path/on/nvme/Strata-data to keep the model files on the NVMe; add --build on NVIDIA
+```
+
+`--yes` with an explicit `--model` accepts setup's warning that IQ3_S wants 62 GB of RAM. Setup writes
+`strata-iq3_s.json` (and its own launcher, which is not the tuned one). From an existing Strata checkout instead, on a
+clean `git status`: `git remote add gamer https://github.com/mandoof1/Strata`, `git fetch gamer gamer-16gb`,
+`git checkout -b gamer-16gb gamer/gamer-16gb`, then the same setup command (it reuses model files it already has).
+
+**3. Experts copy on the NVMe** (skip it when the model files are already on an NVMe):
+
+```bash
+PACK=$(python3 -c "import json; a = json.load(open('strata-iq3_s.json'))['args']; print(a[a.index('--pack') + 1])")
+df "$PACK"                                          # the drive the pack is on
+gamer-16gb/copy-experts.sh "$PACK" /path/on/nvme/experts.bin
+ls -l /path/on/nvme/experts.bin                     # must belong to the user, not root
+```
+
+**4. Write the tuned config and launcher** (starts nothing):
+
+```bash
+python3 gamer-16gb/apply-tuning.py strata-iq3_s.json --experts-copy /path/on/nvme/experts.bin
+# without --experts-copy if step 3 was skipped
+```
+
+It writes `strata-iq3_s-gamer-128k.json` and `run-iq3_s-gamer-128k.sh`. Add `--no-turbo` (output closest to the model,
+slower) or `--refusal-vector FILE` only when the user asks for them.
+
+**5. Start it** (only when the user says so; close the browser and other large programs first, because free RAM is
+the experts' cache):
+
+```bash
+./run-iq3_s-gamer-128k.sh > strata-run.out 2>&1 &
+```
+
+The first start takes a few minutes. The server only listens once the engine is up, so it is ready when
+`curl -s http://127.0.0.1:8080/health` answers with `"status": "ok"`.
+
+**6. Check it:**
+
+```bash
+curl -s http://127.0.0.1:8080/health
+curl -s http://127.0.0.1:8080/v1/models             # the model id for the next call
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "MODEL_ID", "messages": [{"role": "user", "content": "What is 17 * 23?"}], "max_tokens": 2000}'
+grep -o 'NVMe copy: [A-Z]*' strata-run.out          # ON when the experts copy on an NVMe is used
+grep -o 'generated in [0-9.]* ms ([0-9.]* tok/s)' strata-iq3_s-gamer-128k.log | tail -3   # decode speed per request
+grep -o 'io-prio: [0-9]* demand reads' strata-iq3_s-gamer-128k.log | tail -3
+```
+
+The answer should be 391. `io-prio` should show more than 0 demand reads on requests that read from the drive. 0 means
+the prioritized reads are off, usually because the experts copy belongs to another user (step 3). For reference, the
+measured PC (16 GB VRAM, 16 GB RAM) decodes at 27-39 tokens/s.
+
+**Stop and update:**
+
+```bash
+pkill -f 'serve/[s]erver[.]py'                      # stops the server and its engine; the brackets keep the
+                                                    # pattern from matching the shell that runs pkill
+git pull --ff-only && ./setup.sh --update           # recompiles the engine when the source changed
+python3 gamer-16gb/apply-tuning.py strata-iq3_s.json --experts-copy /path/on/nvme/experts.bin   # step 4 again
+```
+
 ## The measured PC
 
 | Part | What |
@@ -178,8 +288,9 @@ decode-only switches above act there too (used for the Quality table).
 
 ## Setup
 
-1. **Clone this branch and run Strata's setup.** The source differs from any release, so setup builds the engine from
-   source (it needs ROCm or CUDA; see the main README).
+1. **Clone this branch and run Strata's setup.** On AMD under Linux, setup always compiles the engine, so it builds
+   this branch's source (it needs ROCm; see the main README). On NVIDIA, add `--build`: otherwise setup installs
+   upstream's ready-made engine, which does not have these patches (this branch has not been built with CUDA).
 
    ```bash
    git clone -b gamer-16gb https://github.com/mandoof1/Strata
@@ -188,7 +299,7 @@ decode-only switches above act there too (used for the Quality table).
    ```
 
    Setup warns that IQ3_S needs about 62 GB of RAM: answer yes (or add `--yes`); step 3 switches the config to reading
-   the experts through the page cache. Setup writes a config such as `strata-IQ3_S.json` and starts the server once:
+   the experts through the page cache. Setup writes a config such as `strata-iq3_s.json` and starts the server once:
    stop it before step 2. (The measured engine was built with `-DSTRATA_HIP_MMVQ_IL` in `CMAKE_HIP_FLAGS`; an A/B
    showed no speed difference, so setup's plain build is fine.)
 
@@ -205,8 +316,8 @@ decode-only switches above act there too (used for the Quality table).
 3. **Write the tuned config and launcher, and start it.**
 
    ```bash
-   python3 gamer-16gb/apply-tuning.py strata-IQ3_S.json --experts-copy /path/on/nvme/experts.bin
-   ./run-IQ3_S-gamer-128k.sh
+   python3 gamer-16gb/apply-tuning.py strata-iq3_s.json --experts-copy /path/on/nvme/experts.bin
+   ./run-iq3_s-gamer-128k.sh
    ```
 
    Add `--no-turbo` for the closest-to-the-model settings (slower, see Results), or `--refusal-vector FILE` (above).
