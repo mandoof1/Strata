@@ -2,7 +2,7 @@
 """Turn a Strata config written by setup.sh into the tuned "gamer 16 GB" config, plus a launcher next to it.
 
     python3 gamer-16gb/apply-tuning.py strata-IQ3_S.json [--experts-copy /fast/drive/experts.bin] [--no-turbo]
-                                       [--ctx 131072] [--pool-workers N] [--name NAME]
+                                       [--ctx 131072] [--pool-workers N] [--refusal-vector FILE] [--name NAME]
 
 Writes strata-NAME.json and run-NAME.sh in the Strata folder (NAME defaults to "<config name>-gamer-<ctx/1024>k").
 Nothing is started. See gamer-16gb/README.md for what each setting does and what it was measured against.
@@ -37,6 +37,8 @@ ARGS = {
     "--adapt-min-gain": "3",
     "--adapt-decay": "0.9",
     "--pcie-frac": "0.6",          # share of cache misses sent over PCIe to the GPU instead of computed on the CPU
+    "--aux-cpus": "auto",          # the engine's other threads (I/O, releaser, ...) on the CPUs the pool leaves free
+    "--pool-tasks": "24",          # CPU expert row tasks per phase; with --aux-cpus and PROBE_TRIM +6% (README)
 }
 DROP = {"--resident-experts": 0, "--resident-budget-gib": 1}   # 16 GB of RAM cannot hold a RAM tier: the page cache is it
 
@@ -58,6 +60,7 @@ ENV = {
     "STRATA_HC_TSUM": "1",
     "STRATA_PREFILL_LEND_PCT": "95",
     "STRATA_DEFER_COLD_LAST": "1",         # inside each deferred pass, the experts still on the drive go last
+    "STRATA_PROBE_TRIM": "1",              # fewer page-cache probes (mincore) per layer, same output
 }
 AMD_ENV = {
     "GPU_PINNED_MIN_XFER_SIZE": "1048576",
@@ -70,6 +73,7 @@ COPY_ENV = {                               # with the experts copy: the prompt r
     "STRATA_PROMPT_DIRECT": "1",
     "STRATA_PROMPT_DIRECT2": "1",
     "STRATA_REFILL_DIRECT": "1",
+    "STRATA_PROMPT_DIRECT_SMALL": "1",     # the small staged prompt chunks read unbuffered too (+10% decode after a prompt)
 }
 # output-changing (measured in README "Quality"); --no-turbo uses the milder cold-skip only
 TURBO_ENV = {
@@ -77,6 +81,7 @@ TURBO_ENV = {
     "STRATA_ROUTE_PRIOR_WARM": "0.5",      # ... or the page cache does: only experts that need a drive read lose
     "STRATA_COLD_SKIP_BELOW": "0.15",      # a decode miss with routing weight below 0.15 is skipped (and warmed)
     "STRATA_DEFER_COLD_LAYERS": "3",       # a cold CPU expert may join the residual up to 3 layers late
+    "STRATA_COLD_SKIP_WARM_MIN": "0.10",   # a skipped expert is read for next time only if its weight was >= 0.10
 }
 NO_TURBO_ENV = {"STRATA_COLD_SKIP_BELOW": "0.10"}
 
@@ -114,6 +119,8 @@ def main():
     ap.add_argument("--no-turbo", action="store_true",
                     help="leave out the output-changing turbo settings (slower, closer to the plain model)")
     ap.add_argument("--pool-workers", type=int, help="CPU expert workers (default: half the CPU threads, at least 2)")
+    ap.add_argument("--refusal-vector", metavar="FILE",
+                    help="a refusal-direction control vector (GGUF), projected out on layers 4-44 (README, \"Refusal vector\")")
     ap.add_argument("--name", help="output name (strata-NAME.json, run-NAME.sh)")
     o = ap.parse_args()
 
@@ -127,6 +134,16 @@ def main():
     set_flag(args, "--max-context", str(o.ctx))
     workers = o.pool_workers or max(2, (os.cpu_count() or 6) // 2)
     set_flag(args, "--pool-workers", str(workers))   # 3 on 6 cores: the I/O, PLE and kernel threads need the rest
+    if o.refusal_vector:
+        p = Path(o.refusal_vector).resolve()
+        if not p.is_file():
+            sys.exit(f"{p}: no such file")
+        drop_flag(args, "--control-vector-scaled", 1)
+        drop_flag(args, "--control-vector-layer-range", 2)
+        drop_flag(args, "--cvec-mode", 1)
+        drop_flag(args, "--cvec-dir", 1)
+        args += ["--control-vector-scaled", f"{p}:1.0", "--control-vector-layer-range", "4", "44",
+                 "--cvec-mode", "project", "--cvec-dir", "per-layer"]
 
     env = c.setdefault("env", {})
     env.update(ENV)
@@ -183,7 +200,8 @@ exec "{py}" "{ROOT}/serve/server.py" --engine strata --config "{out}" --port {c.
     print(f"wrote {out.name} and {run.name} (pool workers {workers}, context {o.ctx}, "
           + ("no turbo" if o.no_turbo else "turbo on")
           + (f", experts from {env['STRATA_EXPERTS_HEAD']}" if o.experts_copy else ", experts from the pack")
-          + (", vision on demand" if isinstance(v, dict) else ", no vision") + ")")
+          + (", vision on demand" if isinstance(v, dict) else ", no vision")
+          + (", refusal vector on" if o.refusal_vector else "") + ")")
     print(f"start it with: {run}")
 
 
